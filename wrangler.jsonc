@@ -1,0 +1,48 @@
+{
+  "name": "example-boat-router",
+  "main": "src/worker.mjs",
+  "compatibility_date": "2026-07-30",
+  "compatibility_flags": [
+    "nodejs_compat"
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "FLEET",
+        "class_name": "Fleet"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": [
+        "Fleet"
+      ]
+    }
+  ],
+  "vars": {
+    "ENABLED": "false",
+    "PLUGIN_ROUTER": "true",
+    "BOAT_WALLET": "example-account",
+    "BOAT_PROVIDER_WALLET": "example-provider-wallet",
+    "ROUTER_PROJECTS": "project-a",
+    "START_PACING": "true",
+    "MACHINE_TTL_SECONDS": "3600",
+    "PUBLIC_ORIGIN": "https://example.invalid"
+  },
+  "observability": {
+    "enabled": false,
+    "logs": {
+      "invocation_logs": false
+    },
+    "traces": {
+      "enabled": false
+    }
+  },
+  "triggers": {
+    "crons": [
+      "* * * * *"
+    ]
+  }
+}

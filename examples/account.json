@@ -1,0 +1,21 @@
+{
+  "id": "example-account",
+  "margin": 0.1,
+  "reuse": {
+    "enabled": true,
+    "floor": 0,
+    "maxJobs": 10,
+    "maxAgeSeconds": 3600
+  },
+  "starts": {
+    "minute": 4,
+    "hour": 60,
+    "day": 500
+  },
+  "poolPacing": {
+    "enabled": true,
+    "marginPct": 10,
+    "burst": 1,
+    "reserveStarts": 0
+  }
+}

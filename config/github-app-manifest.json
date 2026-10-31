@@ -1,0 +1,11 @@
+{
+  "name": "Example Boat CI",
+  "url": "https://example.invalid",
+  "description": "Example GitHub App for Boat Router.",
+  "public": false,
+  "hook_attributes": { "url": "https://example.invalid/webhook", "active": true },
+  "default_permissions": { "actions": "read", "administration": "write", "metadata": "read" },
+  "default_events": ["workflow_job"],
+  "request_oauth_on_install": false,
+  "redirect_url": "https://example.invalid/setup/callback"
+}

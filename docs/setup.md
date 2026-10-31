@@ -1,0 +1,20 @@
+# Setup
+
+The example is a starting point. Review the account, project, runner, GitHub App, and Cloudflare settings before use. Keep `ENABLED` set to `false` while you configure and verify the installation.
+
+1. Install Node 22 or later and run `npm ci`.
+2. Set the account and project data in `examples/account.json` and `examples/project.json`. Register them in `config/installation.mjs`. Set `starts.minute`, `starts.hour`, and `starts.day` to the provider limits for the account. Set the repository, labels, sizes, concurrency caps, and reuse policy for each project.
+3. Set `setupOwner`, `repositories`, and any smoke repository in `config/policy.mjs`. Update the GitHub App manifest in `config/github-app-manifest.json`. The setup owner check prevents storing an App made under a different login.
+4. Set a unique Worker name, the `FLEET` Durable Object binding, migration, cron, and environment variables in `wrangler.jsonc`. Set `BOAT_WALLET`, `BOAT_PROVIDER_WALLET`, and `ROUTER_PROJECTS` to match the registration. Keep deployment credentials and API keys in secret storage.
+5. Run `npm test`, `npm run check`, and `npm run build`. The last command is a Wrangler dry run. Inspect its output and bindings before deployment.
+6. Configure the GitHub App and webhook secret for the target repositories. Verify the webhook signature, the operator control token, provider limits, and the disabled Worker before enabling starts under your own deployment procedure.
+
+For external claimers, configure `externalClaimer` on a project and use the authenticated `/router/local/claim`, `/router/local/started`, and `/router/local/release` routes. Scope credentials to the claimer. A claim remains held when runner retirement is uncertain. Investigate before using the operator release route.
+
+The example enables the experimental router, pacing, and reuse, but `ENABLED=false` prevents machine starts. Replace `BOAT_PROVIDER_WALLET` with the provider wallet value. It must be nonempty and differ from the `BOAT_WALLET` account ID. Set `ROUTER_PROJECTS` to the registered project IDs. Replace `PUBLIC_ORIGIN` with the deployed HTTPS origin. Set start limits, `poolPacing`, TTL, reuse policy, and the cron to suit the provider account. `START_PACING` controls the legacy controller; `poolPacing` controls router pool starts.
+
+Store `BOAT_CI_API_KEY`, `GITHUB_WEBHOOK_SECRET`, and the GitHub App private key as secrets. Configure `GITHUB_APP_ID` and `GITHUB_APP_PRIVATE_KEY` if the App is provisioned outside the setup flow. The setup flow stores App credentials after installation. Set `SETUP_BOOTSTRAP` to a JSON object containing `controlHash` for operator access. To create the GitHub App through the setup flow, also include `tokenHash` and `expiresAt`. Both hashes are lowercase SHA-256 hex digests of separate strong tokens. Use 32 to 128 letters, digits, underscores, or hyphens for each token. Set `expiresAt` to a future Unix timestamp in milliseconds. Open `PUBLIC_ORIGIN/setup?token=<setup-token>` before it expires. Store the bootstrap JSON as a secret. Set `LOCAL_CONTROL_HASH` to the SHA-256 hex digest of a separate token when using an external claimer. `RESUME_EPOCH` and `ALLOW_SMOKE` are optional operational controls. Review all settings before deployment.
+
+Pool mode starts off. After setup, use an authenticated `POST /router/pool-mode?mode=on` to enable it. Pool activation sets the reuse override to `off`. After you review the reuse policy, send an authenticated `POST /router/reuse?project=project-a&mode=config` to use the configured policy. Replace `project-a` with your project ID. Verify both responses and the pool state before enabling machine starts. Reuse requires a successful reset.
+
+Account `poolPacing.fromPct` activates pacing when hourly or daily usage reaches that fraction. The default is 0.7. Optional `waitForBusyBox` settings let queued jobs wait for a reusable busy runner as account limits become scarce. Set `enabled`, `maxWaitMs`, `scarcityFrom`, and `scarcityFull` in the account data. It is disabled by default.

@@ -1,0 +1,27 @@
+{
+  "id": "project-a",
+  "repo": "example-owner/project-a",
+  "account": "example-account",
+  "reuse": {
+    "mode": "on"
+  },
+  "labels": [
+    "boat-default"
+  ],
+  "jobs": {},
+  "landing": {
+    "engine": "runner"
+  },
+  "caps": {},
+  "sizes": {
+    "boat-default": {
+      "machine": "default"
+    }
+  },
+  "triggers": [
+    {
+      "on": "workflow_job",
+      "executor": "actions-jit"
+    }
+  ]
+}
