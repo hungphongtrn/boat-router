@@ -1,0 +1,13 @@
+{
+  "id": "peek",
+  "margin": 0,
+  "reuse": {
+    "enabled": true,
+    "floor": 0
+  },
+  "starts": {
+    "minute": 12,
+    "hour": 60,
+    "day": 190
+  }
+}

@@ -87,20 +87,20 @@ test('hook delivery failures do not block router admission or ticks', async () =
       return new Response(null, { status: 500 });
     };
     class Controller { constructor(storage) { this.storage = storage; } }
-    const router = installRouter(storage, () => ({ BOAT_WALLET: 'example-account', BOAT_PROVIDER_WALLET: 'test', ROUTER_PROJECTS: 'project-a' }), {
+    const router = installRouter(storage, () => ({ BOAT_WALLET: 'peek', BOAT_PROVIDER_WALLET: 'test', ROUTER_PROJECTS: 'peek' }), {
       FleetController: Controller, api: { limits: async () => ({ starts: { day: { used: 100, limit: 100 } } }) }, suiteApi: {},
       alertConfigs: [{ on: ['starts_day'], url: 'https://example.test' }], alertFetcher: fetcher, waitUntil: p => pending.push(p),
     });
-    const project = router.projects.get('project-a');
-    project.prepare = async () => { router.observeAlert('project-a', 'starts_day', true); };
+    const project = router.projects.get('peek');
+    project.prepare = async () => { router.observeAlert('peek', 'starts_day', true); };
     project.admissionEntries = async () => [{ key: 'one', at: 0, rank: 'one' }];
     const { BoxFleet } = await import('../src/router/box-fleet.mjs');
     let claim;
     const budget = { claimKey: async () => 'a'.repeat(64), enqueue: async () => {}, claim: async () => claim, admit: async () => { claim = { status: 'pending' }; return { ok: true }; }, begin: async () => { claim.status = 'calling'; return true; }, settle: async (_, status) => { claim.status = status; return true; } };
-    const boxes = new BoxFleet(project.storage, { create: async () => ({ sandbox: { id: 'bx_23456789' } }) }, () => 100, { budget, alert: (event, data) => router.observeAlert('project-a', event, data.active) });
+    const boxes = new BoxFleet(project.storage, { create: async () => ({ sandbox: { id: 'bx_23456789' } }) }, () => 100, { budget, alert: (event, data) => router.observeAlert('peek', event, data.active) });
     const [record] = await boxes.prepare('pool', 'large', 1, 1);
     project.admitStart = async () => { assert.equal(await boxes.admit(record.createKey, {}, 3600), true); admitted++; };
-    project.tick = async () => { router.observeAlert('project-a', 'starts_day', true); ticks++; };
+    project.tick = async () => { router.observeAlert('peek', 'starts_day', true); ticks++; };
     const result = await Promise.race([router.tick(), new Promise((_, reject) => setTimeout(() => reject(new Error('tick blocked by hook')), 1000))]);
     assert.equal(result[0].ok, true); assert.equal(admitted, 1); assert.equal(ticks, 1);
     release(); await Promise.all(pending); assert.equal(calls, 2);
@@ -112,20 +112,20 @@ test('operator controls and verification changes send transition events', async 
   const { Fleet, FleetController } = await import('../src/fleet.mjs');
   const { hash } = await import('../src/setup.mjs');
   const storage = new Storage(), pending = [], posts = [], token = 'x'.repeat(40);
-  const env = { PLUGIN_ROUTER: 'true', BOAT_WALLET: 'example-account', BOAT_PROVIDER_WALLET: 'test', ROUTER_PROJECTS: 'project-a', SETUP_BOOTSTRAP: JSON.stringify({ controlHash: await hash(token) }) };
+  const env = { PLUGIN_ROUTER: 'true', BOAT_WALLET: 'peek', BOAT_PROVIDER_WALLET: 'test', ROUTER_PROJECTS: 'peek', SETUP_BOOTSTRAP: JSON.stringify({ controlHash: await hash(token) }) };
   const fleet = new Fleet({ storage, waitUntil: p => pending.push(p) }, env);
   fleet.router = installRouter(storage, () => env, { FleetController, api: {}, suiteApi: {}, waitUntil: p => pending.push(p), alertConfigs: [{ on: ['pool_drain', 'reuse_off', 'breaker_open', 'breaker_cleared'], url: 'https://example.test' }], alertFetcher: async (_, options) => { posts.push(JSON.parse(options.body)); return new Response(null, { status: 204 }); } });
-  const headers = { Authorization: `Bearer ${token}` }, project = fleet.router.projects.get('project-a');
+  const headers = { Authorization: `Bearer ${token}` }, project = fleet.router.projects.get('peek');
   await project.storage.put('pool:mode', 'on');
   assert.equal((await fleet.fetch(new Request('https://fleet/router/pool-mode?mode=drain', { method: 'POST', headers }))).status, 202);
   await Promise.all(pending.splice(0));
-  assert.equal((await fleet.fetch(new Request('https://fleet/router/reuse?project=project-a&mode=config', { method: 'POST', headers }))).status, 200);
+  assert.equal((await fleet.fetch(new Request('https://fleet/router/reuse?project=peek&mode=config', { method: 'POST', headers }))).status, 200);
   await Promise.all(pending.splice(0));
-  assert.equal((await fleet.fetch(new Request('https://fleet/router/reuse?project=project-a&mode=off', { method: 'POST', headers }))).status, 200);
+  assert.equal((await fleet.fetch(new Request('https://fleet/router/reuse?project=peek&mode=off', { method: 'POST', headers }))).status, 200);
   const boxes = project.box({ storage: project.storage, ledger: fleet.router.ledger });
   for (let i = 0; i < 3; i++) await boxes.verificationOutcome({ machineId: `box-${i}`, size: 'large' }, 'boot_failed', false);
   await Promise.all(pending.splice(0));
-  assert.equal((await fleet.fetch(new Request('https://fleet/router/verification-breaker?project=project-a', { method: 'POST', headers }))).status, 204);
+  assert.equal((await fleet.fetch(new Request('https://fleet/router/verification-breaker?project=peek', { method: 'POST', headers }))).status, 204);
   await Promise.all(pending.splice(0));
   assert.deepEqual(posts.map(p => p.event), ['pool_drain', 'reuse_off', 'recovered', 'reuse_off', 'breaker_open', 'breaker_cleared']);
 });
