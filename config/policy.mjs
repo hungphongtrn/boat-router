@@ -1,6 +1,6 @@
-export const defaultWallet = 'example-account';
-export const setupOwner = 'example-owner';
-export const repositories = ['example-owner/project-a'];
+export const defaultWallet = 'peek';
+export const setupOwner = 'hungphongtrn';
+export const repositories = ['hungphongtrn/peek'];
 export const smokeRepository = null;
 export function installedPage(app, _env, page) {
   const base = `https://github.com/apps/${encodeURIComponent(app.slug)}/installations/new/permissions`;

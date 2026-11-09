@@ -20,7 +20,7 @@ export class Storage {
 }
 export function event(id = 101, label = 'boat-default', status = 'queued', runnerName = null) {
   return { id, label, size: { 'boat-default': 'default', 'boat-large': 'large', 'boat-xlarge': 'xlarge' }[label],
-    repo: 'example-owner/project-a', installation: 1, status, runnerName };
+    repo: 'hungphongtrn/peek', installation: 1, status, runnerName };
 }
 export function fixture() {
   const clock = { time: 1_000_000 };

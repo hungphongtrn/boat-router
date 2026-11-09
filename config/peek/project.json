@@ -1,0 +1,36 @@
+{
+  "id": "peek",
+  "repo": "hungphongtrn/peek",
+  "account": "peek",
+  "reuse": {
+    "mode": "on",
+    "idleHoldSeconds": 120
+  },
+  "labels": [
+    "peek-router"
+  ],
+  "machineTtlSeconds": 43200,
+  "jobs": {
+    "ci": {
+      "timeoutMinutes": 150
+    },
+    "ci-test-run": {
+      "timeoutMinutes": 150
+    }
+  },
+  "landing": {
+    "engine": "runner"
+  },
+  "caps": {},
+  "sizes": {
+    "peek-router": {
+      "machine": "default"
+    }
+  },
+  "triggers": [
+    {
+      "on": "workflow_job",
+      "executor": "actions-jit"
+    }
+  ]
+}

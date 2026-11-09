@@ -66,7 +66,7 @@ test('a pre-call pending reservation resumes once or releases when stopped', asy
     const budget = new SharedBudget(ledger, 'project-a', now); let creates = 0;
     const api = { create: async () => { creates++; return { sandbox: { id: 'bx_23456789' } }; } };
     const fleet = new FleetController(storage, { ENABLED: 'true' }, api, now, () => {}, { sharedBudget: budget });
-    const job = { id: 1, repo: 'example-owner/project-a', size: 'large', createKey: 'attempt', phase: 'queued', nextAt: 0, intentDone: stopped };
+    const job = { id: 1, repo: 'hungphongtrn/peek', size: 'large', createKey: 'attempt', phase: 'queued', nextAt: 0, intentDone: stopped };
     await storage.put('job:1', job);
     assert.equal((await budget.admit(job.createKey, limits(now()))).ok, true);
     assert.equal((await budget.admit(job.createKey, limits(now()))).ok, true);
@@ -85,7 +85,7 @@ test('a pre-call reservation cannot start while account preparation failed', asy
   const ledger = new AccountLedger(storage, { starts: { minute: 2, hour: 2, day: 2 } }, now);
   const budget = new SharedBudget(ledger, 'project-a', now); let creates = 0;
   const fleet = new FleetController(storage, { ENABLED: 'true' }, { create: async () => { creates++; } }, now, () => {}, { sharedBudget: budget });
-  const job = { id: 1, repo: 'example-owner/project-a', size: 'large', createKey: 'attempt', phase: 'queued', nextAt: 0 };
+  const job = { id: 1, repo: 'hungphongtrn/peek', size: 'large', createKey: 'attempt', phase: 'queued', nextAt: 0 };
   await storage.put('job:1', job); await budget.admit(job.createKey, limits(now()));
   const reserved = await fleet.reserve(job, 'large');
   fleet.startPreparationFailed = true;
