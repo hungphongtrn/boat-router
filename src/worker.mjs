@@ -1,4 +1,5 @@
 import { BUILD_COMMIT } from './build.mjs';
+import { redact } from './redact.mjs';
 export { Fleet } from './fleet.mjs';
 function fleet(env) { return env.FLEET.get(env.FLEET.idFromName('production-v1')); }
 function forward(request, env) {
@@ -9,6 +10,13 @@ function forward(request, env) {
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
+    if (request.method === 'GET' && url.pathname === '/router/verification-failures') {
+      try { return await forward(request, env); }
+      catch (error) {
+        console.error(JSON.stringify({ event: 'verification_failures_forward_exception', errorClass: error?.constructor?.name ?? 'Unknown', message: redact(error?.message ?? '').slice(0, 1024), stack: redact(error?.stack ?? '').slice(0, 4096) }));
+        throw error;
+      }
+    }
     if (request.method === 'GET' && url.pathname === '/router/build') {
       const response = await forward(request, env);
       if (!response.ok) return response;
@@ -16,8 +24,10 @@ export default {
       return Response.json({ worker_commit: BUILD_COMMIT, do_commit: data.do_commit }, { headers: { 'Cache-Control': 'no-store' } });
     }
     if (request.method === 'GET' && url.pathname === '/health') return forward(new Request('https://fleet/health'), env);
+    if (request.method === 'GET' && url.pathname === '/export') return forward(request, env);
     if ((request.method === 'POST' && url.pathname === '/webhook') ||
-      ['/setup', '/setup/callback', '/setup/installed', '/setup/reset', '/setup/status', '/proof', '/status', '/events', '/router/claims', '/router/pool-shadow', '/router/pool-mode', '/router/pools', '/router/reconcile', '/router/box', '/router/restart', '/router/status', '/router/reuse', '/router/resync', '/router/release', '/router/verification-breaker', '/router/verification-outcomes', '/router/verification-failures', '/router/local/claim', '/router/local/release', '/router/local/started', '/router/local/operator-release'].includes(url.pathname)) return forward(request, env);
+      ['/setup', '/setup/callback', '/setup/installed', '/setup/reset', '/setup/status', '/setup/secrets-to-worker', '/proof', '/status', '/events', '/router/claims', '/router/external-leases', '/router/pacing', '/router/pool-shadow', '/router/pool-mode', '/router/drain-status', '/router/pools', '/router/reconcile', '/router/box', '/router/boxes', '/router/restart', '/router/status', '/router/reuse', '/router/docker-reuse', '/router/local-mode', '/router/setup-watchdog', '/router/lanes', '/router/resync', '/router/release', '/router/verification-breaker', '/router/verification-outcomes', '/router/verification-failures', '/router/local/claim', '/router/local/unavailable', '/router/local/release', '/router/local/started', '/router/local/operator-release', '/router/local/capacity'].includes(url.pathname) ||
+      url.pathname.startsWith('/router/lease/') || /^\/router\/claimer\/(claim|unavailable|release|started|capacity)$/.test(url.pathname)) return forward(request, env);
     return new Response('Not found', { status: 404 });
   },
   async scheduled(_event, env, ctx) {

@@ -1,0 +1,25 @@
+{
+  "id": "example-secondary",
+  "ledgerKey": "account:ledger:example-secondary",
+  "openStartQueue": true,
+  "margin": 0.1,
+  "dayReserve": 0,
+  "starts": {
+    "minute": 4,
+    "hour": 60,
+    "day": 500
+  },
+  "poolPacing": {
+    "enabled": true,
+    "mode": "dynamic",
+    "burst": 1,
+    "reserveStarts": 0
+  },
+  "reuse": {
+    "enabled": true,
+    "floor": 0,
+    "maxJobs": 10,
+    "maxAgeSeconds": 3600,
+    "idleHoldSeconds": 420
+  }
+}

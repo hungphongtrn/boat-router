@@ -23,5 +23,12 @@
       "on": "workflow_job",
       "executor": "actions-jit"
     }
+  ],
+  "workflowConcurrency": [
+    {
+      "workflowPath": ".github/workflows/ci.yml",
+      "jobPrefix": "test (",
+      "maxParallel": 8
+    }
   ]
 }

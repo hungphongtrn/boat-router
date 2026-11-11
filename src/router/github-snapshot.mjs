@@ -1,7 +1,7 @@
 // The adapter returns { status, data, etag, rateRemaining }. Cached pages are
 // required for 304 responses; partial reads must never look complete.
 const fields = {
-  workflow_runs: ['id', 'updated_at', 'status', 'run_attempt', 'head_sha'],
+  workflow_runs: ['id', 'updated_at', 'status', 'run_attempt', 'head_sha', 'path', 'display_title'],
   jobs: ['id', 'status', 'conclusion', 'labels', 'created_at', 'started_at', 'completed_at', 'runner_name', 'run_id', 'head_branch', 'head_sha', 'run_attempt', 'workflow_name', 'name'],
   runners: ['id', 'name', 'status', 'busy', 'labels'],
 };
@@ -16,7 +16,8 @@ export async function snapshot(api, repo, { etags = {}, pages: cached = {}, part
   async function get(path, field) {
     if (calls >= budget) throw new Error('snapshot_budget');
     calls++;
-    const response = await api(repo, path, etags[path] ?? null);
+    const missingRunPaths = field === 'workflow_runs' && cached[path]?.workflow_runs?.some(run => typeof run.path !== 'string' || typeof run.display_title !== 'string');
+    const response = await api(repo, path, missingRunPaths ? null : etags[path] ?? null);
     if (Number.isFinite(response.rateRemaining)) rateRemaining = response.rateRemaining;
     const data = response.status === 304 ? cached[path] : response.data;
     if ((response.status !== 200 && response.status !== 304) || !data || typeof data !== 'object') throw new Error('snapshot_page');
@@ -52,7 +53,7 @@ export async function snapshot(api, repo, { etags = {}, pages: cached = {}, part
       const signature = JSON.stringify(run), saved = partial?.runJobs?.[run.id];
       const entry = saved?.signature === signature ? saved : { signature, jobs: await list(`/actions/runs/${run.id}/jobs?filter=latest`, 'jobs') };
       progress.runJobs[run.id] = entry;
-      jobs.push(...entry.jobs);
+      jobs.push(...entry.jobs.map(job => ({ ...job, ...(typeof run.path === 'string' ? { workflow_path: run.path.split('@')[0] } : {}), ...(typeof run.display_title === 'string' ? { run_name: run.display_title } : {}) })));
     }
     runners.push(...await list('/actions/runners', 'runners'));
     return { complete: true, jobs, runners, etags: nextEtags, pages, rateRemaining, calls };

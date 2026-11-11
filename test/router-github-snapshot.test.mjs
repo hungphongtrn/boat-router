@@ -8,12 +8,12 @@ test('snapshot reads all lists and reuses validated cached pages on 304', async 
     requests.push(path);
     if (etag) return { status: 304 };
     const field = path.includes('/jobs?') ? 'jobs' : path.includes('/runners?') ? 'runners' : 'workflow_runs';
-    const rows = field === 'workflow_runs' && path.includes('status=queued') ? [{ id: 1 }] : field === 'jobs' ? [{ id: 2 }] : [];
+    const rows = field === 'workflow_runs' && path.includes('status=queued') ? [{ id: 1, path: '.github/workflows/full-suite.yml@refs/heads/main' }] : field === 'jobs' ? [{ id: 2 }] : [];
     return { status: 200, etag: 'tag', data: { total_count: rows.length, [field]: rows }, rateRemaining: 4500 };
   };
   const first = await snapshot(api, 'owner/repo');
   assert.equal(first.complete, true);
-  assert.deepEqual(first.jobs, [{ id: 2 }]);
+  assert.deepEqual(first.jobs, [{ id: 2, workflow_path: '.github/workflows/full-suite.yml' }]);
   assert.equal(first.calls, 4);
   const second = await snapshot(api, 'owner/repo', first);
   assert.equal(second.complete, true);
@@ -56,4 +56,19 @@ test('a backlog of 49 runs completes over two budgeted ticks', async () => {
   assert.equal(second.complete, true);
   assert.equal(second.jobs.length, 49);
   assert.ok(second.calls <= 40);
+});
+
+
+test('old cached run pages without paths are refreshed even with an etag', async () => {
+  const seen = [];
+  const api = async (_repo, path, etag) => {
+    seen.push({ path, etag });
+    const field = path.includes('/jobs?') ? 'jobs' : path.includes('/runners?') ? 'runners' : 'workflow_runs';
+    const rows = field === 'workflow_runs' && path.includes('status=queued') ? [{ id: 1, path: '.github/workflows/full-suite.yml' }] : field === 'jobs' ? [{ id: 2 }] : [];
+    return { status: 200, data: { total_count: rows.length, [field]: rows } };
+  };
+  const key = '/actions/runs?status=queued&per_page=100&page=1';
+  const result = await snapshot(api, 'owner/repo', { etags: { [key]: 'old' }, pages: { [key]: { total_count: 1, workflow_runs: [{ id: 1 }] } } });
+  assert.equal(seen.find(x => x.path === key).etag, null);
+  assert.equal(result.jobs[0].workflow_path, '.github/workflows/full-suite.yml');
 });

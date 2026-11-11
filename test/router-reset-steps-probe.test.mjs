@@ -18,7 +18,7 @@ for (const [target, step] of [['docker','docker prune'], ['find','clean work dir
     assert.equal(result.status,7);
     const detail=parseLightResetResult({exitCode:result.status,stdout:result.stdout,stderr:result.stderr},1);
     assert.equal(detail.step,step); assert.equal(detail.exitCode,7);
-    assert.match(detail.output,/failure detail/); assert.doesNotMatch(detail.output,/secret-value/);
+    assert.ok(detail.output.includes(`BOAT_RESET_STAGE step=${step}`)); assert.doesNotMatch(detail.output,/secret-value|failure detail/);
   });
 }
 
@@ -31,5 +31,5 @@ test('reports failure to list containers', () => {
   const result=spawnSync('/bin/bash',['-c',script],{env:{PATH:`${bin}:/usr/bin:/bin`},encoding:'utf8'});
   assert.equal(result.status,7);
   const detail=parseLightResetResult({exitCode:result.status,stdout:result.stdout,stderr:result.stderr},1);
-  assert.equal(detail.step,'docker prune'); assert.equal(detail.exitCode,7); assert.match(detail.output,/container list failed/);
+  assert.equal(detail.step,'docker prune'); assert.equal(detail.exitCode,7); assert.match(detail.output,/BOAT_RESET_STAGE step=docker prune/); assert.doesNotMatch(detail.output,/container list failed/);
 });

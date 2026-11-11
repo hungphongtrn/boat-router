@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { mkdtemp, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -163,7 +164,7 @@ if scenario == 'bad layer digest':
     (root / 'layer-response').write_bytes(b'changed registry layer')
 `;
 
-for (const scenario of ['poisoned executable', 'modified metadata', 'modified mountpoint', 'unexpected file', 'poisoned environment', 'bad layer digest', 'genuine', 'manifest image']) test(`the privileged helper checks ${scenario} before it can execute`, async () => {
+for (const scenario of ['poisoned executable', 'modified metadata', 'modified mountpoint', 'unexpected file', 'poisoned environment', 'bad layer digest', 'genuine', 'manifest image', 'offline genuine', 'offline bad layer', 'offline missing layer']) test(`the privileged helper checks ${scenario} before it can execute`, async () => {
   const directory = await mkdtemp(join(tmpdir(), 'boat-helper-integrity-'));
   const binaries = join(directory, 'bin');
   const control = join(directory, 'control');
@@ -171,6 +172,16 @@ for (const scenario of ['poisoned executable', 'modified metadata', 'modified mo
   await mkdir(control);
   const fixture = spawnSync('python3', ['-I', '-B', '-c', fixtureGenerator, directory, scenario], { encoding: 'utf8' });
   assert.equal(fixture.status, 0, fixture.stderr);
+  if (scenario.startsWith('offline')) {
+    const cache = join(control, 'helper-oci');
+    await mkdir(cache);
+    await writeFile(join(control, 'snapshot-mode'), '');
+    for (const name of ['manifest', 'config', 'layer']) {
+      const data = await readFile(join(directory, name));
+      if (name === 'layer' && scenario === 'offline missing layer') continue;
+      await writeFile(join(cache, createHash('sha256').update(data).digest('hex')), name === 'layer' && scenario === 'offline bad layer' ? 'tampered' : data);
+    }
+  }
   const docker = String.raw`#!/usr/bin/python3
 import json, os, pathlib, sys
 root = pathlib.Path(os.environ['TASK_TEST_ROOT'])
@@ -198,8 +209,11 @@ root = pathlib.Path(os.environ['TASK_TEST_ROOT'])
 source = pathlib.Path(sys.argv[-3]).read_text().split("if __name__ == '__main__':")[0]
 namespace = {}
 exec(source, namespace)
+namespace['CONTROL'] = root / 'control'
 namespace['HELPER_IMAGE_DIGEST'] = 'sha256:' + hashlib.sha256((root / 'manifest').read_bytes()).hexdigest()
 def fetch(request, **kwargs):
+    if (root / 'control/snapshot-mode').exists():
+        raise AssertionError('unexpected network request')
     url = request.full_url if hasattr(request, 'full_url') else request
     if 'auth.docker.io' in url:
         return io.BytesIO(b'{"token":"fixture-token"}')
@@ -222,7 +236,7 @@ namespace['verify_helper'](sys.argv[-1])
     env: { PATH: binaries + ':/usr/bin:/bin', TASK_TEST_ROOT: directory } });
   assert.equal(result.status, 0, result.stderr);
   const parsed = parseRefreshResult({ stdout: result.stdout }, 1);
-  if (scenario === 'genuine' || scenario === 'manifest image') {
+  if (scenario === 'genuine' || scenario === 'manifest image' || scenario === 'offline genuine') {
     assert.equal(parsed?.ok, true);
     assert.equal(await readFile(join(directory, 'executed'), 'utf8'), 'privileged helper executed');
   } else {

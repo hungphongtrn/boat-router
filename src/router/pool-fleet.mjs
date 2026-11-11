@@ -2,6 +2,7 @@ import { FleetBase } from './fleet-base.mjs';
 import { LocalFleet } from './local-fleet.mjs';
 import { jobKey } from './jit-pool.mjs';
 import { verifyAttentionRecovery } from './attention-recovery.mjs';
+import { transition as applyBoxEvent } from './box-state.mjs';
 
 export class PoolFleet extends FleetBase {
   constructor(storage, env, api, now, logger, options = {}) {
@@ -29,7 +30,7 @@ export class PoolFleet extends FleetBase {
           claim.machineId !== job.machineId || claim.generation !== machine.generation || box?.state !== 'quarantined' ||
           box.runnerId !== (job.runnerId ?? null) || box.generation !== (machine.generation ?? job.generation ?? 0) ||
           (observed?.observedAt ?? 0) > startedAt) return false;
-      await tx.put(`box:${job.machineId}`, { ...box, state: 'deleted', finishedAt: this.now() });
+      await tx.put(`box:${job.machineId}`, applyBoxEvent(box, 'operator_recover', { finishedAt: this.now() }, this.now()));
       await tx.put(`legacy:machine:${job.machineId}`, { ...machineArchive, value: { ...machine, state: 'deleted', finishedAt: this.now() } });
       const next = { ...current, phase: 'queued', machineId: null, runnerId: null, createPending: false, createKey: crypto.randomUUID(), nextAt: 0, intentDone: false, intentStarted: false };
       await tx.put(`legacy:job:${id}`, { ...currentArchive, value: next });

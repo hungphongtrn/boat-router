@@ -1,4 +1,5 @@
 import { validMachineSize } from './sizes.mjs';
+import { boxSupply } from './box-state.mjs';
 
 export function poolKey(repo, label) { return JSON.stringify([repo, label]); }
 export function configuredPoolSize(config, label) {
@@ -11,6 +12,13 @@ export function poolSize(config, label) {
   return size;
 }
 
+export function localOfferActive(unit, now, cfg = {}) {
+  if (!unit.host || unit.busy || !['claiming', 'pending', 'started'].includes(unit.state) || !Number.isFinite(unit.at)) return false;
+  const hold = Math.max(0, Math.min(180, Number(cfg.registeredHoldSeconds) || 0)) * 1000;
+  if (unit.state === 'started' && hold && Number.isFinite(unit.startedAt)) return now < Math.min(unit.startedAt + hold, unit.at + 30_000 + hold);
+  return now < unit.at + 30_000;
+}
+
 export function supplyCounts(units, now, cfg = {}) {
   const seconds = (key, fallback) => (cfg[key] ?? fallback) * 1000;
   const within = (at, ms) => Number.isFinite(at) && now < at + ms;
@@ -18,21 +26,14 @@ export function supplyCounts(units, now, cfg = {}) {
   for (const unit of units) {
     const state = unit.state;
     let count = false;
-    if (unit.kind === 'foreign') count = unit.snapshotComplete === true && unit.online === true && !unit.busy;
+    if (unit.kind === 'held-boat') count = true;
+    else if (unit.kind === 'foreign') count = unit.snapshotComplete === true && unit.online === true && !unit.busy;
     else if (unit.kind === 'local') {
-      if (state === 'claiming' || state === 'pending') count = within(unit.at, seconds('offerSeconds', 30));
-      else if (state === 'started') count = !unit.busy && (unit.online === true || (!unit.everOnline && within(unit.startedAt, seconds('onlineGraceSeconds', 120))));
+      count = localOfferActive(unit, now, cfg);
     } else if (unit.kind === 'create') {
       if (state === 'pending') count = true;
       else if (state === 'calling' || state === 'unknown') count = within(unit.callingAt ?? unit.at, seconds('createSoftSeconds', 120));
-    } else {
-      if (state === 'booting') count = within(unit.since, seconds('bootSoftSeconds', 300));
-      else if (state === 'baseline') count = within(unit.since, seconds('bootSoftSeconds', 300));
-      else if (state === 'ready') count = true;
-      else if (state === 'registering') count = within(unit.since, seconds('registerSeconds', 120));
-      else if (state === 'resetting') count = within(unit.since, seconds('resetSoftSeconds', 120));
-      else if (state === 'idle') count = !unit.busy && (unit.online === true || (!unit.everOnline && within(unit.startedAt ?? unit.since, seconds('onlineGraceSeconds', 120))));
-    }
+    } else count = boxSupply(unit, now, cfg);
     if (count) {
       const key = unit.kind === 'foreign' ? 'foreign' : unit.kind === 'local' ? `local:${state}` : unit.kind === 'create' ? `create:${state}` : state;
       counts[key] = (counts[key] ?? 0) + 1;
@@ -41,8 +42,9 @@ export function supplyCounts(units, now, cfg = {}) {
   return counts;
 }
 
-export function uncovered(jobs, supply) {
-  return [...jobs].sort((a, b) => a.queuedAt - b.queuedAt || a.id - b.id).slice(supply);
+// `compare` orders the jobs (lane rank, then queuedAt); the default is the old FIFO.
+export function uncovered(jobs, supply, compare = (a, b) => a.queuedAt - b.queuedAt || (typeof a.id === 'number' && typeof b.id === 'number' ? a.id - b.id : String(a.id).localeCompare(String(b.id)))) {
+  return [...jobs].sort(compare).slice(supply);
 }
 
 // Inputs are observations grouped by pool; no job owns a supply unit.
@@ -50,7 +52,7 @@ export function plan({ pools, jobs, units, now }) {
   const result = {};
   for (const pool of pools) {
     const demand = jobs.filter(job => job.pool === pool.key && job.status === 'queued');
-    const aged = demand.filter(job => !pool.localFirst || job.queuedAt + (pool.offerSeconds ?? 30) * 1000 <= now);
+    const aged = demand;
     const counts = supplyCounts(units.filter(unit => unit.pool === pool.key), now, pool);
     const supply = Object.values(counts).reduce((sum, value) => sum + value, 0);
     const reason = pool.reason ?? null;

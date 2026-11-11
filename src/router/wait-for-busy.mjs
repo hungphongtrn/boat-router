@@ -14,8 +14,9 @@ export async function recordDuration(tx, job) {
   const duration = job.completedAt - job.startedAt;
   if (!Number.isFinite(duration) || duration <= 0 || !job.conclusion) return;
   const key = historyKey(job.pool), history = await tx.get(key) ?? { all: [], names: {} };
-  const poolMedian = median(history.all);
-  if (poolMedian && duration > 3 * poolMedian) job.slowBox = true;
+  const jobMedian = job.jobName ? median(history.names[JSON.stringify(job.jobName)]) : null;
+  // A cancelled or skipped job was stopped from outside; its length says nothing about the box.
+  if (jobMedian && duration > 3 * jobMedian && !['cancelled', 'skipped'].includes(job.conclusion)) job.slowBox = true;
   job.durationRecorded = true;
   if (['timed_out', 'cancelled', 'skipped'].includes(job.conclusion)) return;
   history.all = [...history.all, duration].slice(-32);
@@ -31,7 +32,8 @@ export async function recordDuration(tx, job) {
 export async function waitClaims({ storage, api, jobs, boxes, pools, units, now, account, project, env = {}, enabled, logger }) {
   const cfg = account.waitForBusyBox;
   const valid = enabled && cfg?.enabled === true && Number.isFinite(cfg.maxWaitMs) && cfg.maxWaitMs > 0 &&
-    Number.isFinite(cfg.scarcityFrom) && Number.isFinite(cfg.scarcityFull) && cfg.scarcityFrom >= 0 && cfg.scarcityFull <= 1 && cfg.scarcityFull > cfg.scarcityFrom;
+    Number.isFinite(cfg.scarcityFrom) && Number.isFinite(cfg.scarcityFull) && cfg.scarcityFrom >= 0 && cfg.scarcityFull <= 1 && cfg.scarcityFull > cfg.scarcityFrom &&
+    (cfg.minimumAllowanceMs === undefined || (Number.isFinite(cfg.minimumAllowanceMs) && cfg.minimumAllowanceMs >= 0 && cfg.minimumAllowanceMs <= Math.min(600_000, cfg.maxWaitMs)));
   const claims = await records(storage, 'wait:claim:');
   const active = [], claimedBoxes = new Set();
   const byJob = new Map(jobs.map(j => [j.id, j])), byBox = new Map(boxes.map(b => [b.machineId, b]));
@@ -41,8 +43,9 @@ export async function waitClaims({ storage, api, jobs, boxes, pools, units, now,
       if (!current || current.machineId !== claim.machineId || current.at !== claim.at) return false;
       await tx.delete(`wait:claim:${claim.jobId}`);
       if (await tx.get(`wait:box:${claim.machineId}`) === claim.jobId) await tx.delete(`wait:box:${claim.machineId}`);
-      const job = await tx.get(`gh-job:${claim.jobId}`);
-      if (job) await tx.put(`gh-job:${claim.jobId}`, { ...job, waitAttempted: true });
+      const jobKey = byJob.get(claim.jobId)?.direct === true ? `direct:job:${claim.jobId}` : `gh-job:${claim.jobId}`;
+      const job = await tx.get(jobKey);
+      if (job) await tx.put(jobKey, { ...job, waitAttempted: true });
       return true;
     });
     if (!removed) return;
@@ -54,7 +57,7 @@ export async function waitClaims({ storage, api, jobs, boxes, pools, units, now,
     let outcome;
     if (!valid) outcome = 'disabled';
     else if (!job || job.missing) outcome = 'job_missing';
-    else if (job.status !== 'queued') outcome = job.runnerName && box?.runnerName === job.runnerName ? 'reused' : 'other_assignment';
+    else if (job.status !== 'queued') outcome = (job.direct === true ? box?.lease === job.id : job.runnerName && box?.runnerName === job.runnerName) ? 'reused' : 'other_assignment';
     else if (now >= claim.until) outcome = 'expired';
     else if (!box || box.pool !== claim.pool || box.failureReason || box.drainOnly || (box.state === 'retiring' && box.afterFence !== 'finished') || ['destroying', 'purging', 'deleted', 'quarantined', 'unregister'].includes(box.state)) outcome = 'box_failed';
     else if (box.generation > claim.generation && box.state === 'busy') outcome = 'other_assignment';
@@ -89,14 +92,14 @@ export async function waitClaims({ storage, api, jobs, boxes, pools, units, now,
       const day = limits?.windows?.day, hour = limits?.windows?.hour;
       if (!day || !hour || now - limits.at > 30_000 || limits.at > now) break;
       const scarcity = Math.max(day.used / day.limit, hour.used / hour.limit);
-      const allowance = Math.min(600_000, cfg.maxWaitMs) * Math.max(0, Math.min(1, (scarcity - cfg.scarcityFrom) / (cfg.scarcityFull - cfg.scarcityFrom)));
+      const allowance = Math.max(cfg.minimumAllowanceMs ?? 0, Math.min(600_000, cfg.maxWaitMs) * Math.max(0, Math.min(1, (scarcity - cfg.scarcityFrom) / (cfg.scarcityFull - cfg.scarcityFrom))));
       if (allowance <= 0) break;
       const history = await storage.get(historyKey(pool.key)) ?? { all: [], names: {} };
       const choices = available.map(box => {
-        const running = jobs.find(j => j.status === 'in_progress' && j.runnerName === box.runnerName && j.pool === pool.key);
+        const running = jobs.find(j => j.status === 'in_progress' && j.pool === pool.key && (j.direct === true ? box.lease === j.id : j.runnerName && j.runnerName === box.runnerName));
         const typical = median(history.names[JSON.stringify(running?.jobName)]) ?? median(history.all) ?? 600_000;
-        const poolMedian = median(history.all);
-        const tooSlow = running && poolMedian && now - running.startedAt > 3 * poolMedian;
+        const jobMedian = running?.jobName ? median(history.names[JSON.stringify(running.jobName)]) : null;
+        const tooSlow = running && jobMedian && now - running.startedAt > 3 * jobMedian;
         return { box, remaining: running && Number.isFinite(running.startedAt) && !tooSlow ? Math.max(0, running.startedAt + typical - now) + 15_000 : Infinity };
       }).filter(item => item.remaining <= allowance).sort((a,b) => a.remaining - b.remaining);
       if (!choices.length) continue;

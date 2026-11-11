@@ -70,3 +70,18 @@ test('oversized old snapshots are discarded without failing the tick', async () 
   assert.ok(Buffer.byteLength(JSON.stringify(await storage.get('pool:snapshot'))) < 1_000_000);
   assert.equal(await storage.get('pool:snapshot-complete'), false);
 });
+
+test('partial snapshot resumes quickly only with sufficient GitHub quota', async () => {
+  const { snapshotResumeAt } = await import('../src/router/pool-observations.mjs');
+  assert.equal(snapshotResumeAt({ partialScan: true, rateRemaining: 2501 }, 1000), 6000);
+  assert.equal(snapshotResumeAt({ partialScan: true, rateRemaining: 2500 }, 1000), null);
+  assert.equal(snapshotResumeAt({ partialScan: true }, 1000), null);
+  assert.equal(snapshotResumeAt({ complete: true, rateRemaining: 4000 }, 1000), null);
+});
+
+test('a later webhook retains the workflow path learned from the snapshot', async () => {
+  const storage = new Storage();
+  await observe(storage, { ...event, workflowPath: '.github/workflows/full-suite.yml' }, 10, 'snapshot');
+  await observe(storage, { ...event, status: 'in_progress' }, 11, 'webhook');
+  assert.equal((await storage.get('gh-job:1')).workflowPath, '.github/workflows/full-suite.yml');
+});

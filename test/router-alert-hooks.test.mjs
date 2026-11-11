@@ -1,7 +1,18 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { Storage } from './helpers.mjs';
-import { AlertHooks } from '../src/router/alert-hooks.mjs';
+import { AlertHooks, parseAlertConfig, queueWaitMinutes } from '../src/router/alert-hooks.mjs';
+
+test('alerts detect a direct job waiting for a busy box', async () => {
+  const configs = parseAlertConfig(JSON.stringify([{ on: ['queue_wait'], url: 'https://example.test/alert', minutes: 5 }]));
+  const posts = [], pending = [], hooks = new AlertHooks(new Storage(), configs, () => ({}), { now: () => 600_000, waitUntil: promise => pending.push(promise), fetcher: async (_, options) => { posts.push(JSON.parse(options.body)); return new Response(null, { status: 204 }); } });
+  const minutes = queueWaitMinutes([], [{ status: 'queued', queuedAt: 60_000 }, { status: 'completed', queuedAt: 0 }], 600_000);
+  await hooks.observe('queue_wait', { project: 'project-a', value: minutes });
+  await Promise.all(pending);
+  assert.equal(posts[0].event, 'queue_wait');
+  assert.equal(posts[0].value, 9);
+  assert.throws(() => parseAlertConfig('[{"on":["queue_wait"],"url":"https://example.test/?token=bad"}]'), /invalid alert config/);
+});
 
 test('hooks deduplicate crossings, recover and rearm', async () => {
   const posts = [], pending = [], storage = new Storage();
