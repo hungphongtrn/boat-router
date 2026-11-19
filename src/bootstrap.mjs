@@ -179,6 +179,10 @@ ln -sf /home/user/.local/bin/shellcheck /usr/local/bin/shellcheck
 phase runner_download
 fetch_mirrored '${RELEASES.runner.mirror}' '${RELEASES.runner.url}' '${RELEASES.runner.sha256}' /home/user/.boat-ci/runner.tar.gz
 tar xzf /home/user/.boat-ci/runner.tar.gz -C /home/user/boat-ci-runner
+# The snapshot manifest and every JIT start need these two; a tarball that
+# extracted somewhere else must fail here, not at the first job.
+test -x /home/user/boat-ci-runner/Runner.Listener
+test -x /home/user/boat-ci-runner/Runner.Worker
 pwsh -NoLogo -NoProfile -NonInteractive -Command '$PSVersionTable.PSVersion.ToString()'
 shellcheck --version
 cat > /home/user/boat-ci-start.sh <<'START'

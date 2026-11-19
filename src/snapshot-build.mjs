@@ -73,7 +73,9 @@ HELPER_OCI`;
 // then lists whichever git the box resolves: a boot verifies what this build
 // found, not what a mode says it should find.
 export function snapshotBuildScript() {
-  const common = snapshotManifestFiles().filter(file => file !== '/usr/bin/git').map(file => `'${file}'`).join(' ');
+  const files = snapshotManifestFiles().filter(file => file !== '/usr/bin/git');
+  const common = files.map(file => `'${file}'`).join(' ');
+  const listed = files.join(' ');
   return `#!/usr/bin/env bash
 set -Eeuo pipefail
 ${environment()}
@@ -101,6 +103,9 @@ cargo-nextest nextest --version
 bun --version
 docker image inspect postgres:17 >/dev/null
 phase snapshot_manifest_write
+# Name what is absent before sha256sum does: its first failure would otherwise be
+# the only trace of a bootstrap that never installed the layout.
+for file in ${listed}; do test -e "$file" || printf 'BOAT_MANIFEST_MISSING %s\\n' "$file" >&2; done
 manifest=/home/user/.boat-ci/toolchain.sha256
 : > "$manifest"
 sha256sum -- ${common} >> "$manifest"
