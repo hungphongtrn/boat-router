@@ -140,7 +140,8 @@ const healthFixture = ({ stepMicros = 1000, pgrepForeign = false, memAvailableKi
   writeFileSync(`${dir}/clock`, '1000000000000000');
   stub('date', `v=$(cat "${dir}/clock"); echo $((v + ${stepMicros})) > "${dir}/clock"; printf '%s\\n' "$v"`);
   writeFileSync(`${dir}/meminfo`, `MemTotal:        8000000 kB\nMemFree:         1000000 kB\nMemAvailable:    ${memAvailableKiB} kB\n`);
-  const script = decode(lightResetCommand(1, null, 4194304, 4194304, mode)).replaceAll('/proc/meminfo', `${dir}/meminfo`).replaceAll('/var/tmp/.boat-reset-health', `${dir}/vartmp/probe`);
+  writeFileSync(`${dir}/cpuinfo`, 'processor\t: 0\nmodel name\t: Fixture CPU\n');
+  const script = decode(lightResetCommand(1, null, 4194304, 4194304, mode)).replaceAll('/proc/meminfo', `${dir}/meminfo`).replaceAll('/proc/cpuinfo', `${dir}/cpuinfo`).replaceAll('/var/tmp/.boat-reset-health', `${dir}/vartmp/probe`);
   return run(script, { PATH: `${bin}:/usr/bin:/bin`, CALLS: `${dir}/calls` });
 };
 
@@ -149,7 +150,7 @@ test('a healthy box passes the post-reset check and reports its measurements', (
   assert.equal(result.status, 0, result.stderr);
   const parsed = parseLightResetResult({ exitCode: 0, stdout: result.stdout }, 1);
   assert.equal(parsed.ok, true);
-  assert.deepEqual(parsed.summary.health, { cpuMs: 1, fsyncMs: 1, writeMs: 1, memPct: 75, foreign: false, measured: true, failed: false, slow: false, cpu: null });
+  assert.deepEqual(parsed.summary.health, { cpuMs: 1, fsyncMs: 1, writeMs: 1, memPct: 75, foreign: false, measured: true, failed: false, slow: false, cpu: 'Fixture CPU' });
 });
 
 test('a box with slow synchronous writes fails the health guard after one retry', () => {

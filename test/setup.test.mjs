@@ -11,7 +11,7 @@ async function setupFixture() {
   const storage = new Storage();
   const env = { ENABLED: 'false', PUBLIC_ORIGIN: origin, BOAT_CI_API_KEY: f.env.BOAT_CI_API_KEY,
     SETUP_BOOTSTRAP: JSON.stringify({ tokenHash: await hash(token), expiresAt: f.now() + 30 * 60_000 }) };
-  const app = { id: 123, slug: 'boat-ci-test', owner: { login: 'example-owner' }, pem: f.env.GITHUB_APP_PRIVATE_KEY,
+  const app = { id: 123, slug: 'boat-ci-test', owner: { login: 'hungphongtrn' }, pem: f.env.GITHUB_APP_PRIVATE_KEY,
     webhook_secret: 'PRIVATE_FAKE_MANIFEST_WEBHOOK_SECRET', client_secret: 'PRIVATE_FAKE_UNUSED_CLIENT_SECRET' };
   const requests = []; const alerts = [];
   let convert = async () => Response.json(app);

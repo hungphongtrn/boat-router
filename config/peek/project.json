@@ -1,0 +1,48 @@
+{
+  "id": "peek",
+  "repo": "hungphongtrn/peek",
+  "account": "peek",
+  "reuse": {
+    "mode": "on"
+  },
+  "labels": [
+    "peek-router"
+  ],
+  "machineTtlSeconds": 28800,
+  "jobs": {
+    "ci": {
+      "timeoutMinutes": 40
+    },
+    "shard": {
+      "timeoutMinutes": 30
+    },
+    "ci-test-run": {
+      "timeoutMinutes": 40
+    },
+    "promotion": {
+      "timeoutMinutes": 30
+    }
+  },
+  "landing": {
+    "engine": "runner"
+  },
+  "sizes": {
+    "peek-router": {
+      "machine": "default"
+    }
+  },
+  "triggers": [
+    {
+      "on": "workflow_job",
+      "executor": "actions-jit"
+    }
+  ],
+  "snapshotBoot": true,
+  "workflowConcurrency": [
+    {
+      "workflowPath": ".github/workflows/ci.yml",
+      "jobPrefix": "shard (",
+      "maxParallel": 4
+    }
+  ]
+}

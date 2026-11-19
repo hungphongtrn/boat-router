@@ -109,7 +109,7 @@ test('real Workers runtime completes manifest setup, restarts, and uses Worker s
     outboundService: async request => {
       if (new URL(request.url).pathname.includes('/app-manifests/')) {
         conversions++; assert.equal(request.headers.get('Authorization'), null);
-        return Response.json({ id: 123, slug: 'boat-ci-test', owner: { login: 'example-owner' }, pem: f.env.GITHUB_APP_PRIVATE_KEY, webhook_secret: secret });
+        return Response.json({ id: 123, slug: 'boat-ci-test', owner: { login: 'hungphongtrn' }, pem: f.env.GITHUB_APP_PRIVATE_KEY, webhook_secret: secret });
       }
       return f.fetcher(request.url, { method: request.method, headers: Object.fromEntries(request.headers),
         body: ['GET', 'HEAD'].includes(request.method) ? undefined : await request.text() });
