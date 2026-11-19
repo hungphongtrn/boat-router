@@ -1,3 +1,5 @@
+import { dayLimit, paidExtraEnabled } from './paid-extra.mjs';
+
 const SPANS = { minute: 60_000, hour: 3_600_000, day: 86_400_000 };
 const count = value => Number.isSafeInteger(value) && value >= 0;
 
@@ -14,18 +16,22 @@ export function dynamicPacing({ snapshot, policy, claims, previous, now }) {
   if (ownedDayCap !== undefined && !count(ownedDayCap)) throw new TypeError('invalid owned daily start cap');
   const margin = policy.margin ?? 0, dayReserve = policy.dayReserve ?? policy.defaultDayReserve ?? 0;
   if (!Number.isFinite(margin) || margin < 0 || margin >= 1 || !count(dayReserve)) throw new TypeError('invalid dynamic pacing margin');
+  const allowPaidExtra = paidExtraEnabled(policy);
   const remaining = {}, hardRemaining = {}, capacities = {}, localRooms = {};
   for (const [name, span] of Object.entries(SPANS)) {
     const observed = snapshot.windows?.[name], configured = policy.starts?.[name], windowMargin = policy.windowMargins?.[name] ?? margin;
     if (!observed || !count(observed.limit) || observed.limit < 1 || !count(observed.used) || (configured != null && !count(configured)) || !Number.isFinite(windowMargin) || windowMargin < 0 || windowMargin >= 1) return null;
-    const cap = Math.max(0, Math.floor(Math.min(configured ?? Infinity, observed.limit) * (1 - windowMargin)) - (name === 'day' ? dayReserve + reserve : 0));
+    // Paid extras raise the day ceiling to the configured cap; minute and hour
+    // keep the provider's own limit, which the account cannot buy past.
+    const ceiling = name === 'day' ? dayLimit(observed.limit, configured, allowPaidExtra) : Math.min(configured ?? Infinity, observed.limit);
+    const cap = Math.max(0, Math.floor(ceiling * (1 - windowMargin)) - (name === 'day' ? dayReserve + reserve : 0));
     const local = claims.filter(c => c.status !== 'created' || (c.settledAt ?? c.at) > now - span);
     const candidates = local.filter(c => c.status === 'created' && Number.isFinite(c.settledAt) && c.settledAt < snapshot.at).length;
     const unobserved = local.filter(c => c.status !== 'created' || !Number.isFinite(c.settledAt) || c.settledAt >= snapshot.at).length + Math.max(0, candidates - observed.used);
     const localRoom = Math.min(configured == null ? Infinity : configured - local.length, name === 'day' && ownedDayCap !== undefined ? ownedDayCap - local.length : Infinity);
     remaining[name] = Math.max(0, Math.min(localRoom, cap - observed.used - unobserved));
     localRooms[name] = localRoom;
-    hardRemaining[name] = Math.max(0, Math.min(localRoom, Math.min(configured ?? Infinity, observed.limit) - (name === 'day' ? hardDayReserve : 0) - observed.used - unobserved));
+    hardRemaining[name] = Math.max(0, Math.min(localRoom, ceiling - (name === 'day' ? hardDayReserve : 0) - observed.used - unobserved));
     capacities[name] = cap;
   }
   const dayCapacity = Math.min(capacities.day, ownedDayCap ?? Infinity), safeDay = remaining.day;
@@ -58,7 +64,7 @@ export function dynamicPacing({ snapshot, policy, claims, previous, now }) {
     const pendingUnmatched = at < fallbackAt ? unmatched : 0;
     const expiredUnmatched = unmatched - pendingUnmatched;
     const estimatedRemainingDay = Math.max(0, Math.min(dayCapacity, localRooms.day + expiredTracked, safeDay + expiredTracked + expiredUnmatched));
-    const estimatedHardRemainingDay = Math.min(ownedDayCap ?? Infinity, Math.max(0, Math.min(snapshot.windows.day.limit, policy.starts?.day ?? Infinity) - hardDayReserve), hardRemaining.day + expiredTracked + expiredUnmatched);
+    const estimatedHardRemainingDay = Math.min(ownedDayCap ?? Infinity, Math.max(0, dayLimit(snapshot.windows.day.limit, policy.starts?.day, allowPaidExtra) - hardDayReserve), hardRemaining.day + expiredTracked + expiredUnmatched);
     // At the next hourly sample provider minute/hour usage has rolled off
     // under the no-new-start assumption. Continue holding uncertain claims.
     const projectedWindowRoom = name => hourOffset === 0 ? hardRemaining[name] : Math.max(0, Math.min(localRooms[name], hardRemaining[name] + snapshot.windows[name].used));

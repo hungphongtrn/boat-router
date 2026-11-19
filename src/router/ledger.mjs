@@ -1,4 +1,5 @@
 import { dynamicPacing } from './dynamic-pacing.mjs';
+import { dayLimit, paidExtraEnabled, paidStartAllowed } from './paid-extra.mjs';
 const WINDOWS = { minute: 60_000, hour: 3_600_000, day: 86_400_000 };
 const validCount = n => Number.isSafeInteger(n) && n >= 0;
 function releaseFloor(state, key) {
@@ -146,7 +147,9 @@ export class AccountLedger {
       const group = JSON.stringify([...keys].sort());
       if (keys.some(key => !state.waiting.some(item => item.key === key && item.project === project && (item.group ?? JSON.stringify([item.key])) === group))) return { ok: false, reason: 'not_queued' };
       if (!snapshot || !Number.isFinite(snapshot.at) || snapshot.at > now || now - snapshot.at > 30_000 || snapshot.canStart !== true) return { ok: false, reason: 'limits_unavailable' };
+      const allowPaidExtra = paidExtraEnabled(this.policy);
       if (this.policy.forbidPaidStarts && snapshot.nextStartDollars !== 0) return { ok: false, reason: 'paid_start_refused' };
+      if (allowPaidExtra && !paidStartAllowed(snapshot.nextStartDollars)) return { ok: false, reason: 'paid_start_ceiling' };
       const margin = this.policy.margin ?? 0;
       if (!Number.isFinite(margin) || margin < 0 || margin >= 1) throw new TypeError('invalid margin');
       const dayReserve = this.policy.dayReserve ?? (this.policy.defaultDayReserve ?? 0);
@@ -187,7 +190,8 @@ export class AccountLedger {
         if (!provider || !validCount(provider.limit) || !validCount(provider.used) || (configured != null && !validCount(configured)) || provider.limit < 1) return { ok: false, reason: 'limits_unavailable' };
         const windowMargin = this.policy.windowMargins?.[name] ?? margin;
         if (!Number.isFinite(windowMargin) || windowMargin < 0 || windowMargin >= 1) throw new TypeError('invalid window margin');
-        const cappedLimit = unpaced ? Math.min(configured ?? Infinity, provider.limit) : dynamicEnabled ? Math.floor(Math.min(configured ?? Infinity, provider.limit) * (1 - windowMargin)) : Math.min(configured ?? Infinity, Math.floor(provider.limit * (1 - windowMargin)));
+        const providerWindow = name === 'day' ? dayLimit(provider.limit, configured, allowPaidExtra) : provider.limit;
+        const cappedLimit = unpaced ? Math.min(configured ?? Infinity, providerWindow) : dynamicEnabled ? Math.floor(Math.min(configured ?? Infinity, providerWindow) * (1 - windowMargin)) : Math.min(configured ?? Infinity, Math.floor(providerWindow * (1 - windowMargin)));
         const cap = Math.max(0, cappedLimit - (name === 'day' ? (unpaced ? (this.policy.poolPacing.hardDayReserve ?? 0) : dayReserve) : 0));
         const local = claims.filter(c => (c.settledAt ?? c.at) > now - span || c.status !== 'created');
         const recent = local.filter(c => (c.settledAt ?? c.at) >= snapshot.at || c.status !== 'created').length;
@@ -250,7 +254,7 @@ export class AccountLedger {
         const group = item.group ?? JSON.stringify([item.key]);
         const count = state.waiting.filter(entry => entry.project === item.project && (entry.group ?? JSON.stringify([entry.key])) === group).length;
         if (!pool && item.pool && pacingActive) {
-          const day = snapshot.windows.day, limit = Math.min(day.limit, this.policy.starts?.day ?? Infinity);
+          const day = snapshot.windows.day, limit = dayLimit(day.limit, this.policy.starts?.day, allowPaidExtra);
           const unobserved = claims.filter(c => (c.settledAt ?? c.at) >= snapshot.at || c.status !== 'created').length;
           const burst = pacing.burst ?? 1, reserve = pacing.reserveStarts ?? 0, marginPct = pacing.marginPct ?? 10;
           if (!Number.isFinite(marginPct) || marginPct < 0 || marginPct >= 100 || !validCount(burst) || burst < 1 || !validCount(reserve)) throw new TypeError('invalid pool pacing');
@@ -271,7 +275,7 @@ export class AccountLedger {
         const marginPct = pacing.marginPct ?? 10, burst = pacing.burst ?? 1, reserve = pacing.reserveStarts ?? 0;
         if (!Number.isFinite(marginPct) || marginPct < 0 || marginPct >= 100 || !validCount(burst) || burst < 1 || !validCount(reserve)) throw new TypeError('invalid pool pacing');
         const day = snapshot.windows.day;
-        const cap = Math.min(day.limit, this.policy.starts?.day ?? Infinity);
+        const cap = dayLimit(day.limit, this.policy.starts?.day, allowPaidExtra);
         const unobserved = claims.filter(c => (c.settledAt ?? c.at) >= snapshot.at || c.status !== 'created').length;
         if (day.used + unobserved + keys.length + reserve > cap) freeRefusal ??= 'pacing_reserve';
         const rate = cap * (1 - marginPct / 100) / WINDOWS.day;
