@@ -181,8 +181,8 @@ fetch_mirrored '${RELEASES.runner.mirror}' '${RELEASES.runner.url}' '${RELEASES.
 tar xzf /home/user/.boat-ci/runner.tar.gz -C /home/user/boat-ci-runner
 # The snapshot manifest and every JIT start need these two; a tarball that
 # extracted somewhere else must fail here, not at the first job.
-test -x /home/user/boat-ci-runner/Runner.Listener
-test -x /home/user/boat-ci-runner/Runner.Worker
+test -x /home/user/boat-ci-runner/bin/Runner.Listener
+test -x /home/user/boat-ci-runner/bin/Runner.Worker
 pwsh -NoLogo -NoProfile -NonInteractive -Command '$PSVersionTable.PSVersion.ToString()'
 shellcheck --version
 cat > /home/user/boat-ci-start.sh <<'START'
