@@ -28,8 +28,9 @@ On a snapshot box it keeps what the snapshot is for — the Docker images (the s
 `postgres:17` among them), the primed `/home/user/ci/peek/target/` and the Rust toolchain —
 and clears what the finished job left:
 
-- its processes: `pkill -u ci` plus every process whose executable or working directory is
-  under `/home/user/ci/peek` or the runner's `/tmp/w`;
+- its processes: `pkill -u ci`, the job users' leftover `node`, `Runner.*`, browser and
+  Playwright processes (by uid, taken from `/home/ci` and `/home/user`), and every process
+  whose executable or working directory is under `/home/user/ci/peek` or the runner's `/tmp/w`;
 - its containers, volumes, networks and dangling images: the reset's own helper container
   (label `boat-light-reset`) and any `peek-ci-keep-*` container survive, and `docker image
   prune -f` without `-a` keeps the suite image;
@@ -39,8 +40,9 @@ and clears what the finished job left:
   branch's files;
 - the build cache under `/var/lib/peek-dagger`, without following mounts (`find -xdev`);
 - `/home/ci`, `/tmp` (not the runner's `/tmp/w`), `/var/tmp` and `/dev/shm`, the runner's
-  registration (`.runner`, `.credentials`), and the one-shot
-  `/home/user/.boat-ci/{jit,started,ready}`.
+  registration (`.runner`, `.credentials`, `.credentials_rsaparams`, `.service`), and the
+  one-shot `/home/user/.boat-ci/{jit,started,runner.log}`. A box with neither `/home/ci` nor
+  `/home/user` skips the user wipe rather than failing the reset.
 
 A plain (never-saved) box keeps the old behaviour: everything below `/home/user/ci` is wiped
 too, because nothing there was primed. It then re-extracts the runner and runs the health
