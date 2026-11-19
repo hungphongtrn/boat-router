@@ -102,30 +102,90 @@ ${leaseId ? `if id externallease >/dev/null 2>&1; then
 elif test -e /var/lib/boat-ci-reuse/external-lease-user; then
   false
 fi` : ''}
+# Peek's snapshot boxes run no ci user: the runner and its jobs live on the
+# box user, with the tree at /home/user/ci/peek and the work folder /tmp/w. A
+# cancelled or timed-out job leaves compilers and servers behind, and the next
+# job must not inherit them.
+foreign='node|nodejs|bun|deno|workerd|vitest|esbuild|Runner.Listener|Runner.Worker|chrome|chromium|headless_shell|java|playwright'
+pkill -KILL -x "$foreign" || true
+for proc in /proc/[0-9]*; do
+  pid=\${proc#/proc/}
+  [ "$pid" = "$$" ] && continue
+  for link in exe cwd; do
+    target=$(readlink "$proc/$link" 2>/dev/null) || continue
+    case "$target" in
+    /tmp/w|/tmp/w/*|/home/user/ci/peek|/home/user/ci/peek/*)
+      kill -KILL "$pid" 2>/dev/null || true
+      ;;
+    esac
+  done
+done
 mark 'docker prune'
 helpers=$(docker ps -q --filter label=boat-light-reset)
-containers=$(docker ps -q)
+# A Peek snapshot keeps its Postgres image alive through a container that never
+# runs (ci-base-prime.sh); removing it would drop the image from a later save.
+keepers=$(docker ps -aq --filter 'name=^/peek-ci-keep-')
+protected=$(printf '%s\n%s\n' "$helpers" "$keepers")
+containers=$(docker ps -aq)
 for container in $containers; do
-  if ! printf '%s\n' "$helpers" | grep -Fxq "$container"; then docker rm -f "$container" >/dev/null; fi
+  if ! printf '%s\n' "$protected" | grep -Fxq "$container"; then docker rm -f "$container" >/dev/null 2>&1 || true; fi
 done
-docker system prune -af --volumes >/dev/null
+# The previous job's containers, volumes and networks go; images stay. A
+# snapshot carries its toolchain as images (postgres:17, the Peek API image),
+# and docker system prune -af deleted exactly what the reuse exists to keep,
+# so every reused box pulled and rebuilt them again. Dangling layers still go.
+docker volume prune -f >/dev/null
+docker network prune -f >/dev/null
+docker image prune -f >/dev/null
 mark 'clean work dir'
-find /home/ci/work /home/ci/toolcache -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
-find /home/ci -mindepth 1 -maxdepth 1 ! -name work ! -name toolcache -exec rm -rf -- {} +
-find /tmp /var/tmp /dev/shm -xdev -mindepth 1 -user ci ! -path /tmp/w ! -path '/tmp/w/*' -delete
+if [ -d /home/ci ]; then
+  find /home/ci/work /home/ci/toolcache -mindepth 1 -maxdepth 1 -exec rm -rf -- {} + 2>/dev/null || true
+  find /home/ci -mindepth 1 -maxdepth 1 ! -name work ! -name toolcache -exec rm -rf -- {} +
+  wipe_user=ci
+else
+  # A snapshot box has no ci user: its jobs run as the box user.
+  wipe_user=$(stat -c %U /home/user)
+fi
+find /tmp /var/tmp /dev/shm -xdev -mindepth 1 -user "$wipe_user" ! -path /tmp/w ! -path '/tmp/w/*' -delete 2>/dev/null || true
 ${leaseId ? `rm -rf -- /tmp/lease-${leaseId}` : ''}
+# The primed tree keeps what the primer built (target/, node_modules, .next and
+# its stamp); only the previous job's checkout goes. target/ is the entire
+# point of a snapshot box, so it is never cleaned here.
+tree=/home/user/ci/peek
+if [ -d "$tree/.git" ]; then
+  git -C "$tree" -c safe.directory="$tree" reset --hard --quiet || true
+  git -C "$tree" -c safe.directory="$tree" clean -ffdxq -e target -e node_modules -e .next -e .ci-base-built-at || true
+fi
+# The next job writes its own JIT config and must start from a clean marker and
+# registration, and the snapshot verifier requires both absent at boot.
+rm -f /home/user/.boat-ci/jit /home/user/.boat-ci/started /home/user/.boat-ci/runner.log
+rm -f /home/user/boat-ci-runner/.runner /home/user/boat-ci-runner/.credentials /home/user/boat-ci-runner/.credentials_rsaparams /home/user/boat-ci-runner/.service
+# The snapshot's Dagger cache (a mount point, 12 GB) is empty in every native
+# job too: scripts/ci/free-boat-disk.sh in peek empties it the same way.
+if [ -d /var/lib/peek-dagger ]; then
+  find /var/lib/peek-dagger -xdev -depth -mindepth 1 -delete 2>/dev/null || true
+fi
 mark 'prepare runner'
-mkdir /home/ci/runner
-printf '%s  %s\\n' '${RELEASES.runner.sha256}' /home/user/.boat-ci/runner.tar.gz | sha256sum -c - >/dev/null
-tar xzf /home/user/.boat-ci/runner.tar.gz -C /home/ci/runner
-chown -R ci:ci /home/ci/runner
+if [ ! -f /home/user/.boat-ci/snapshot-mode ]; then
+  # A native box keeps its runner under /home/ci and starts it as the ci user.
+  mkdir -p /home/ci/runner
+  printf '%s  %s\\n' '${RELEASES.runner.sha256}' /home/user/.boat-ci/runner.tar.gz | sha256sum -c - >/dev/null
+  tar xzf /home/user/.boat-ci/runner.tar.gz -C /home/ci/runner
+  chown -R ci:ci /home/ci/runner
+else
+  # A snapshot box keeps the runner the snapshot carries, and its start script.
+  test -x /home/user/boat-ci-start.sh
+  test -x /home/user/boat-ci-runner/run.sh
+  test -f /home/user/.boat-ci/runner.tar.gz
+fi
 mark 'sanity checks'
-for spec in /:${minimumDiskKiB} /home/ci:${minimumHomeDiskKiB}; do
+if [ -d /home/ci ]; then home=/home/ci; else home=/home/user; fi
+for spec in "/:${minimumDiskKiB}" "$home:${minimumHomeDiskKiB}"; do
   path=\${spec%:*}; floor=\${spec##*:}
   disk_info=$(df -Pk "$path" | awk 'NR==2 {print $2, $4}')
   read -r total available <<< "$disk_info"
   if [[ ! "$total" =~ ^[0-9]+$ || ! "$available" =~ ^[0-9]+$ ]] || [ "$total" -le 0 ]; then printf 'BOAT_RESET_GUARD disk\n' >&2; false; fi
-  if [ "$path" = /home/ci ]; then quarter=$(( (total + 3) / 4 )); [ "$floor" -ge "$quarter" ] || floor=$quarter; fi
+  if [ "$path" = "$home" ]; then quarter=$(( (total + 3) / 4 )); [ "$floor" -ge "$quarter" ] || floor=$quarter; fi
   [ "$floor" -le "$total" ] || floor=$total
   if ! [ "$available" -gt "$floor" ]; then printf 'BOAT_RESET_GUARD disk\n' >&2; false; fi
 done

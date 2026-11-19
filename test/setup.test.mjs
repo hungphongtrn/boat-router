@@ -81,6 +81,22 @@ test('setup status lists installation repositories and sanitized deliveries with
   const mint = f.requests.find(x => x.url.endsWith('/access_tokens'));
   assert.deepEqual(JSON.parse(mint.options.body), { permissions: { metadata: 'read' } });
 });
+test('setup status names the secrets-to-worker step instead of an opaque 502', async () => {
+  const f = await setupFixture();
+  const control = 'fake-control-setup-status-32-characters';
+  const config = JSON.parse(f.env.SETUP_BOOTSTRAP); config.controlHash = await hash(control); f.env.SETUP_BOOTSTRAP = JSON.stringify(config);
+  await f.storage.put('github-app', { id: '123', pem: f.app.pem, webhookSecret: f.app.webhook_secret });
+  const response = await f.controller.fetch(new Request(origin + '/setup/status', { headers: { Authorization: 'Bearer ' + control } }));
+  assert.equal(response.status, 409);
+  const body = await response.json();
+  assert.equal(body.app_configured, true);
+  assert.equal(body.error, 'app_secrets_missing');
+  assert.equal(body.needs_secrets_to_worker, true);
+  assert.deepEqual(body.missing, ['GITHUB_APP_PRIVATE_KEY', 'GITHUB_WEBHOOK_SECRET']);
+  assert.equal(body.private_key_in_storage, true, 'the stored key is reported, never used at runtime');
+  assert.match(body.hint, /secrets-to-worker/);
+  assert.equal(f.requests.length, 0, 'no GitHub call is attempted without the key');
+});
 test('invalid, expired, wrong-origin, and enabled setup attempts have no effects', async () => {
   const f = await setupFixture();
   assert.equal((await f.call('/setup')).status, 401);
@@ -124,7 +140,9 @@ test('conversion persists only required App credentials and closes setup without
   const installed = await f.call('/setup/installed'); const html = await installed.text();
   const links = [...html.matchAll(/href="([^"]+)"/g)].map(m => new URL(m[1].replace(/&amp;/g, '&')));
   assert.equal(links.length, 1);
-  assert.equal(links[0].pathname, '/apps/boat-ci-test/installations/new/permissions');
+  assert.equal(links[0].pathname, '/apps/boat-ci-test/installations/new');
+  assert.match(html, /id="secrets-missing"/);
+  assert.match(html, /secrets-to-worker/);
   const output = await response.text() + html + await (await f.call('/setup?token=' + token)).text();
   for (const secret of [f.app.pem, f.app.webhook_secret, f.app.client_secret, f.env.BOAT_CI_API_KEY]) assert.ok(!output.includes(secret));
   assert.ok(!JSON.stringify([...f.storage.data]).includes(f.app.client_secret));

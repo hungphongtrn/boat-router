@@ -33,7 +33,19 @@ test -x /home/user/boat-ci-start.sh
 test -x /home/user/boat-ci-runner/run.sh
 mkdir -p ${RUNNER_WORK_FOLDER}
 ${reusable ? `phase snapshot_helper
-test -d /home/user/.boat-ci/helper-oci
+${helperImageSetup()}
+` : ''}: > /home/user/.boat-ci/ready
+phase ready
+`;
+}
+
+// The helper image and the state a reusable snapshot boot needs: the OCI
+// fallback for a restored Docker store that cannot start the image, the
+// snapshot-mode flag every reset reads, and the PATH a reset and a start
+// command source. The snapshot builder runs this too, so a snapshot it saves
+// carries exactly what this boot check produces.
+export function helperImageSetup() {
+  return `test -d /home/user/.boat-ci/helper-oci
 : > /home/user/.boat-ci/snapshot-mode
 # 13 of 19 boot failures in 24 h were the helper's first docker run on a restored snapshot
 # ("failed to start shim ... bootstrap parameters do not match"), and the restart in the retry loop then failed
@@ -94,8 +106,5 @@ for attempt in 1 2 3 4; do
 done
 [ "$helper_ready" = true ]
 printf '%s' "/home/user/.local/bin:$PATH" > /home/user/.boat-ci/reuse-path
-chmod 600 /home/user/.boat-ci/reuse-path
-` : ''}: > /home/user/.boat-ci/ready
-phase ready
-`;
+chmod 600 /home/user/.boat-ci/reuse-path`;
 }

@@ -25,11 +25,11 @@
     "ENABLED": "false",
     "PLUGIN_ROUTER": "true",
     "BOAT_WALLET": "peek",
-    "BOAT_PROVIDER_WALLET": "REPLACE_WITH_BOAT_PROVIDER_WALLET",
+    "BOAT_PROVIDER_WALLET": "sandbox_86a94b0d060c3c6145307bbcb419d258",
     "ROUTER_PROJECTS": "peek",
     "START_PACING": "true",
     "MACHINE_TTL_SECONDS": "28800",
-    "PUBLIC_ORIGIN": "https://peek-boat-router.example.workers.dev",
+    "PUBLIC_ORIGIN": "https://peek-boat-router.phonglearntodev.workers.dev",
     "PROJECT_SNAPSHOT_NAME": "",
     "PROJECT_SNAPSHOT_MANIFEST_SHA256": ""
   },

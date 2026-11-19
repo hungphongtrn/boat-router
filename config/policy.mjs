@@ -6,9 +6,16 @@ export const defaultWallet = 'peek';
 export const setupOwner = 'hungphongtrn';
 export const repositories = ['hungphongtrn/peek', 'example-owner/project-a', 'example-owner/project-b', 'example-owner/project-c'];
 export const smokeRepository = null;
-export function installedPage(app, _env, page) {
-  const base = `https://github.com/apps/${encodeURIComponent(app.slug)}/installations/new/permissions`;
-  return page(`<h1>Install Boat CI</h1><p>Choose the repositories that can use this router.</p><p><a href="${base}" target="_blank" rel="noopener noreferrer">Install the GitHub App</a>.</p>`);
+// GitHub answers /installations/new/permissions with 404; the plain form picks the
+// repositories. The App's key and webhook secret reach this Worker only as secrets,
+// and /setup/status cannot call GitHub without them, so the page says what is missing
+// instead of leaving the owner with a 502.
+export function installedPage(app, env, page) {
+  const base = `https://github.com/apps/${encodeURIComponent(app.slug)}/installations/new`;
+  const missing = !env?.GITHUB_APP_PRIVATE_KEY || !env?.GITHUB_WEBHOOK_SECRET
+    ? '<p id="secrets-missing">The App is registered, but its private key and webhook secret are not Worker secrets yet: run <code>scripts/app-secrets-to-worker.mjs</code> from the router repository (it posts to <code>/setup/secrets-to-worker</code>) before <code>/setup/status</code> can check the installation.</p>'
+    : '';
+  return page(`<h1>Install Boat CI</h1><p>Choose the repositories that can use this router.</p><p><a href="${base}" target="_blank" rel="noopener noreferrer">Install the GitHub App</a>.</p>${missing}`);
 }
 // Base URL of your own checksum-pinned toolchain mirror (see docs/setup.md). The router
 // downloads a pinned git package from here with no upstream fallback, so the mirror must

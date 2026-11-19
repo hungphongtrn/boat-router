@@ -59,7 +59,7 @@ exec ${quote(prefix + '/usr/bin/git')} "$@"
 `;
 }
 
-function environment() {
+export function environment() {
   return `umask 022
 export PATH="/home/user/.local/bin:$PATH"
 export TMPDIR=/tmp
@@ -77,8 +77,19 @@ export function setupPhaseHelpers() {
 phase() { BOAT_PHASE=$1; printf 'BOAT_SETUP_PHASE %s\\n' "$1"; printf 'BOAT_SETUP_PHASE %s\\n' "$1" >&2; }
 trap 'printf "BOAT_SETUP_FAILED phase=%s status=%s line=%s\\n" "$BOAT_PHASE" "$?" "$LINENO" >&2' ERR`;
 }
+// The body of the bootstrap script, without its shebang and environment. The
+// snapshot builder (`src/snapshot-build.mjs`) reuses it, so the runner layout a
+// router snapshot carries is the one a plain boot installs.
+//
+// `git` chooses the VCS: 'mirror' downloads the pinned 2.56.0 package the
+// toolchain mirror must host and has no upstream fallback (docs/setup.md);
+// 'system' keeps the image's git instead. The builder uses 'system' where no
+// mirror is hosted: a snapshot boot verifies the saved layout and never runs
+// this script, so the pinned git only matters to a plain boot.
+//
 // The Docker Actions boxes add the lane packages, a tool-cache Node and the pinned FFmpeg (`docker: true`).
-export function bootstrap({ docker = false } = {}) {
+export function bootstrapBody({ docker = false, git = 'mirror' } = {}) {
+  const gitCheck = git === 'system' ? 'git --version' : `test "$(git --version)" = 'git version 2.56.0'`;
   const actionsDocker = docker ? `phase actions_apt_install
 sudo -n env DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 install -y --no-install-recommends ${ACTIONS_DOCKER_PACKAGES.playwright.join(' ')}
 sudo -n env DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 install -y ${ACTIONS_DOCKER_PACKAGES.plain.join(' ')}
@@ -101,11 +112,7 @@ sudo -n ln -sf /usr/local/lib/ffmpeg/bin/ffprobe /usr/local/bin/ffprobe
 ffmpeg -version | head -1
 ffprobe -version | head -1
 ` : '';
-  return `#!/usr/bin/env bash
-set -Eeuo pipefail
-${environment()}
-${setupPhaseHelpers()}
-mkdir -p /home/user/.local/bin "$RUNNER_TOOL_CACHE" /home/user/boat-ci-runner ${RUNNER_WORK_FOLDER}
+  return `mkdir -p /home/user/.local/bin "$RUNNER_TOOL_CACHE" /home/user/boat-ci-runner ${RUNNER_WORK_FOLDER}
 (umask 077; mkdir -p /home/user/.boat-ci)
 chmod 700 /home/user/.boat-ci
 exec 9>/home/user/.boat-ci/bootstrap.lock
@@ -141,7 +148,11 @@ command -v python3
 command -v node
 command -v jq
 command -v dpkg-deb
-phase git_download
+${git === 'system' ? `phase git_system
+command -v git
+git --version
+git lfs version
+` : `phase git_download
 fetch_checked '${RELEASES.git.url}' '${RELEASES.git.sha256}' /home/user/.boat-ci/git.deb
 dpkg-deb --extract /home/user/.boat-ci/git.deb /home/user/.local/git
 cat > /home/user/.local/bin/git <<'GIT'
@@ -153,7 +164,7 @@ git lfs version
 git init -q /home/user/.boat-ci/git-check
 GIT_AUTHOR_DATE=2000-01-01T00:00:00Z GIT_COMMITTER_DATE=2000-01-01T00:00:00Z git -C /home/user/.boat-ci/git-check -c user.name=Boat -c user.email=ci@example.com -c commit.gpgsign=false commit --allow-empty -qm bootstrap
 test "$(git -C /home/user/.boat-ci/git-check log -1 --format=%aI)" = 2000-01-01T00:00:00Z
-phase powershell_download
+`}phase powershell_download
 fetch_mirrored '${RELEASES.powershell.mirror}' '${RELEASES.powershell.url}' '${RELEASES.powershell.sha256}' /home/user/.boat-ci/powershell.tar.gz
 mkdir -p /home/user/.local/powershell
 tar xzf /home/user/.boat-ci/powershell.tar.gz -C /home/user/.local/powershell
@@ -180,7 +191,7 @@ if test -f /home/user/.boat-ci/started; then exit 0; fi
 chmod 600 /home/user/.boat-ci/jit
 : > /home/user/.boat-ci/started
 cd /home/user/boat-ci-runner
-test "$(git --version)" = 'git version 2.56.0'
+${gitCheck}
 ${telemetrySetup('/home/user/.boat-ci/telemetry.sh', RUNNER_WORK_FOLDER)}
 ${RUNNER_CAPS_DROP} ./run.sh --jitconfig "$(cat /home/user/.boat-ci/jit)" > /home/user/.boat-ci/runner.log 2>&1
 START
@@ -188,6 +199,13 @@ chmod 700 /home/user/boat-ci-start.sh
 : > /home/user/.boat-ci/ready
 phase ready
 `;
+}
+export function bootstrap({ docker = false, git = 'mirror' } = {}) {
+  return `#!/usr/bin/env bash
+set -Eeuo pipefail
+${environment()}
+${setupPhaseHelpers()}
+${bootstrapBody({ docker, git })}`;
 }
 export function dockerBootstrap() { return bootstrap({ docker: true }); }
 export const START_COMMAND = `${RUNNER_CAPS_DROP} bash /home/user/boat-ci-start.sh`;

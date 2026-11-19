@@ -99,6 +99,16 @@ export class SetupController {
       webhook_secret_stored: typeof sources.webhookSecret === 'string' && sources.webhookSecret.length > 0, webhook_secret_source: sources.webhookSecretSource,
       private_key_in_storage: typeof app?.pem === 'string', webhook_secret_in_storage: typeof app?.webhookSecret === 'string' };
     if (!app) return Response.json({ app_configured: false, ...stored }, { headers });
+    // appCredentials reads the Worker secrets only: the stored PEM is never
+    // used at runtime. Without them appJWT throws and the owner saw an opaque
+    // 502, so name the step that fixes it.
+    const missing = [];
+    if (!sources.pem) missing.push('GITHUB_APP_PRIVATE_KEY');
+    if (!sources.webhookSecret) missing.push('GITHUB_WEBHOOK_SECRET');
+    if (missing.length > 0) {
+      return Response.json({ app_configured: true, error: 'app_secrets_missing', missing, needs_secrets_to_worker: true,
+        hint: 'The App is registered, but the Worker has no App secrets yet: run scripts/app-secrets-to-worker.mjs (POST /setup/secrets-to-worker) with the control token, then retry this check.', ...stored }, { status: 409, headers });
+    }
     try {
       const token = await this.api.appJWT();
       const remote = await this.api.request('github', '/app', { token });

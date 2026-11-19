@@ -8,7 +8,7 @@
   },
   "scripts": {
     "test": "node --test --test-concurrency=1 test/*.test.mjs",
-    "check": "node --check src/worker.mjs && node --check src/webhook.mjs && node --check src/setup.mjs && node --check src/fleet.mjs && node --check src/apis.mjs && node --check src/bootstrap.mjs",
+    "check": "node --check src/worker.mjs && node --check src/webhook.mjs && node --check src/setup.mjs && node --check src/fleet.mjs && node --check src/apis.mjs && node --check src/bootstrap.mjs && node --check src/snapshot-build.mjs",
     "build": "wrangler deploy --dry-run --outdir dist"
   },
   "devDependencies": {

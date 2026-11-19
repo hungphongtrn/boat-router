@@ -23,34 +23,53 @@ project is registered, so an unregistered repository is refused by the webhook.
 
 ## Reuse and the reset
 
-Reuse is on with the router's light reset, which runs before the next job is registered:
-it kills the previous job's processes, removes every container and volume (so the `peek-ci`
-Postgres compose project and its data are gone), prunes unused images, and wipes
-`/home/ci/work`, `/tmp`, `/var/tmp` and `/dev/shm` — the job checkout and its `target/`
-drift, which the job never reads from (`CI_WORKSPACE` is `/home/user/ci/peek`). It then
-re-extracts the runner and runs the health probe. This covers what
-`scripts/ci/free-boat-disk.sh` frees by hand on the native path, plus the process and
-Postgres cleanup that a fresh box gets for free.
+Reuse is on with the router's light reset, which runs before the next job is registered.
+On a snapshot box it keeps what the snapshot is for — the Docker images (the suite's
+`postgres:17` among them), the primed `/home/user/ci/peek/target/` and the Rust toolchain —
+and clears what the finished job left:
+
+- its processes: `pkill -u ci` plus every process whose executable or working directory is
+  under `/home/user/ci/peek` or the runner's `/tmp/w`;
+- its containers, volumes, networks and dangling images: the reset's own helper container
+  (label `boat-light-reset`) and any `peek-ci-keep-*` container survive, and `docker image
+  prune -f` without `-a` keeps the suite image;
+- the peek checkout: `git reset --hard` and
+  `git clean -ffdxq -e target -e node_modules -e .next -e .ci-base-built-at` in
+  `/home/user/ci/peek`, so the next job fetches into the primed tree instead of a previous
+  branch's files;
+- the build cache under `/var/lib/peek-dagger`, without following mounts (`find -xdev`);
+- `/home/ci`, `/tmp` (not the runner's `/tmp/w`), `/var/tmp` and `/dev/shm`, the runner's
+  registration (`.runner`, `.credentials`), and the one-shot
+  `/home/user/.boat-ci/{jit,started,ready}`.
+
+A plain (never-saved) box keeps the old behaviour: everything below `/home/user/ci` is wiped
+too, because nothing there was primed. It then re-extracts the runner and runs the health
+probe. This covers what `scripts/ci/free-boat-disk.sh` frees by hand on the native path, plus
+the process and Postgres cleanup that a fresh box gets for free.
 
 ## Snapshot boot and the pin
 
 `snapshotBoot: true` is on, and the pin is the two Worker vars
-`PROJECT_SNAPSHOT_NAME` / `PROJECT_SNAPSHOT_MANIFEST_SHA256`. Both are empty on purpose:
-the router verifies `/home/user/.boat-ci/toolchain.sha256` and its own runner layout
-inside the snapshot, and the native `ci-base` snapshot that `scripts/ci/ci-base-refresh.sh`
-maintains carries neither. With the vars empty the project boots a plain box — the
-documented fallback — and the job warms its own `target/` on the first run.
+`PROJECT_SNAPSHOT_NAME` / `PROJECT_SNAPSHOT_MANIFEST_SHA256`. The pin names a snapshot Peek
+built for this router: `scripts/ci/ci-base-refresh.sh --router` primes one sandbox exactly as
+the native `ci-base` refresh does, runs this router's builder on it
+(`node src/snapshot-build.mjs` from this clone), and saves the disk twice — `ci-base` for the
+native route, then `peek-ci-base-<yyyymmdd>-<commit8>` — printing both pin values. The
+builder installs the runner layout a plain boot installs, caches the reset helper image's OCI
+blobs, clears the one-shot markers, and writes `/home/user/.boat-ci/toolchain.sha256` over
+the runner layout, the toolchain Peek jobs call, the helper blobs and the git PATH resolves.
+The router verifies that file and the manifest hash at boot (`snapshotBootstrap`).
 
-The pin is not automatic. A saved snapshot's name is fixed; `ci-base` is re-saved under the
-same name, so it cannot be pinned as-is, and the router requires
-`<name>-<yyyymmdd>-<hex>`. To turn snapshot boot on:
+The pin follows a `ci-base` refresh only through that `--router` run:
 
-1. Build a router snapshot from the same tree `ci-base` holds (the router bootstrap, then
-   `scripts/ci/ci-base-prime.sh`), and save it as `peek-ci-base-<yyyymmdd>-<hex>`.
-2. Compute the SHA-256 of `/home/user/.boat-ci/toolchain.sha256` inside that snapshot.
-3. Re-pin both vars and deploy: `wrangler deploy --var PROJECT_SNAPSHOT_NAME:<name> --var PROJECT_SNAPSHOT_MANIFEST_SHA256:<sha>`.
+1. Run `scripts/ci/ci-base-refresh.sh --router` in the peek clone (the router clone is
+   `ROUTER` or `../boat-router`). One sandbox serves both routes; it prints
+   `PROJECT_SNAPSHOT_NAME` and `PROJECT_SNAPSHOT_MANIFEST_SHA256`.
+2. Commit both in `wrangler.jsonc`, so every later deploy carries them.
+3. Deploy. Until the new name is deployed the old pin keeps booting the old snapshot, which
+   is intact; a name is never reused, so a stale pin cannot point at a replaced disk.
 
-Because the name embeds the date, every `ci-base` refresh means a new router snapshot and a
-new pair of vars; step 3 is the whole follow-up, and it is in `scripts/ci/boat-router-wizard.sh`
-and the router section of Peek's `docs/runbook.md`. A missing snapshot answers
+An empty pin is still valid and is the fallback: the project boots a plain box and the job
+warms its own `target/` on the first run.
+A missing snapshot answers
 `snapshot_not_found`, and the router boots the box plain instead of failing the job.
