@@ -122,6 +122,7 @@ export function installRouter(storage, getEnv, { api, now = Date.now, logger = c
     }
   }
   const account = { ...selected, ...cutoverPolicy, requireConcurrency: true, externalClients: accountClients };
+  if (selected.starts?.allowPaidExtra !== undefined && typeof selected.starts.allowPaidExtra !== 'boolean') throw new TypeError('invalid paid extra starts');
   const provisionerFingerprint = createHash('sha256').update(reuseBootstrap()).update('\0').update(getEnv().TOOLCHAIN_REVISION ?? 'default').digest('hex');
   const snapshotName = getEnv().PROJECT_SNAPSHOT_NAME, snapshotManifest = getEnv().PROJECT_SNAPSHOT_MANIFEST_SHA256;
   if ((snapshotName || snapshotManifest) && (!/^[a-z][a-z0-9-]{0,40}-\d{8}-[a-f0-9]{8,64}$/.test(snapshotName ?? '') || !/^[a-f0-9]{64}$/.test(snapshotManifest ?? ''))) throw new TypeError('invalid project snapshot configuration');
@@ -158,7 +159,7 @@ export function installRouter(storage, getEnv, { api, now = Date.now, logger = c
     let policy;
     try { policy = JSON.parse(getEnv().ACCOUNT_POOL_POLICY); } catch { throw new TypeError('invalid account pool policy'); }
     if (!policy || typeof policy !== 'object' || Array.isArray(policy) || typeof policy.accounts?.secondary?.enabled !== 'boolean' || typeof policy.accounts?.primary?.enabled !== 'boolean') throw new TypeError('invalid account pool policy');
-    poolOptions = { secondaryEnabled: policy.accounts.secondary.enabled, workEnabled: policy.accounts.primary.enabled, secondaryLimits: cachedLimits(() => secondaryApi.limits(), now),
+    poolOptions = { secondaryEnabled: policy.accounts.secondary.enabled, workEnabled: policy.accounts.primary.enabled, allowPaidExtra: account.starts?.allowPaidExtra === true, secondaryLimits: cachedLimits(() => secondaryApi.limits(), now),
       secondaryBase: lease => { const base = secondaryBases()[lease?.routerSnapshot?.kind]; return base && base.name === lease.routerSnapshot?.name ? base : null; },
       // Which accounts hold the snapshot a project boots from; the other account's boxes would boot plain.
       snapshotAccounts: project => {

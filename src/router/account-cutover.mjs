@@ -1,5 +1,6 @@
 import { SharedBudget } from './shared-budget.mjs';
 import { snapshotLimits } from './ledger.mjs';
+import { paidStartAllowed } from './paid-extra.mjs';
 
 // Untagged records predate the cutover and belong to the secondary account.
 export function accountApi(storage, secondary, work) {
@@ -32,14 +33,16 @@ const BILLING_BLOCKED = ['past_due', 'unpaid', 'canceled'];
 const FUNDS = limits => [limits.creditBalanceSeconds, limits.packBalanceSeconds, limits.subscriptionRemainingSeconds, limits.creditBalanceHours, limits.planIncluded?.vmHoursRemaining].filter(Number.isFinite);
 
 // Fields the provider omits give no opinion: the ledger still checks every window before a start.
-export function accountReady(limits, size) {
+// `allowPaidExtra` lets a day window that is already full, or a billed next start up to the
+// paid-extra ceiling, still choose the account; the ledger enforces the same ceiling.
+export function accountReady(limits, size, allowPaidExtra = false) {
   if (!limits || limits.canStart !== true || limits.checkoutRequired === true || BILLING_BLOCKED.includes(limits.billingStatus)) return false;
   if (size && !limits.machineTypes?.some(type => type.type === size && type.available === true)) return false;
   const funds = FUNDS(limits);
   if (limits.unlimited !== true && funds.length && !funds.some(value => value > 0)) return false;
-  if (limits.nextStartDollars !== undefined && limits.nextStartDollars !== 0) return false;
+  if (limits.nextStartDollars !== undefined && limits.nextStartDollars !== 0 && !(allowPaidExtra && paidStartAllowed(limits.nextStartDollars))) return false;
   const day = limits.starts?.day;
-  if (Number.isFinite(day?.remaining) && day.remaining < 1) return false;
+  if (!allowPaidExtra && Number.isFinite(day?.remaining) && day.remaining < 1) return false;
   return true;
 }
 
@@ -69,11 +72,11 @@ export async function preferredAccount({ storage, poolOptions, secondaryLedger, 
   if (await accountBlocked(storage, 'secondary', now)) return 'primary';
   let secondaryLimits;
   try { secondaryLimits = await (poolOptions.secondaryChoiceLimits ?? poolOptions.secondaryLimits)(); } catch { return 'primary'; }
-  if (!accountReady(secondaryLimits, size)) return 'primary';
+  if (!accountReady(secondaryLimits, size, poolOptions.allowPaidExtra)) return 'primary';
   if (!poolOptions.workEnabled || !poolOptions.workLimits) return 'secondary';
   let workLimits;
   try { workLimits = await poolOptions.workLimits(); } catch { return 'secondary'; }
-  if (!accountReady(workLimits, size)) return 'secondary';
+  if (!accountReady(workLimits, size, poolOptions.allowPaidExtra)) return 'secondary';
   if (snapshot && snapshot.primary !== snapshot.secondary) return snapshot.primary ? 'primary' : 'secondary';
   const [secondaryShare, workShare] = await Promise.all([dayShareFree(secondaryLimits, secondaryLedger), dayShareFree(workLimits, workLedger)]);
   if (secondaryShare == null) return 'primary';
@@ -119,7 +122,7 @@ export function cutoverBudget(storage, secondaryLedger, workLedger, project, now
         if (poolOptions.secondaryEnabled && await preferredAccount({ storage: secondaryLedger.storage, poolOptions, secondaryLedger, workLedger, size, now: now(), snapshot }) === 'secondary') {
           try {
             const limits = await poolOptions.secondaryLimits();
-            if (accountReady(limits, size)) {
+            if (accountReady(limits, size, poolOptions.allowPaidExtra)) {
               const result = await secondary.admit(key, limits, { queuedAt: record.queuedAt, jobId: record.snapshotRecoveryJobId, pool: true, label: JSON.parse(record.pool)[1], snapshotRecovery: Boolean(record.snapshotRecoveryJobId) });
               if (result.ok) {
                 if (!await selectSecondary()) { await secondary.abandon(key); return false; }
@@ -163,7 +166,7 @@ export function externalCutoverLedger(secondary, work, poolOptions = null, now =
       if (!workOnly && poolOptions.secondaryEnabled && await preferredAccount({ storage: secondary.storage, poolOptions, secondaryLedger: secondary, workLedger: work, size: lease.size, now: now() }) === 'secondary') {
         try {
           const limits = await poolOptions.secondaryLimits();
-          if (accountReady(limits, lease.size)) {
+          if (accountReady(limits, lease.size, poolOptions?.allowPaidExtra)) {
             await secondary.enqueue(lease.project, lease.claimKey, lease.createdAt, undefined, { client: lease.client });
             const admitted = await secondary.admit(lease.project, lease.claimKey, snapshotLimits(limits, now()));
             if (admitted.ok) return 'secondary';

@@ -12,6 +12,7 @@ The router has run our own CI on Boat since the first release. This release port
 - **Two accounts as one pool.** A secondary Boat account serves the same projects. Each start goes to the account with the larger free share. A refusal on the secondary account parks only that account. For us this took the day limit from 600 to 1,000 starts.
 - **Lane rules.** Optional lanes by run name, with reserved slots, aging, a per-lane `maxParallel`, and lending of idle reserved slots. The open start queue turns lanes off.
 - **Dynamic pacing** spreads starts against the provider's rolling day window from tracked start times.
+- **Paid extra starts.** An account with `starts.allowPaidExtra: true` may start past Boat's free day allowance: the configured `starts.day` is the ceiling (with `margin`) and a billed next start up to $0.07 is accepted. Minute and hour limits, `canStart`, checkout, billing and funds still stop a start. Off by default.
 
 ### Box health and lifecycle
 

@@ -9,7 +9,8 @@ project is registered, so an unregistered repository is refused by the webhook.
 
 | Value | Setting | Reason |
 |---|---|---|
-| `starts` | 12/minute, 60/hour, 200/day | Boat's stated limits; the provider's `/limits` snapshot stays authoritative and the router caps at `min(configured, floor(limit × (1 − margin)))`. |
+| `starts` | 12/minute, 60/hour, 260/day | Boat's stated minute and hour limits; the provider's `/limits` snapshot stays authoritative and the router caps at `min(configured, floor(limit × (1 − margin)))`. The day value is 260 because `allowPaidExtra` raises the ceiling past Boat's free 200. |
+| `starts.allowPaidExtra` | `true` | Past Boat's free 200 day starts the configured 260 is the ceiling: 234 paced (90 %) and 260 hard, and a billed `nextStartDollars` up to $0.07 is accepted. Minute and hour limits, `canStart`, checkout, billing status and zero funds still stop a start. Off by default. |
 | `margin` | 0.1 | The router stops at 90 % of each window, which leaves about 20 daily starts for `publish`, which stays on native `runs-on: boat`. |
 | `openStartQueue`, `dayReserve` | `true`, `0` | One queue in arrival order, no per-project reserve. |
 | `poolPacing` | `dynamic`, `unpaced: false` | Starts follow the provider's rolling windows instead of a free-running burst. |

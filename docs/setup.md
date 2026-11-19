@@ -3,7 +3,7 @@
 The example is a starting point. Review the account, project, runner, GitHub App, and Cloudflare settings before use. Keep `ENABLED` set to `false` while you configure and verify the installation.
 
 1. Install Node 22 or later and run `npm ci`.
-2. Set the account and project data in `examples/account.json` and `examples/project.json`. Register them in `config/installation.mjs`. Set `starts.minute`, `starts.hour`, and `starts.day` to the provider limits for the account. Set the repository, labels, sizes, concurrency caps, and reuse policy for each project.
+2. Set the account and project data in `examples/account.json` and `examples/project.json`. Register them in `config/installation.mjs`. Set `starts.minute`, `starts.hour`, and `starts.day` to the provider limits for the account. Leave `starts.allowPaidExtra` unset to stop at the provider's day limit (see [Paid extra starts](#paid-extra-starts)). Set the repository, labels, sizes, concurrency caps, and reuse policy for each project.
 3. Set `setupOwner`, `repositories`, and any smoke repository in `config/policy.mjs`. Update the GitHub App manifest in `config/github-app-manifest.json`. The setup owner check prevents storing an App made under a different login.
 4. Set a unique Worker name, the `FLEET` Durable Object binding, migration, cron, and environment variables in `wrangler.jsonc`. Set `BOAT_WALLET`, `BOAT_PROVIDER_WALLET`, and `ROUTER_PROJECTS` to match the registration. Keep deployment credentials and API keys in secret storage.
 5. Run `npm test`, `npm run check`, and `npm run build`. The last command is a Wrangler dry run. Inspect its output and bindings before deployment.
@@ -22,6 +22,15 @@ Account `poolPacing.fromPct` activates pacing when hourly or daily usage reaches
 ## Open start queue
 
 Set `openStartQueue: true` and `dayReserve: 0` on the account. All projects then share one start queue in order of arrival, with no per-project cap and no lane reserve. Project `caps.concurrent`, `caps.startsPerDay` and `lanes` are ignored in this mode. Account start limits (`starts`, `poolPacing`) and money limits still apply.
+
+## Paid extra starts
+
+Boat accepts starts past the account's free day allowance and bills each one (about $0.03–0.07 on our account). Set `starts.allowPaidExtra: true` on the account to spend them:
+
+- `starts.day` becomes the day ceiling instead of being clamped to the provider's reported limit, still with `margin`. With `starts.day: 260` and a 10 % margin the router paces 234 starts and stops hard at 260.
+- A `nextStartDollars` up to $0.07 is accepted. A higher price refuses the start as `paid_start_ceiling`; an omitted price gives no opinion.
+- Everything else still refuses: the provider's minute and hour windows, `canStart: false`, `checkoutRequired`, a blocked billing status (`past_due`, `unpaid`, `canceled`) and zero funds. Dynamic pacing and reuse stay in place, so extras follow the day rate instead of bursting.
+- It is off by default. It needs an account ledger that may spend a billed start: the two-account cutover policy keeps `forbidPaidStarts: true`, so extras do not apply there.
 
 ## Max-parallel matrix runs
 
