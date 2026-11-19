@@ -30,8 +30,8 @@
     "START_PACING": "true",
     "MACHINE_TTL_SECONDS": "28800",
     "PUBLIC_ORIGIN": "https://peek-boat-router.phonglearntodev.workers.dev",
-    "PROJECT_SNAPSHOT_NAME": "ci-base-20261119-b3245b3e",
-    "PROJECT_SNAPSHOT_MANIFEST_SHA256": "ddd7a9f58e641547e8ab4029ac4bce8ef67db89a1ed5bba862654707089def56"
+    "PROJECT_SNAPSHOT_NAME": "ci-base-20261119-05a58e0d",
+    "PROJECT_SNAPSHOT_MANIFEST_SHA256": "eaa5286f83bb6195263e0ce7cba4e3d5b03338db4690ca0101509f901f67f10d"
   },
   "observability": {
     "enabled": false,
