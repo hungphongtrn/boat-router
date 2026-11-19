@@ -114,8 +114,14 @@ esac
 for blob in /home/user/.boat-ci/helper-oci/*; do sha256sum -- "$blob" >> "$manifest"; done
 sha256sum --check --strict "$manifest" >/dev/null
 phase snapshot_ready
-printf 'ROUTER_SNAPSHOT_MANIFEST_SHA256 %s\\n' "$(sha256sum "$manifest" | cut -d' ' -f1)"
-printf 'ROUTER_SNAPSHOT_READY\\n'
+sha256sum "$manifest" | cut -d' ' -f1 > /home/user/.boat-ci/router-manifest.sha256
+printf 'ROUTER_SNAPSHOT_MANIFEST_SHA256 %s\\n' "$(cat /home/user/.boat-ci/router-manifest.sha256)"
+# A long streaming exec can lose its output pipe and kill this shell with
+# SIGPIPE (seen 2026-11-19, status 141, after ten minutes of downloads). The
+# marker is what the caller reads back, so a lost stream cannot pass for a
+# finished build, and a finished build is not lost to a lost stream.
+printf 'ROUTER_SNAPSHOT_READY\\n' > /home/user/.boat-ci/router-snapshot-ready
+printf 'ROUTER_SNAPSHOT_READY\\n' || true
 `;
 }
 

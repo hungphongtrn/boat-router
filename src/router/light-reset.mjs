@@ -107,7 +107,11 @@ fi` : ''}
 # cancelled or timed-out job leaves compilers and servers behind, and the next
 # job must not inherit them.
 foreign='node|nodejs|bun|deno|workerd|vitest|esbuild|Runner.Listener|Runner.Worker|chrome|chromium|headless_shell|java|playwright'
-pkill -KILL -x "$foreign" || true
+# Only the users a job runs as are fair game: by uid, because the helper
+# container need not resolve either name. An unscoped pkill -x would kill every
+# node process on the box, the reset's own caller included.
+job_uids=$( { stat -c %u /home/ci 2>/dev/null || true; stat -c %u /home/user 2>/dev/null || true; } | sort -u)
+for uid in $job_uids; do pkill -KILL -u "$uid" -x "$foreign" || true; done
 for proc in /proc/[0-9]*; do
   pid=\${proc#/proc/}
   [ "$pid" = "$$" ] && continue
@@ -141,12 +145,16 @@ mark 'clean work dir'
 if [ -d /home/ci ]; then
   find /home/ci/work /home/ci/toolcache -mindepth 1 -maxdepth 1 -exec rm -rf -- {} + 2>/dev/null || true
   find /home/ci -mindepth 1 -maxdepth 1 ! -name work ! -name toolcache -exec rm -rf -- {} +
-  wipe_user=ci
-else
+  wipe_uid=$(stat -c %u /home/ci)
+elif [ -d /home/user ]; then
   # A snapshot box has no ci user: its jobs run as the box user.
-  wipe_user=$(stat -c %U /home/user)
+  wipe_uid=$(stat -c %u /home/user)
+else
+  wipe_uid=''
 fi
-find /tmp /var/tmp /dev/shm -xdev -mindepth 1 -user "$wipe_user" ! -path /tmp/w ! -path '/tmp/w/*' -delete 2>/dev/null || true
+# Neither /home/ci nor /home/user exists outside those two image kinds, and a
+# reset must not fail for want of a work folder it never had.
+if [ -n "$wipe_uid" ]; then find /tmp /var/tmp /dev/shm -xdev -mindepth 1 -user "$wipe_uid" ! -path /tmp/w ! -path '/tmp/w/*' -delete 2>/dev/null || true; fi
 ${leaseId ? `rm -rf -- /tmp/lease-${leaseId}` : ''}
 # The primed tree keeps what the primer built (target/, node_modules, .next and
 # its stamp); only the previous job's checkout goes. target/ is the entire

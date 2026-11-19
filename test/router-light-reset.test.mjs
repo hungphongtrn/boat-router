@@ -71,6 +71,9 @@ case "$*" in
   *) exit 1 ;;
 esac`);
   for (const name of ['pkill']) stub(name, 'exit 0');
+  stub('find', `printf 'find %s\\n' "$*" >> "$CALLS"
+case "$*" in *"${dagger}"*) exec /usr/bin/find "$@";; esac`);
+  stub('stat', 'echo 1000');
   stub('pgrep', 'exit 1');
   stub('git', `echo "git $*" >> "$CALLS"`);
   stub('df', "printf 'Filesystem blocks used available\\nfixture 20000000 1 9999999\\n'");
@@ -88,6 +91,7 @@ esac`);
   for (const name of ['jit', 'started', 'runner.log']) assert.equal(existsSync(`${home}/.boat-ci/${name}`), false);
   for (const name of ['.runner', '.credentials', '.credentials_rsaparams', '.service']) assert.equal(existsSync(`${home}/boat-ci-runner/${name}`), false);
   assert.equal(existsSync(`${home}/.boat-ci/snapshot-mode`), true, 'the snapshot keeps its mode flag for the next reset');
+  assert.match(calls, /find \/tmp \/var\/tmp \/dev\/shm .*-user 1000 ! -path \/tmp\/w ! -path \/tmp\/w\/\*/);
   assert.deepEqual(readdirSync(dagger), []);
   assert.equal(existsSync(`${home}/ci/peek/target`), true);
 });
