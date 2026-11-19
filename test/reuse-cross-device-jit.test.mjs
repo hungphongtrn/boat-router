@@ -51,3 +51,21 @@ with tempfile.TemporaryDirectory() as root:
   const result = spawnSync('python3', ['-I', '-B', '-c', source + '\n' + python], { encoding: 'utf8' });
   assert.equal(result.status, 0, result.stderr);
 });
+
+test('a job gets the group that owns the Docker socket, and docker_access names it', () => {
+  const source = REFRESH_PROGRAM.split("if __name__ == '__main__':")[0];
+  const python = `
+import tempfile, pathlib
+with tempfile.TemporaryDirectory() as root:
+    socket = pathlib.Path(root) / 'docker.sock'
+    assert job_groups(True, socket) == ['docker']
+    assert job_groups(False, socket) == []
+    socket.touch()
+    socket.chmod(0o660)
+    owner = grp.getgrgid(socket.stat().st_gid).gr_name
+    assert job_groups(False, socket) == [owner]
+    assert job_groups(False, pathlib.Path(root) / 'absent.sock') == []
+`;
+  const result = spawnSync('python3', ['-I', '-B', '-c', source + '\n' + python], { encoding: 'utf8' });
+  assert.equal(result.status, 0, result.stderr);
+});

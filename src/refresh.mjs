@@ -32,7 +32,7 @@ PERMISSIONS`;
 export const REFRESH_RESULT_MAX_BYTES = 65536;
 export const REFRESH_DRIFT_ARTIFACT_MAX_BYTES = 4 * 1024 * 1024;
 
-export const REFRESH_PROGRAM = String.raw`import fcntl, hashlib, io, json, os, pathlib, pwd, re, resource, select, shutil, signal, stat, subprocess, sys, tarfile, tempfile, time, urllib.request
+export const REFRESH_PROGRAM = String.raw`import fcntl, grp, hashlib, io, json, os, pathlib, pwd, re, resource, select, shutil, signal, stat, subprocess, sys, tarfile, tempfile, time, urllib.request
 
 STATE = pathlib.Path('/var/lib/boat-ci-reuse')
 CONTROL = pathlib.Path('/home/user/.boat-ci')
@@ -1196,6 +1196,21 @@ def transfer_jit(source, destination):
         if temporary is not None:
             temporary.unlink(missing_ok=True)
 
+def job_groups(docker_access, socket=pathlib.Path('/var/run/docker.sock')):
+    # A job needs the Docker socket the way a native box's job has it, and a
+    # snapshot box did not give it one: the job runs as 'ci', which the image
+    # never puts in the 'docker' group, so peek's first snapshot job died at its
+    # "Check the snapshot" step with "docker is unreachable in the sandbox"
+    # (2026-11-20). The group that owns the socket is the access a native job
+    # inherits through 'user', so grant that one whenever the box has it;
+    # 'docker_access' still names it when the socket is not there yet.
+    if docker_access:
+        return ['docker']
+    try:
+        return [grp.getgrgid(socket.stat().st_gid).gr_name]
+    except (OSError, KeyError):
+        return []
+
 def start_job(generation, docker_access):
     if int((STATE / 'current').read_text()) != generation:
         raise RuntimeError('generation')
@@ -1243,7 +1258,8 @@ ${RUNNER_PERMISSION_CHECK}
 exec setpriv --no-new-privs --inh-caps=-all --ambient-caps=-all ./run.sh --jitconfig "$jit"
 ''', 0o700)
     os.chown(script, user.pw_uid, user.pw_gid)
-    run(['systemd-run', '--quiet', '--unit=' + unit, '--property=User=ci', '--property=Group=ci'] + (['--property=SupplementaryGroups=docker'] if docker_access else []) + ['--property=KillMode=control-group', '--property=RemainAfterExit=yes', '--property=TimeoutStopSec=10', '--property=RuntimeMaxSec=14400', '--property=WorkingDirectory=/home/ci/runner', '--property=StandardOutput=null', '--property=StandardError=null', str(script)])
+    groups = job_groups(docker_access)
+    run(['systemd-run', '--quiet', '--unit=' + unit, '--property=User=ci', '--property=Group=ci'] + (['--property=SupplementaryGroups=' + ','.join(groups)] if groups else []) + ['--property=KillMode=control-group', '--property=RemainAfterExit=yes', '--property=TimeoutStopSec=10', '--property=RuntimeMaxSec=14400', '--property=WorkingDirectory=/home/ci/runner', '--property=StandardOutput=null', '--property=StandardError=null', str(script)])
     atomic(marker, 'started')
 
 def main(mode, generation, waiter, helper, docker_access=False):
