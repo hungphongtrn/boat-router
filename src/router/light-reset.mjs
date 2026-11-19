@@ -272,6 +272,14 @@ rm -f /home/ci/.jit
 exec setpriv --no-new-privs --inh-caps=-all --ambient-caps=-all ./run.sh --jitconfig "$jit"
 `;
   const script = `set -euo pipefail
+if [ -f /home/user/.boat-ci/snapshot-mode ]; then
+  # A snapshot box carries its runner and its own start script under /home/user,
+  # and that script hands the JIT to the runner itself: a generation start only
+  # has to run it, the way the box's first job does. The /home/ci layout below
+  # exists only on a box the router provisioned (2026-11-20: generation 1 died on
+  # its first line on a snapshot box, and the router retired the box offline).
+  exec systemd-run --quiet --unit=boat-ci-job-${generation} --property=KillMode=control-group --property=RemainAfterExit=yes --property=TimeoutStopSec=10 --property=RuntimeMaxSec=14400 --property=WorkingDirectory=/home/user/boat-ci-runner --property=StandardOutput=null --property=StandardError=null bash /home/user/boat-ci-start.sh
+fi
 install -o ci -g ci -m 644 /var/lib/boat-ci-reuse/path /home/ci/.path
 install -o ci -g ci -m 600 /home/user/.boat-ci/jit /home/ci/.jit
 rm -f /home/user/.boat-ci/jit

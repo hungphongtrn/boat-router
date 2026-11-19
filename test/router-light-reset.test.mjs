@@ -117,6 +117,19 @@ test('generated start makes PATH readable to ci and starts the runner', () => {
   assert.ok((statSync(`${home}/.path`).mode & 0o004) !== 0);
 });
 
+test('a snapshot box starts its own runner script for the next generation', () => {
+  const dir = mkdtempSync(`${tmpdir()}/light-start-snapshot-`), bin = `${dir}/bin`, source = `${dir}/source`;
+  mkdirSync(bin); mkdirSync(source);
+  writeFileSync(`${source}/snapshot-mode`, '');
+  writeFileSync(`${source}/jit`, 'dummy');
+  writeFileSync(`${source}/boat-ci-start.sh`, '#!/bin/bash\nprintf snapshot > "$PROOF"\n', { mode: 0o755 });
+  writeFileSync(`${bin}/systemd-run`, '#!/bin/bash\nexec /bin/bash "${@: -1}"\n', { mode: 0o755 });
+  const script = decode(lightStartCommand(1)).replaceAll('/home/user/.boat-ci', source).replaceAll('/home/user/boat-ci-start.sh', `${source}/boat-ci-start.sh`);
+  const result = run(script, { PATH: `${bin}:/usr/bin:/bin`, PROOF: `${dir}/started` });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(readFileSync(`${dir}/started`, 'utf8'), 'snapshot');
+});
+
 test('light reset accepts only a complete successful result for its generation', () => {
   assert.equal(parseLightResetResult({ running: true }, 1), null);
   for (const response of [{ exitCode: 1 }, { exitCode: 0, stdout: '{"ok":true,"gen":2}' }, { exitCode: 0, stdout: '{"ok":true,"gen":1}', stdoutTruncated: true }, { exitCode: 0, stdout: 'bad' }]) {
