@@ -32,7 +32,7 @@ test('the project passes the router validator', () => {
 });
 
 test('the account paces starts at Boat limits and buys the extras past them', () => {
-  assert.deepEqual(account.starts, { minute: 12, hour: 60, day: 260, allowPaidExtra: true });
+  assert.deepEqual(account.starts, { minute: 12, hour: 60, day: 260, allowPaidExtra: true, paidExtraMaxDollarsPerMonth: 2 });
   assert.equal(account.margin, 0.1);
   assert.equal(account.openStartQueue, true);
   assert.equal(account.dayReserve, 0);

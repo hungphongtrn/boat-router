@@ -14,7 +14,8 @@
     "minute": 12,
     "hour": 60,
     "day": 260,
-    "allowPaidExtra": true
+    "allowPaidExtra": true,
+    "paidExtraMaxDollarsPerMonth": 2
   },
   "poolPacing": {
     "enabled": true,
