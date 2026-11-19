@@ -23,6 +23,7 @@ The router has run our own CI on Boat since the first release. This release port
 - **Setup watchdog** destroys a box whose job stays in "Set up runner" past a limit and reruns the job after GitHub completes the cancelled one.
 - **Docker-enabled reuse** with an in-box reset and a baseline for labels that need Docker.
 - **A snapshot box's job gets the group that owns the Docker socket.** The job runs as the ephemeral `ci` uid, which the image never puts in the `docker` group, so a job that calls Docker failed with "docker is unreachable in the sandbox" on the first snapshot box (2026-11-20). The start unit now names the socket's owning group, the access a native box's job inherits through `user`.
+- **A snapshot box's second job starts its own runner.** Generation 0 of a snapshot box runs `/home/user/boat-ci-start.sh`, but a generation start built the `/home/ci` layout a router-provisioned box has, so the unit died on its first line and the router retired the box as offline after every first job (2026-11-20, two boxes). A snapshot box now starts its own script for the next generation too, which is what makes reuse work on one.
 
 ### Boot
 
