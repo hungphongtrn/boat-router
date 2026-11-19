@@ -43,10 +43,24 @@ function safeFailureMessage(message) {
     setupStatus: ['pending', 'starting', 'running', 'done', 'failed', 'cancelled', 'unknown'],
     providerErrorCategory: ['rate_limited', 'timeout', 'network', 'unavailable', 'configuration', 'integrity', 'unknown'],
     captureStatus: ['ok', 'unavailable', 'http_403', 'http_404', 'http_409', 'http_429', 'http_other', 'not_attempted', 'invalid_format'],
-    step: ['kill processes', 'docker prune', 'clean work dir', 'prepare runner', 'sanity checks', 'reset command', 'submit reset command', 'read reset result'],
+    step: ['kill processes', 'docker prune', 'clean work dir', 'prepare runner', 'sanity checks', 'reset command', 'submit reset command', 'read reset result', 'submit baseline command', 'baseline'],
   })) if (allowed.includes(value[key])) safe[key] = value[key];
   if (typeof value.retryEligible === 'boolean') safe.retryEligible = value.retryEligible;
   if (Number.isSafeInteger(value.exitCode) && value.exitCode >= 0 && value.exitCode <= 255) safe.exitCode = value.exitCode;
+  // The reuse controller's own reason a box retired: a stage and an exit status
+  // alone left a box undiagnosable (2026-11-20), so the failing command's line
+  // travels too. Every field is a bounded, allowlisted shape and free text is
+  // redacted before it leaves the router.
+  if (Array.isArray(value.failed) && value.failed.length <= 8 && value.failed.every(code => typeof code === 'string' && /^[A-Za-z]{1,24}$/.test(code))) safe.failed = value.failed;
+  if (value.diagnostic && typeof value.diagnostic === 'object' && !Array.isArray(value.diagnostic)) {
+    const diagnostic = {};
+    if (typeof value.diagnostic.stage === 'string' && /^[a-z_]{1,40}$/.test(value.diagnostic.stage)) diagnostic.stage = value.diagnostic.stage;
+    if (typeof value.diagnostic.exception === 'string' && /^[A-Za-z]{1,40}$/.test(value.diagnostic.exception)) diagnostic.exception = value.diagnostic.exception;
+    if (typeof value.diagnostic.operation === 'string' && /^[a-z.-]{1,24}$/.test(value.diagnostic.operation)) diagnostic.operation = value.diagnostic.operation;
+    if (Number.isSafeInteger(value.diagnostic.exitCode) && value.diagnostic.exitCode >= -255 && value.diagnostic.exitCode <= 255) diagnostic.exitCode = value.diagnostic.exitCode;
+    if (typeof value.diagnostic.output === 'string' && value.diagnostic.output.length <= 200 && /^[\x20-\x7e]*$/.test(value.diagnostic.output)) diagnostic.output = redact(value.diagnostic.output);
+    if (Object.keys(diagnostic).length) safe.diagnostic = diagnostic;
+  }
   if (Array.isArray(value.setupOutput)) safe.setupOutput = value.setupOutput.slice(-20).map(line => ['[redacted]', '[apt network failure]', '[apt integrity failure]', '[apt lock failure]'].includes(line) ? line : sanitizeSetupLine(line));
   if (SETUP_ERROR_CATEGORIES.has(value.setupErrorCategory)) safe.setupErrorCategory = value.setupErrorCategory;
   if (value.setupPhase === 'unknown' || PHASES.has(value.setupPhase)) safe.setupPhase = value.setupPhase;

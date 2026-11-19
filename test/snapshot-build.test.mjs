@@ -54,3 +54,13 @@ test('the build checks the primed tree it is about to pin', () => {
   assert.match(script, /docker image inspect postgres:17/);
   assert.ok(script.indexOf('phase snapshot_peek') < script.indexOf('phase snapshot_manifest_write'));
 });
+
+test('the build names the job tree the reuse controller hands to the ci user', () => {
+  const script = snapshotBuildScript();
+  // The saved disk owns the primed tree as `user`; every job runs as its own
+  // ephemeral `ci` uid, so the controller reads this list at start and chowns
+  // the paths before it launches the runner.
+  assert.match(script, /printf '\/home\/user\/ci\\n' > '\/home\/user\/\.boat-ci\/job-paths'/);
+  assert.ok(snapshotManifestFiles().includes('/home/user/.boat-ci/job-paths'));
+  assert.ok(script.indexOf('phase snapshot_job_paths') < script.indexOf('phase snapshot_manifest_write'));
+});

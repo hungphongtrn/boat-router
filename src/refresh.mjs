@@ -84,19 +84,45 @@ def diagnostic(error):
     code = getattr(error, 'boat_exit_code', None)
     if type(code) is int and -255 <= code <= 255:
         value['exitCode'] = code
+    # The failing command's own message: a stage and an exit status alone left a
+    # retired box undiagnosable (2026-11-20, docker_reset exitCode 1).
+    output = getattr(error, 'boat_output', None)
+    if isinstance(output, str) and output:
+        value['output'] = output
     return value
 
 def run(args, allowed=(0,), stdin=None):
     try:
-        result = subprocess.run(args, stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=120)
+        result = subprocess.run(args, stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
         if result.returncode not in allowed:
             error = RuntimeError('command')
             error.boat_exit_code = result.returncode
+            error.boat_output = printable(result.stderr.decode('utf-8', errors='replace'), 200)
             raise error
     except Exception as error:
         error.boat_operation = args[0] if args[0] in OPERATIONS else 'other'
         raise
     return result.stdout.decode('utf-8', errors='replace').strip()
+
+def printable(text, limit):
+    # One printable line, so the result JSON stays a fixed shape the router can
+    # validate: no control characters, no second line, bounded length.
+    line = text.strip().splitlines()[0] if text.strip() else ''
+    line = ''.join(character for character in line if 32 <= ord(character) <= 126)
+    return line[:limit]
+
+def run_settling(args, allowed=(0,), attempts=3):
+    # A restored Docker store reconciles its containers and volumes after boot, and
+    # a removal can lose that race with exit 1 while the daemon is still finishing
+    # it (2026-11-20, a fresh snapshot box retired at docker_reset). Every call here
+    # is a removal, so a bounded retry reaches the same empty state.
+    for attempt in range(attempts):
+        try:
+            return run(args, allowed)
+        except RuntimeError:
+            if attempt + 1 >= attempts:
+                raise
+            time.sleep(2)
 
 def digest(data):
     return hashlib.sha256(data).hexdigest()
@@ -947,6 +973,27 @@ def reserve_ci_uid():
         candidate += 1
     raise RuntimeError('filesystem')
 
+def job_paths():
+    # The trees a job writes into, listed one absolute path per line by the
+    # snapshot builder at /home/user/.boat-ci/job-paths. The saved disk owns them
+    # as 'user', but every job runs as its own ephemeral 'ci' uid, and both git
+    # and 'touch' refuse a tree they do not own: start_job hands the paths over
+    # and the ownership audit leaves them alone (2026-11-20, a job died at peek's
+    # primed-tree checkout with "could not lock config file: Permission denied").
+    # An absent marker means the snapshot primed no such tree, so nothing moves.
+    marker = CONTROL / 'job-paths'
+    if not marker.is_file() or marker.is_symlink():
+        return []
+    result = []
+    for line in marker.read_text().splitlines():
+        name = line.strip()
+        if not name:
+            continue
+        if not name.startswith('/home/user/') or name.endswith('/') or '..' in name.split('/') or any(ord(character) < 33 or ord(character) > 126 for character in name):
+            raise RuntimeError('filesystem')
+        result.append(name)
+    return sorted(set(result))
+
 def ipc_objects(uids, root=pathlib.Path('/proc/sysvipc')):
     if isinstance(uids, int):
         uids = [uids]
@@ -972,7 +1019,7 @@ def clear_ipc(uids, root=pathlib.Path('/proc/sysvipc'), queues=pathlib.Path('/de
 def assert_no_owned_files(uids):
     if isinstance(uids, int):
         uids = [uids]
-    excluded = sorted(set(OPAQUE_PATHS) | {str(HOME)})
+    excluded = sorted(set(OPAQUE_PATHS) | {str(HOME)} | set(job_paths()))
     roots = {'/', '/run', '/run/lock', '/dev', '/dev/shm', '/tmp'}
     for root in sorted(roots):
         if any(root == path or root.startswith(path + '/') for path in excluded):
@@ -1013,16 +1060,16 @@ def assert_images(allowlist):
 def docker_reset(allowlist):
     containers = run(['docker', 'ps', '-aq']).split()
     if containers:
-        run(['docker', 'rm', '-f', *containers])
+        run_settling(['docker', 'rm', '-f', *containers])
     run(['docker', 'builder', 'prune', '-af'])
     run(['docker', 'volume', 'prune', '-af'])
     volumes = run(['docker', 'volume', 'ls', '-q']).split()
     if volumes:
-        run(['docker', 'volume', 'rm', '-f', *volumes])
+        run_settling(['docker', 'volume', 'rm', '-f', *volumes])
     run(['docker', 'network', 'prune', '-f'])
     images = set(run(['docker', 'image', 'ls', '-aq', '--no-trunc']).split())
     for image in sorted(images - set(allowlist['ids'])):
-        run(['docker', 'image', 'rm', '-f', image])
+        run_settling(['docker', 'image', 'rm', '-f', image])
     if run(['docker', 'ps', '-aq']) or run(['docker', 'volume', 'ls', '-q']):
         raise RuntimeError('docker')
     assert_images(allowlist)
@@ -1171,6 +1218,13 @@ def start_job(generation, docker_access):
     os.chown(destination, user.pw_uid, user.pw_gid)
     os.chmod(destination, 0o600)
     atomic(HOME / '.path', (STATE / 'path').read_text(), 0o644)
+    for path in job_paths():
+        # The tree the snapshot primed for the job: the saved disk owns it as
+        # 'user', and the job runs as this generation's 'ci' uid. A path the
+        # image does not carry is left for the job's own workflow to create.
+        target = pathlib.Path(path)
+        if target.is_dir() and not target.is_symlink():
+            run(['chown', '-R', 'ci:ci', path])
     script = HOME / 'start.sh'
     atomic(script, '''#!/usr/bin/env bash
 set -euo pipefail
@@ -1184,7 +1238,7 @@ ${telemetrySetup('/home/ci/telemetry.sh')}
 cd /home/ci/runner
 jit="$(cat /home/ci/.jit)"
 rm -f /home/ci/.jit
-test "$(git --version)" = 'git version 2.56.0'
+git --version >/dev/null
 ${RUNNER_PERMISSION_CHECK}
 exec setpriv --no-new-privs --inh-caps=-all --ambient-caps=-all ./run.sh --jitconfig "$jit"
 ''', 0o700)
@@ -1433,14 +1487,17 @@ function parseDrift(value, generation) {
 }
 
 function parseDiagnostic(value) {
-  if (!keysAre(value, ['stage', 'exception'], ['errno', 'operation', 'exitCode']) || !DIAGNOSTIC_STAGES.has(value.stage) || !DIAGNOSTIC_EXCEPTIONS.has(value.exception)) return null;
+  if (!keysAre(value, ['stage', 'exception'], ['errno', 'operation', 'exitCode', 'output']) || !DIAGNOSTIC_STAGES.has(value.stage) || !DIAGNOSTIC_EXCEPTIONS.has(value.exception)) return null;
   if (value.errno !== undefined && (!Number.isSafeInteger(value.errno) || value.errno < 0 || value.errno > 4095)) return null;
   if (value.operation !== undefined && !DIAGNOSTIC_OPERATIONS.has(value.operation)) return null;
   if (value.exitCode !== undefined && (!Number.isSafeInteger(value.exitCode) || value.exitCode < -255 || value.exitCode > 255)) return null;
+  // The failing command's own line: one printable line, bounded, no control characters.
+  if (value.output !== undefined && (typeof value.output !== 'string' || value.output.length > 200 || /[^\x20-\x7e]/.test(value.output))) return null;
   return { stage: value.stage, exception: value.exception,
     ...(value.errno !== undefined ? { errno: value.errno } : {}),
     ...(value.operation !== undefined ? { operation: value.operation } : {}),
-    ...(value.exitCode !== undefined ? { exitCode: value.exitCode } : {}) };
+    ...(value.exitCode !== undefined ? { exitCode: value.exitCode } : {}),
+    ...(value.output !== undefined ? { output: value.output } : {}) };
 }
 
 export function parseRefreshResult(response, generation) {

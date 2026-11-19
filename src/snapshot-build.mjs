@@ -12,6 +12,10 @@ import { REFRESH_HELPER_IMAGE } from './router/reset-constants.mjs';
 export function snapshotManifestFiles({ git = 'system' } = {}) {
   return [
     '/home/user/.boat-ci/runner.tar.gz',
+    // The trees a job writes into. The reuse controller reads this list at start
+    // and hands them to the job's `ci` user; listing it in the manifest makes the
+    // boot read it, so a lazily hydrated disk cannot report it missing.
+    '/home/user/.boat-ci/job-paths',
     '/home/user/.local/bin/bun',
     '/home/user/.local/bin/cargo-nextest',
     '/home/user/.local/bin/ld.lld',
@@ -102,6 +106,14 @@ test -f /home/user/ci/peek/.ci-base-built-at
 cargo-nextest nextest --version
 bun --version
 docker image inspect postgres:17 >/dev/null
+phase snapshot_job_paths
+# The tree a job checks out into. The saved disk owns it as 'user', but a
+# reusable box runs each job as its own ephemeral 'ci' uid, so the reuse
+# controller hands these paths over before it starts the runner and leaves them
+# out of its ownership audit. Without this list a job's first write fails with
+# "could not lock config file .git/config: Permission denied".
+printf '/home/user/ci\\n' > '/home/user/.boat-ci/job-paths'
+chmod 644 '/home/user/.boat-ci/job-paths'
 phase snapshot_manifest_write
 # Name what is absent before sha256sum does: its first failure would otherwise be
 # the only trace of a bootstrap that never installed the layout.

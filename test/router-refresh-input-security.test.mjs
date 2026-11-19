@@ -246,3 +246,72 @@ namespace['verify_helper'](sys.argv[-1])
     await assert.rejects(readFile(join(directory, 'executed')), { code: 'ENOENT' });
   }
 });
+
+test('a retired box keeps the failing command message in its diagnostic', () => {
+  const result = { ok: false, gen: 1, seconds: 1, failed: ['command'], diagnostic: { stage: 'docker_reset', exception: 'RuntimeError', operation: 'docker', exitCode: 1, output: 'Error response from daemon: remove peek: volume is in use' } };
+  assert.equal(parseRefreshResult({ stdout: JSON.stringify(result) }, 1)?.diagnostic?.output, 'Error response from daemon: remove peek: volume is in use');
+  // The message is one printable line of bounded length: a control character, a
+  // second line or an oversized value refuses the whole result.
+  for (const output of ['two\nlines', 'bell\u0007', 'x'.repeat(201), 7]) {
+    const broken = { ...result, diagnostic: { ...result.diagnostic, output } };
+    assert.equal(parseRefreshResult({ stdout: JSON.stringify(broken) }, 1), null, JSON.stringify(output));
+  }
+});
+
+test('job paths come from the snapshot marker and stay under /home/user', () => python(String.raw`
+import tempfile
+with tempfile.TemporaryDirectory() as directory:
+    CONTROL = pathlib.Path(directory)
+    assert job_paths() == []
+    (CONTROL / 'job-paths').write_text('/home/user/ci\n\n/home/user/ci\n')
+    assert job_paths() == ['/home/user/ci']
+    for bad in ('/home/user/ci/../etc', '/etc', '/home/user/ci/', '/home/user/ci\n/tmp/w'):
+        (CONTROL / 'job-paths').write_text(bad + '\n')
+        try:
+            job_paths()
+        except RuntimeError as error:
+            assert str(error) == 'filesystem', bad
+        else:
+            raise AssertionError(bad)
+print('ok')
+`));
+
+test('the ownership scan leaves the job tree alone', () => python(String.raw`
+CONTROL = pathlib.Path(tempfile.mkdtemp())
+(CONTROL / 'job-paths').write_text('/home/user/ci\n')
+seen = []
+run = lambda args, *a, **kw: seen.append(args) or ''
+mounts = lambda: []
+pathlib.Path.is_dir = lambda self: True
+assert_no_owned_files(1234)
+root = [args for args in seen if args[1] == '/']
+assert root and '/home/user/ci' in root[0], root
+print('ok')
+`));
+
+test('starting a job hands the primed job tree to the ci user', () => python(String.raw`
+import tempfile
+with tempfile.TemporaryDirectory() as directory:
+    root = pathlib.Path(directory)
+    STATE = root / 'state'; STATE.mkdir()
+    CONTROL = root / 'control'; CONTROL.mkdir()
+    HOME = root / 'home'; HOME.mkdir()
+    (STATE / 'current').write_text('1')
+    (STATE / 'refresh-1.json').write_text(json.dumps({'ok': True, 'gen': 1}))
+    (STATE / 'path').write_text('/usr/bin:/bin')
+    (CONTROL / 'jit').write_text('jit')
+    job = root / 'primed'; (job / 'peek').mkdir(parents=True); (job / 'peek' / 'a').write_text('x')
+    chowns, commands = [], []
+    def fake(args, allowed=(0,), stdin=None):
+        commands.append(args)
+        return 'not-found' if args[:2] == ['systemctl', 'show'] else ''
+    run = fake
+    job_paths = lambda: [str(job)]
+    pwd.getpwnam = lambda name: type('U', (), {'pw_uid': 1001, 'pw_gid': 1001})()
+    os.chown = lambda path, uid, gid: chowns.append((str(path), uid, gid))
+    start_job(1, False)
+    assert (['chown', '-R', 'ci:ci', str(job)] in commands), commands
+    assert (str(HOME / '.jit'), 1001, 1001) in chowns, chowns
+    assert any(args[:2] == ['systemd-run', '--quiet'] for args in commands), commands
+print('ok')
+`));

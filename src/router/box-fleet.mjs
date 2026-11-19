@@ -1191,12 +1191,12 @@ export class BoxFleet {
         const result = box.resetMode === 'docker' ? await this.api.dockerBaseline(box) : await this.api.refresh(box, 'baseline', 0);
         if (!Number.isSafeInteger(result?.processId) || result.processId < 1) throw new Error('missing process');
         return this.transition(machineId, 'baseline_submitted', { processId: result.processId });
-      } catch { await this.verificationOutcome(box, 'baseline_failed', false); return this.transition(machineId, 'baseline_failed', { failureReason: 'baseline_failed' }); }
+      } catch (error) { await this.verificationOutcome(box, 'baseline_failed', false, { step: 'submit baseline command', status: Number.isInteger(error?.status) ? error.status : null, code: error?.code ?? null }); return this.transition(machineId, 'baseline_failed', { failureReason: 'baseline_failed' }); }
     }
     if (box.state === 'baseline' && box.processId) {
       const result = box.resetMode === 'docker' ? await this.api.dockerBaselineResult(box, box.processId) : await this.api.refreshResult(box, box.processId, 0);
       if (result === null) return;
-      if (result?.ok !== true || !/^[a-f0-9]{64}$/.test(result.baselineHash ?? '')) { await this.verificationOutcome(box, 'baseline_failed', false, box.resetMode === 'docker' ? { step: result?.step ?? 'baseline', exitCode: result?.exitCode ?? null, output: result?.output ?? '' } : null); return this.transition(machineId, 'baseline_failed', { failureReason: 'baseline_failed' }); }
+      if (result?.ok !== true || !/^[a-f0-9]{64}$/.test(result.baselineHash ?? '')) { await this.verificationOutcome(box, 'baseline_failed', false, box.resetMode === 'docker' ? { step: result?.step ?? 'baseline', exitCode: result?.exitCode ?? null, output: result?.output ?? '' } : { step: 'baseline', failed: result?.failed ?? null, diagnostic: result?.diagnostic ?? null }); return this.transition(machineId, 'baseline_failed', { failureReason: 'baseline_failed' }); }
       return this.transition(machineId, 'baseline_done', { baselineHash: result.baselineHash, generation: 0, ...(result.summary ? { baselineSummary: result.summary } : {}) });
     }
     if (box.state === 'ready') {

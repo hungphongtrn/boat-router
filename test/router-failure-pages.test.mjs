@@ -55,6 +55,26 @@ test('paged diagnostics expose only allowlisted categories and normalized output
   assert.equal(page.failures[1].message,null); assert.equal(page.failures[1].size,null);
 });
 
+test('paged diagnostics carry the reuse controller reason a box retired', async () => {
+  const {storage,get} = await fixture(), prefix = 'project:project-a:verification:attempt:failure:';
+  const secret = 'EXAMPLE_SECRET_DO_NOT_ECHO';
+  await storage.put(prefix+'bx_a:0',{ kind:'baseline_failed', phase:'baseline', size:'default', at:1, message:JSON.stringify({ step:'baseline', failed:['command','docker'], diagnostic:{ stage:'docker_reset', exception:'RuntimeError', operation:'docker', exitCode:1, output:`Error response from daemon: volume in use TOKEN=${secret}` } }) });
+  await storage.put(prefix+'bx_b:0',{ kind:'baseline_failed', phase:'baseline', size:'default', at:2, message:JSON.stringify({ step:'baseline', failed:['command'], diagnostic:{ stage:'docker_reset', exception:'RuntimeError', output:'two\nlines', script:'rm -rf /' } }) });
+  const page = await (await get('&limit=10')).json();
+  assert.equal(JSON.stringify(page).includes(secret),false);
+  const diag = JSON.parse(page.failures[0].message);
+  assert.equal(diag.step,'baseline');
+  assert.deepEqual(diag.failed,['command','docker']);
+  assert.equal(diag.diagnostic.stage,'docker_reset');
+  assert.equal(diag.diagnostic.operation,'docker');
+  assert.equal(diag.diagnostic.exitCode,1);
+  assert.equal(diag.diagnostic.output,'Error response from daemon: volume in use TOKEN=[REDACTED]');
+  // A diagnostic the box shaped badly keeps only what the allowlist accepts.
+  const loose = JSON.parse(page.failures[1].message);
+  assert.equal(loose.diagnostic.output,undefined);
+  assert.equal(loose.diagnostic.script,undefined);
+});
+
 test('existing seven-day pruning applies to paged records', async () => {
   const {storage,get} = await fixture(), now = 10 * 86400_000, prefix = 'project:project-a:verification:attempt:failure:';
   await storage.put(prefix+'bx_old:0',{at:now-8*86400_000,kind:'boot_failed'});
