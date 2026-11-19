@@ -54,11 +54,11 @@ Each start goes to the enabled account that has the larger free share of its lim
 
 ## Snapshot boot
 
-Set `snapshotBoot: true` on a project and pin `PROJECT_SNAPSHOT_NAME` (`<name>-<yyyymmdd>-<hex>`) and `PROJECT_SNAPSHOT_MANIFEST_SHA256`. The helper waits for systemd and Docker before its first container run. If the helper fails, the box boots plain.
+Set `snapshotBoot: true` on a project and pin `PROJECT_SNAPSHOT_NAME` (`<name>-<yyyymmdd>-<hex>`) and `PROJECT_SNAPSHOT_MANIFEST_SHA256`. The snapshot must be one this router can verify: `src/snapshot-build.mjs` prints the build script a project's own setup runs on a primed box (`node src/snapshot-build.mjs`), which installs the plain-boot layout, caches the reset helper's OCI blobs and writes `/home/user/.boat-ci/toolchain.sha256`; the manifest hash is the SHA-256 of that file, and `PROJECT_SNAPSHOT_NAME`/`_MANIFEST_SHA256` are re-pinned together every time the snapshot is rebuilt. The helper waits for systemd and Docker before its first container run. If the helper fails, or the snapshot is missing, the box boots plain.
 
 ## Toolchain mirror
 
-`src/bootstrap.mjs` installs a pinned git package, the Actions runner, PowerShell and ShellCheck, each with a SHA-256 check. Set `toolchainMirror` in `config/policy.mjs` to your own HTTPS mirror. Mirrored files fall back to the upstream release URL; git has no upstream fallback, so put `git/2.56.0/git_amd64.deb` on the mirror first.
+`src/bootstrap.mjs` installs a pinned git package, the Actions runner, PowerShell and ShellCheck, each with a SHA-256 check. Set `toolchainMirror` in `config/policy.mjs` to your own HTTPS mirror. Mirrored files fall back to the upstream release URL; git has no upstream fallback, so put `git/2.56.0/git_amd64.deb` on the mirror first. A deployment that hosts no mirror can call `bootstrap({ git: 'system' })` to keep the image's git; a snapshot boot never runs the bootstrap, and `src/snapshot-build.mjs` builds with that mode and then manifests whichever git the box resolves.
 
 ## Alerts
 
