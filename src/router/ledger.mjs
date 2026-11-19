@@ -1,5 +1,5 @@
 import { dynamicPacing } from './dynamic-pacing.mjs';
-import { dayLimit, paidExtraEnabled, paidStartAllowed } from './paid-extra.mjs';
+import { dayLimit, paidExtraBudget, paidExtraEnabled, paidExtraPrice, paidExtraSpend, paidExtraStart, paidExtraSummary, paidStartAllowed, PAID_EXTRA_WINDOW_MS } from './paid-extra.mjs';
 const WINDOWS = { minute: 60_000, hour: 3_600_000, day: 86_400_000 };
 const validCount = n => Number.isSafeInteger(n) && n >= 0;
 function releaseFloor(state, key) {
@@ -302,6 +302,17 @@ export class AccountLedger {
         if (keys.length !== 1 || !oldest?.pool || oldest.key !== keys[0] || now - oldest.at < wait * 60_000 || (freeDailyExhausted && (count >= max || !this.paidTick || this.paidTick.used || (state.lastPaidCallAt != null && now - state.lastPaidCallAt < spacing * 1000)))) return { ok: false, reason: freeRefusal };
         paid = freeDailyExhausted;
       }
+      // A billed extra start is recorded against the account's rolling 30-day
+      // budget. Free starts are never counted and never refused, and an account
+      // without a budget keeps today's behaviour.
+      const budget = allowPaidExtra ? paidExtraBudget(this.policy) : null;
+      const extra = allowPaidExtra && paidExtraStart(snapshot.windows.day, snapshot.nextStartDollars);
+      const extraPrice = extra ? paidExtraPrice(snapshot.nextStartDollars) : 0;
+      const extraSpend = budget != null ? paidExtraSpend(state.paidExtraSpend, now) : [];
+      if (budget != null && extra) {
+        const spent = extraSpend.reduce((total, record) => total + record.dollars, 0);
+        if (spent + extraPrice * keys.length > budget + 1e-9) return { ok: false, reason: 'paid_extra_budget', nextAt: (extraSpend.length ? Math.min(...extraSpend.map(record => record.at)) : now) + PAID_EXTRA_WINDOW_MS };
+      }
       if (dynamic) {
         if (useFloor) state.dynamicPacing.floorStarts.push(...keys.map(key => ({ key, at: now })));
         else state.dynamicPacing.credit = Math.max(0, state.dynamicPacing.credit - keys.length);
@@ -313,6 +324,7 @@ export class AccountLedger {
         state.claims[key] = { project, at: now, status: 'pending', ...(client ? { client } : {}), ...(paid ? { paid: true, pricePerStartUsd: this.policy.paidOverflow.pricePerStartUsd ?? 0.05 } : {}), ...(Number.isSafeInteger(jobId) ? { jobId } : {}) };
       }
       state.waiting = state.waiting.filter(item => !selected.has(item.key));
+      if (budget != null && extra) state.paidExtraSpend = [...extraSpend, ...keys.map(() => ({ at: now, dollars: extraPrice }))];
       await tx.put(this.key, state);
       if (paid) { this.paidTick.used = true; this.paidTick.key = keys[0]; }
       return { ok: true, recovered: false, ...(paid ? { paid: true } : {}) };
@@ -352,6 +364,11 @@ export class AccountLedger {
     const state = await this.storage.get(this.key);
     const claims = Object.values(state?.claims ?? {}).filter(c => c.paid && (c.status !== 'created' || (c.settledAt ?? c.at) > this.now() - WINDOWS.day));
     return { count: claims.length, estimatedUsd: claims.reduce((sum, c) => sum + c.pricePerStartUsd, 0) };
+  }
+  // The rolling 30-day spend against the account's budget, for operators.
+  async paidExtraStatus() {
+    const state = await this.storage.get(this.key);
+    return paidExtraSummary(state?.paidExtraSpend, this.policy, this.now());
   }
   async claim(key) {
     const state = await this.storage.get(this.key);

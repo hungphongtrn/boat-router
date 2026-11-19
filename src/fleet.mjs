@@ -3,6 +3,7 @@ import { transition as applyBoxEvent } from './router/box-state.mjs';
 import { FleetBase } from './router/fleet-base.mjs';
 import { snapshotLimits } from './router/ledger.mjs';
 import { dynamicPacing } from './router/dynamic-pacing.mjs';
+import { paidExtraEnabled, paidExtraSummary } from './router/paid-extra.mjs';
 import { runnableDemand } from './router/workflow-demand.mjs';
 import { claimAny } from './router/local-fleet.mjs';
 import { ExternalService } from './router/external-service.mjs';
@@ -811,14 +812,16 @@ export class Fleet {
         const projected = dynamicPacing({ snapshot: { ...snapshot, canStart: true }, policy, claims: Object.values(ledger?.claims ?? {}), previous: ledger?.dynamicPacing, now: Date.now() });
         if (!projected) return Response.json({ enabled: true, available: false, reason: 'limits_unavailable' }, { headers });
         return Response.json({ enabled: true, available: true, admissionAvailable: snapshot.canStart && (selected?.enabled ?? true), ...(selected ? { account: name, accountEnabled: selected.enabled } : {}),
-          ...projected.status, ...(!snapshot.canStart ? { reason: 'provider_refused' } : {}) }, { headers });
+          ...projected.status, ...(!snapshot.canStart ? { reason: 'provider_refused' } : {}), ...(paidExtraEnabled(policy) ? { paidExtra: paidExtraSummary(ledger?.paidExtraSpend, policy, sampledAt) } : {}) }, { headers });
       }
       if (url.pathname === '/router/claims' && request.method === 'GET') {
         if (!await authorizedControl(request, this.env)) return new Response(null, { status: 401 });
         const name = url.searchParams.get('account'), selected = name ? this.router.accountPools?.[name] : null;
         if (name && !selected) return new Response(null, { status: 400 });
         const ledger = await this.storage.get(selected?.ledger.key ?? this.router.ledger.key);
-        return Response.json({ claims: ledger?.claims ?? {}, waiting: ledger?.waiting ?? [], poolPacing: ledger?.poolPacing ?? null }, { headers: { 'Cache-Control': 'no-store' } });
+        const policy = selected?.ledger.policy ?? this.router.account;
+        return Response.json({ claims: ledger?.claims ?? {}, waiting: ledger?.waiting ?? [], poolPacing: ledger?.poolPacing ?? null,
+          ...(paidExtraEnabled(policy) ? { paidExtra: paidExtraSummary(ledger?.paidExtraSpend, policy, Date.now()) } : {}) }, { headers: { 'Cache-Control': 'no-store' } });
       }
       if (url.pathname === '/router/balancer' && request.method === 'GET') {
         if (!await authorizedControl(request, this.env)) return new Response(null, { status: 401 });
