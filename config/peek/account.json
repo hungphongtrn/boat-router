@@ -13,7 +13,7 @@
   "starts": {
     "minute": 12,
     "hour": 60,
-    "day": 200
+    "day": 260
   },
   "poolPacing": {
     "enabled": true,
