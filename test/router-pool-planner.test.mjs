@@ -2,13 +2,13 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { plan, poolKey, poolSize, supplyCounts } from '../src/router/pool.mjs';
 
-test('pool planner counts aged demand and independent supply', () => {
+test('pool planner sends uncovered demand to Boat immediately', () => {
   const key = poolKey('owner/repo', 'boat-large');
   const pools = [{ key, localFirst: true, offerSeconds: 30 }];
   const jobs = [{ id: 1, pool: key, status: 'queued', queuedAt: 0 }, { id: 2, pool: key, status: 'queued', queuedAt: 80_000 }];
   const units = [{ pool: key, state: 'booting', since: 0 }];
   const result = plan({ pools, jobs, units, now: 100_000 })[key];
-  assert.deepEqual([result.D, result.Dboat, result.S, result.create, result.localOffer, result.oldestUncoveredAt], [2, 1, 1, 0, true, 80_000]);
+  assert.deepEqual([result.D, result.Dboat, result.S, result.create, result.localOffer, result.oldestUncoveredAt], [2, 2, 1, 1, true, 80_000]);
   assert.equal(plan({ pools, jobs, units, now: 300_000 })[key].create, 2);
   assert.equal(plan({ pools: [{ ...pools[0], reason: 'breaker' }], jobs, units, now: 300_000 })[key].create, 0);
   assert.equal(poolSize({ sizes: { label: { machine: 'large' } } }, 'label'), 'large');

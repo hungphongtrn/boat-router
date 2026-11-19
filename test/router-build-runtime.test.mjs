@@ -13,8 +13,15 @@ test('build stamps and disabled-only restart work in the Workers runtime', async
     assert.equal((await mf.dispatchFetch('https://router.test/router/build')).status, 401);
     let response = await mf.dispatchFetch('https://router.test/router/build', { headers: auth });
     assert.deepEqual(await response.json(), { worker_commit: commit, do_commit: commit });
-    assert.equal((await mf.dispatchFetch('https://router.test/router/restart', { method: 'POST' })).status, 401);
-    assert.equal((await mf.dispatchFetch('https://router.test/router/restart', { method: 'POST', headers: auth })).status, 409);
+    assert.equal((await mf.dispatchFetch('https://launcher.test/router/boxes?project=project-a')).status, 401);
+    response = await mf.dispatchFetch('https://launcher.test/router/boxes?project=project-a', { headers: auth });
+    assert.equal(response.status, 200);
+    assert.deepEqual((await response.json()).boxes, []);
+    assert.equal((await mf.dispatchFetch('https://launcher.test/router/external-leases')).status, 401);
+    response = await mf.dispatchFetch('https://launcher.test/router/external-leases', { headers: auth });
+    assert.deepEqual(await response.json(), { leases: [] });
+    assert.equal((await mf.dispatchFetch('https://launcher.test/router/restart', { method: 'POST' })).status, 401);
+    assert.equal((await mf.dispatchFetch('https://launcher.test/router/restart', { method: 'POST', headers: auth })).status, 409);
     await mf.setOptions({ ...options, bindings: { ...options.bindings, ENABLED: 'false' } });
     response = await mf.dispatchFetch('https://router.test/router/restart', { method: 'POST', headers: auth });
     assert.equal(response.status, 500);

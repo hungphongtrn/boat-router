@@ -30,7 +30,7 @@ export class FleetBase {
     if (!Number.isSafeInteger(value) || value < 1) throw new ApiError('config', 400);
     return value;
   }
-  maxActive() { return this.policy('MAX_ACTIVE', 4); }
+  maxActive() { return this.env.OPEN_START_QUEUE === 'true' ? null : this.policy('MAX_ACTIVE', 4); }
   day() { return new Date(this.now()).toISOString().slice(0, 10); }
   async release(job) { await this.storage.delete(`slot:${job.id}`); }
   async emit(event, job, detail, tx) {

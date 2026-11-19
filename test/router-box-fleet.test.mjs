@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { Storage } from './helpers.mjs';
-import { BoxFleet } from '../src/router/box-fleet.mjs';
+import { BoxFleet, healthGateFromLimits, effectiveHealthMode, slowBoxYields, reuseHealthMode } from '../src/router/box-fleet.mjs';
 
 const box = { machineId: 'bx_23456789', runnerId: 1, state: 'idle' };
 
@@ -53,6 +53,7 @@ test('admission persists its key before provider creation and records the result
   const [record] = await fleet.prepare('pool', 'large', 1, 1);
   assert.equal(await fleet.admit(record.createKey, {}, 3600), true);
   assert.equal((await storage.get(`box:${box.machineId}`)).state, 'booting');
+  assert.equal((await storage.get(`box:${box.machineId}`)).machineTtlSeconds, 3600);
   assert.equal(await storage.get(`create:${record.createKey}`), undefined);
   assert.equal(claim.status, 'created');
 });
@@ -267,7 +268,7 @@ test('a 422 during completion fencing does not count the job twice', async () =>
   assert.equal((await storage.get(`box:${box.machineId}`)).jobs, 1);
 });
 
-test('local offer window cancels an uncalled create that no longer has aged demand', async () => {
+test('unclaimed demand keeps its uncalled Boat create', async () => {
   const storage = new Storage(), pool = JSON.stringify(['owner/repo', 'boat-large']);
   await storage.put('pool:migrated', { done: true });
   await storage.put('pool:snapshot', { at: 1, complete: true, runners: [] });
@@ -277,8 +278,8 @@ test('local offer window cancels an uncalled create that no longer has aged dema
   const budget = { claim: async () => ({ status: 'pending' }), cancelPending: async () => { cancelled++; return true; } };
   const fleet = new BoxFleet(storage, {}, () => 10_000, { budget });
   await fleet.tick({ mode: 'on', env: { ENABLED: 'true' }, project: { repo: 'owner/repo', labels: ['boat-large'], sizes: { 'boat-large': { machine: 'large' } }, localFirst: { enabled: true, labels: { 'boat-large': 'generic' } } } });
-  assert.equal(cancelled, 1);
-  assert.equal(await storage.get('create:key'), undefined);
+  assert.equal(cancelled, 0);
+  assert.ok(await storage.get('create:key'));
 });
 
 test('pool tick starts a box for uncovered demand and follows the assigned runner', async () => {
@@ -461,4 +462,270 @@ test('failed light resets delete boxes and allow fresh provider creates', async 
   assert.equal((await storage.get('verification:breaker')).tripped, false);
   await fleet.verificationOutcome({ machineId: 'b', size: 'large' }, 'online', false);
   assert.equal((await storage.get('verification:breaker')).tripped, true);
+});
+
+
+test('purging requires a fenced runner and a missing sandbox when deletion is incomplete', async () => {
+  for (const [fenced, sandboxStatus, operationStatus, expected] of [
+    [true, 404, 'blocked', 'deleted'],
+    [false, 404, 'blocked', 'purging'],
+    [true, 200, 'blocked', 'purging'],
+    [true, 200, 'completed', 'deleted'],
+  ]) {
+    const storage = new Storage();
+    const record = { ...box, state: 'purging', runnerFenced: fenced, operationId: 'op' };
+    await storage.put(`box:${box.machineId}`, record);
+    let sandboxCalls = 0;
+    const fleet = new BoxFleet(storage, {
+      deletion: async () => ({ operation: { id: 'op', status: operationStatus } }),
+      sandbox: async received => { sandboxCalls++; assert.equal(received.operationId, 'op'); if (sandboxStatus === 404) throw Object.assign(new Error(), { status: 404 }); return {}; },
+    });
+    await fleet.stepBox(box.machineId);
+    const actual = await storage.get(`box:${box.machineId}`);
+    assert.equal(actual.state, expected);
+    if (fenced && sandboxStatus === 404) {
+      assert.equal(actual.deletedBy, 'sandbox_404');
+      assert.equal(actual.deletionOperationId, 'op');
+      assert.equal(actual.deletionOperationStatus, 'blocked');
+    }
+    if (operationStatus === 'completed') assert.equal(sandboxCalls, 0);
+  }
+});
+
+test('completed jobs clear consecutive boot failures even with an incomplete snapshot', async () => {
+  const storage = new Storage(), pool = JSON.stringify(['owner/repo', 'boat-default']);
+  let now = 1000;
+  const project = { id: 'demo', repo: 'owner/repo', labels: ['boat-default'], sizes: { 'boat-default': { machine: 'default' } } };
+  const fleet = new BoxFleet(storage, {}, () => now, { project });
+  await storage.put('pool:migrated', { done: true });
+  await storage.put('pool:snapshot', { complete: false });
+  await storage.put('box:good', { machineId: 'good', runnerId: 1, runnerName: 'runner-good', size: 'default', state: 'busy', pool, since: 0 });
+  await fleet.verificationOutcome({ machineId: 'bad1', size: 'default' }, 'boot_failed', false);
+  now = 3000;
+  await storage.put('gh-job:1', { id: 1, pool, runnerName: 'runner-good', status: 'completed', conclusion: 'success', completedAt: 2000 });
+  await fleet.tick({ mode: 'on', env: { ENABLED: 'true' }, project });
+  assert.equal((await storage.get('verification:breaker')).counts.default, 0);
+  now = 4000;
+  await fleet.verificationOutcome({ machineId: 'bad2', size: 'default' }, 'boot_failed', false);
+  await fleet.tick({ mode: 'on', env: { ENABLED: 'true' }, project });
+  assert.equal((await storage.get('verification:breaker')).counts.default, 1, 'duplicate success must not clear a later failure');
+  await storage.put('gh-job:2', { id: 2, pool, runnerName: 'runner-good', status: 'completed', conclusion: 'success', completedAt: 2000 });
+  await fleet.tick({ mode: 'on', env: { ENABLED: 'true' }, project });
+  assert.equal((await storage.get('verification:breaker')).counts.default, 1, 'late old success must not clear a later failure');
+  await fleet.verificationOutcome({ machineId: 'bad3', size: 'default' }, 'boot_failed', false);
+  assert.equal((await storage.get('verification:breaker')).tripped, false);
+});
+
+test('project concurrency cap limits old pending creates and preserves uncertain recovery', async () => {
+  const storage = new Storage(), project = { caps: { concurrent: 2 } };
+  const fleet = new BoxFleet(storage, {}, () => 1000, { project, budget: {} });
+  await storage.put('box:one', { state: 'idle' });
+  await storage.put('box:two', { state: 'busy' });
+  await storage.put('create:old', { createKey: 'old', queuedAt: 1, state: 'pending' });
+  await storage.put('create:new', { createKey: 'new', queuedAt: 2, state: 'pending' });
+  assert.equal(await fleet.concurrentCapReached(project), true);
+  assert.deepEqual(await fleet.admissionEntries(), []);
+  await storage.put('create:uncertain', { createKey: 'uncertain', queuedAt: 0, state: 'unknown' });
+  assert.deepEqual((await fleet.admissionEntries()).map(x => x.key), ['uncertain']);
+  await storage.put('create:uncertain', { createKey: 'uncertain', queuedAt: 0, state: 'pending' });
+  await storage.put('box:two', { state: 'deleted' });
+  assert.deepEqual((await fleet.admissionEntries()).map(x => x.key), ['uncertain']);
+  assert.equal(await fleet.concurrentCapReached(project), false);
+});
+
+test('an incomplete prepare does not touch each pending create', async () => {
+  const storage = new Storage(), pool = JSON.stringify(['owner/repo', 'boat-default']);
+  const project = { id: 'demo', repo: 'owner/repo', labels: ['boat-default'], sizes: { 'boat-default': { machine: 'default' } }, caps: { concurrent: 1 } };
+  await storage.put('pool:migrated', { done: true });
+  await storage.put('pool:snapshot', { complete: false });
+  await storage.put('gh-job:1', { id: 1, pool, status: 'queued', queuedAt: 1 });
+  await storage.put('create:old', { createKey: 'old', pool, queuedAt: 1, state: 'pending', reusable: false });
+  let withdrawals = 0;
+  const budget = { project: 'demo', ledger: { withdrawPoolWaiters: async () => { withdrawals++; } } };
+  const fleet = new BoxFleet(storage, {}, () => 1000, { project, budget });
+  const result = await fleet.tick({ mode: 'on', env: { ENABLED: 'true' }, project, prepareOnly: true });
+  assert.equal(result[pool].reason, 'snapshot_incomplete');
+  assert.equal(withdrawals, 1);
+  assert.ok(await storage.get('create:old'));
+});
+
+test('zero account pool cap pauses new boxes but preserves uncertain reconciliation', async () => {
+  const storage = new Storage(), project = { caps: { concurrent: 0 } };
+  const fleet = new BoxFleet(storage, {}, () => 1000, { project, budget: {} });
+  await storage.put('create:new', { createKey: 'new', queuedAt: 2, state: 'pending' });
+  await storage.put('create:unknown', { createKey: 'unknown', queuedAt: 1, state: 'unknown' });
+  assert.equal(await fleet.concurrentCapReached(project), true);
+  assert.deepEqual((await fleet.admissionEntries()).map(x => x.key), ['unknown']);
+});
+
+
+test('reset outcomes include successes, failures and timeouts without duplicate generations', async () => {
+  const storage = new Storage(); let now = 1000;
+  const fleet = new BoxFleet(storage, { lightResetResult: async box => ({ ok: box.machineId === 'good' }) }, () => now);
+  for (const id of ['good', 'bad']) {
+    await storage.put(`box:${id}`, { machineId: id, state: 'resetting', since: 0, generation: 1, processId: 2 });
+    await fleet.stepBox(id);
+  }
+  await fleet.recordResetOutcome({ machineId: 'good', generation: 1 }, true);
+  now = 301000;
+  await storage.put('box:slow', { machineId: 'slow', state: 'resetting', since: 1000, generation: 1 });
+  await fleet.deadline('slow');
+  const records = await storage.get('verification:reset-outcomes');
+  assert.deepEqual(records.map(({ machineId, ok }) => ({ machineId, ok })), [{ machineId: 'good', ok: true }, { machineId: 'bad', ok: false }, { machineId: 'slow', ok: false }]);
+});
+
+
+test('a reset killed with 137 collects kernel classification before retirement', async () => {
+  const storage = new Storage(), calls = [];
+  const api = { lightResetResult: async () => ({ ok: false, exitCode: 137, step: 'docker prune' }), lightResetDiagnostics: async () => { calls.push('diagnose'); return { dmesgReadable: true, oomObserved: true }; } };
+  const fleet = new BoxFleet(storage, api, () => 1000);
+  await storage.put('box:machine', { machineId: 'machine', state: 'resetting', generation: 1, processId: 2 });
+  await fleet.stepBox('machine');
+  assert.deepEqual(calls, ['diagnose']);
+  assert.equal((await storage.get('box:machine')).state, 'destroying');
+  const failure = await storage.get('verification:attempt:failure:machine:1');
+  assert.deepEqual(JSON.parse(failure.message).kernel, { dmesgReadable: true, oomObserved: true });
+});
+
+test('queued incompatible work releases only the idle slots it needs', async () => {
+  const storage = new Storage(), large = JSON.stringify(['owner/repo', 'boat-large']), small = JSON.stringify(['owner/repo', 'boat-default']);
+  const project = { id: 'demo', repo: 'owner/repo', labels: ['boat-large', 'boat-default'], sizes: { 'boat-large': { machine: 'large' }, 'boat-default': { machine: 'default' } }, caps: { concurrent: 3 }, reuse: { mode: 'on', idleHoldSeconds: 3600 } };
+  const runners = [];
+  for (let i = 0; i < 3; i++) {
+    const machineId = `box${i}`, runnerName = `runner${i}`;
+    await storage.put(`box:${machineId}`, { machineId, runnerId: i + 1, runnerName, pool: large, state: 'idle', since: 0, onlineAt: 0, reusable: true });
+    runners.push({ name: runnerName, status: 'online', busy: false });
+  }
+  await storage.put('pool:migrated', { done: true });
+  await storage.put('pool:snapshot', { at: 200_000, complete: true, runners });
+  await storage.put('gh-job:1', { id: 1, pool: small, status: 'queued', queuedAt: 0 });
+  let removed = 0;
+  const fleet = new BoxFleet(storage, { removeRunner: async () => { removed++; } }, () => 200_000, { project, budget: { claim: async () => null } });
+  await fleet.tick({ mode: 'on', env: { ENABLED: 'true' }, account: { reuse: { enabled: true } }, project, preprepared: true, skipAdmission: true });
+  assert.equal(removed, 1);
+  assert.equal((await storage.get('box:box0')).retirementReason, 'incompatible_queue');
+  assert.equal((await storage.get('box:box1')).state, 'idle');
+});
+
+test('a failed post-reset health check retires the box outside the breaker', async () => {
+  const storage = new Storage(), logs = [];
+  const health = { cpuMs: 90, fsyncMs: 1900, writeMs: 300, memPct: 88, foreign: false, measured: true, failed: true, slow: true, cpu: 'AMD Ryzen 7 9700X 8-Core Processor' };
+  const fleet = new BoxFleet(storage, { lightResetResult: async () => ({ ok: false, step: 'health check', exitCode: 1, output: '', guard: 'health', health }) }, () => 1000, { project: { id: 'demo' }, logger: line => logs.push(JSON.parse(line)) });
+  await storage.put('box:machine', { machineId: 'machine', size: 'large', state: 'resetting', generation: 1, processId: 2 });
+  await fleet.stepBox('machine');
+  const box = await storage.get('box:machine');
+  assert.equal(box.state, 'destroying'); assert.equal(box.retirementReason, 'health_check'); assert.deepEqual(box.resetHealth, health); assert.equal(box.hostCpu, health.cpu); assert.equal(box.slowHost, true);
+  assert.equal(await storage.get('verification:attempt:failure:machine:1'), undefined);
+  assert.notEqual((await storage.get('verification:breaker'))?.tripped, true);
+  assert.deepEqual(logs.find(line => line.event === 'reset_health_retire')?.health, health);
+});
+
+test('a healthy reset keeps its measurements on the box', async () => {
+  const storage = new Storage();
+  const summary = { health: { cpuMs: 90, fsyncMs: 40, writeMs: 300, memPct: 88, foreign: false, measured: true, failed: false, slow: false, cpu: 'AMD Ryzen 9 9950X 16-Core Processor' } };
+  const fleet = new BoxFleet(storage, { lightResetResult: async () => ({ ok: true, summary }) }, () => 1000, { project: { id: 'demo' } });
+  await storage.put('box:machine', { machineId: 'machine', state: 'resetting', generation: 1, processId: 2 });
+  await fleet.stepBox('machine');
+  const box = await storage.get('box:machine');
+  assert.equal(box.state, 'ready'); assert.deepEqual(box.lastResetSummary, summary); assert.equal(box.slowHost, false); assert.equal(box.hostCpu, 'AMD Ryzen 9 9950X 16-Core Processor');
+});
+
+test('the reset receives the account health mode; observe is the default', async () => {
+  const seen = [];
+  for (const reuseMode of [undefined, 'observe', 'enforce']) {
+    const storage = new Storage();
+    const fleet = new BoxFleet(storage, { lightReset: async job => { seen.push(job.healthMode); return { processId: 1 }; } }, () => 1000, { project: { id: 'demo' } });
+    await storage.put('box:m', { machineId: 'm', pool: 'p', size: 'large', state: 'finished', since: 0, generation: 0, reusable: true, baselineHash: 'a'.repeat(64) });
+    await fleet.stepBox('m', {}, { reuseEnabled: true, ...(reuseMode ? { reuseHealthMode: reuseMode } : {}) });
+  }
+  assert.deepEqual(seen, ['observe', 'observe', 'enforce']);
+});
+
+test('a fresh box is health-probed once before its first job; enforce retires a slow one', async () => {
+  const slow = { cpuMs: 80, fsyncMs: 2500, writeMs: 300, memPct: 90, foreign: false, measured: true, failed: true, slow: true, cpu: 'AMD Ryzen 7 9700X 8-Core Processor' };
+  const good = { ...slow, fsyncMs: 60, failed: false, slow: false };
+  const run = async (health, healthMode, probe = async () => health) => {
+    const storage = new Storage(); let probes = 0, registrations = 0;
+    const api = { healthProbe: async box => { probes++; return probe(box); }, configure: async () => { registrations++; throw new Error('stop after register'); } };
+    const fleet = new BoxFleet(storage, api, () => 1000, { project: { id: 'demo', repo: 'owner/repo' }, installation: 1 });
+    await storage.put('box:m', { machineId: 'm', pool: JSON.stringify(['owner/repo', 'boat-large']), originPool: JSON.stringify(['owner/repo', 'boat-large']), size: 'large', state: 'ready', since: 0, generation: 0, reusable: true, baselineHash: 'a'.repeat(64) });
+    await fleet.stepBox('m', {}, { healthMode });
+    const box = await storage.get('box:m');
+    return { box, probes, registrations };
+  };
+  const enforced = await run(slow, 'enforce');
+  assert.equal(enforced.box.state, 'destroying'); assert.equal(enforced.box.retirementReason, 'health_check'); assert.equal(enforced.registrations, 0);
+  const observed = await run(slow, 'observe');
+  assert.deepEqual(observed.box.freshHealth, slow); assert.equal(observed.registrations, 1, 'observe keeps the box in service'); assert.equal(observed.box.slowHost, true); assert.equal(observed.box.hostCpu, slow.cpu);
+  const healthy = await run(good, 'enforce');
+  assert.deepEqual(healthy.box.freshHealth, good); assert.equal(healthy.registrations, 1);
+  const broken = await run(null, 'enforce', async () => { throw new Error('provider error'); });
+  assert.deepEqual(broken.box.freshHealth, { measured: false }); assert.equal(broken.registrations, 1, 'a probe error never retires a box');
+  const unmeasured = await run({ ...slow, measured: false }, 'enforce');
+  assert.equal(unmeasured.registrations, 1);
+  const none = await run(slow, undefined);
+  assert.equal(none.probes, 0); assert.equal(none.box.freshHealth, undefined);
+});
+
+test('the fresh probe parses only a complete numeric result', async () => {
+  const { parseHealthProbe, healthProbeCommand } = await import('../src/router/light-reset.mjs');
+  assert.deepEqual(parseHealthProbe({ exitCode: 0, stdout: '{"health":{"cpuMs":1,"fsyncMs":2,"writeMs":3,"memPct":90,"foreign":0,"measured":1,"failed":0,"slow":0,"cpu":"AMD_EPYC_9455_48-Core_Processor"}}\n' }), { cpuMs: 1, fsyncMs: 2, writeMs: 3, memPct: 90, foreign: false, measured: true, failed: false, slow: false, cpu: 'AMD EPYC 9455 48-Core Processor' });
+  for (const response of [{ exitCode: 1, stdout: '' }, { running: true }, { exitCode: 0, stdout: 'x' }, { exitCode: 0, stdout: '{"health":{"cpuMs":-1}}' }]) assert.equal(parseHealthProbe(response), null);
+  assert.match(Buffer.from(healthProbeCommand().match(/[A-Za-z0-9+/]{80,}={0,2}/)[0], 'base64').toString(), /health_enforce=0/);
+});
+
+test('auto health mode enforces only while the window and credit can replace a box', async () => {
+  const limits = (remaining, credit, canStart = true) => ({ starts: { day: { remaining } }, creditBalanceHours: credit, canStart });
+  assert.equal(healthGateFromLimits(limits(20, 5)), true);
+  assert.equal(healthGateFromLimits(limits(19, 5)), false);
+  assert.equal(healthGateFromLimits(limits(200, 0)), false);
+  assert.equal(healthGateFromLimits(limits(200, 5, false)), false);
+  assert.equal(healthGateFromLimits(null), false);
+  const account = mode => ({ reuse: { healthCheck: mode, healthEnforceMinStarts: 20 } });
+  assert.equal(await effectiveHealthMode(account('auto'), { limits: async () => limits(150, 3) }, 1000), 'enforce');
+  assert.equal(await effectiveHealthMode(account('auto'), { limits: async () => limits(0, 3) }, 1000), 'observe');
+  assert.equal(await effectiveHealthMode(account('auto'), { limits: async () => { throw new Error('down'); } }, 1000), 'observe');
+  assert.equal(await effectiveHealthMode(account('enforce'), {}, 1000), 'enforce');
+  assert.equal(await effectiveHealthMode(account(undefined), { limits: async () => limits(150, 3) }, 1000), 'observe');
+  let reads = 0; const api = { limits: async () => { reads++; return limits(150, 3); } };
+  await effectiveHealthMode(account('auto'), api, 1000); await effectiveHealthMode(account('auto'), api, 20_000); await effectiveHealthMode(account('auto'), api, 40_000);
+  assert.equal(reads, 2, 'one provider read per 30 s');
+});
+
+test('a slow box is handed out last and never takes a large shard when a healthy box is about to be free', () => {
+  const pool = 'p', now = 1_000_000, job = { id: 1, queuedAt: now - 10_000 };
+  const slow = { machineId: 's', pool, size: 'large', state: 'ready', slowHost: true };
+  assert.equal(slowBoxYields(slow, job, [slow, { machineId: 'h', pool, state: 'ready' }], now), true);
+  assert.equal(slowBoxYields(slow, job, [slow, { machineId: 'h', pool, state: 'resetting' }], now), true);
+  assert.equal(slowBoxYields({ ...slow, size: 'default' }, job, [slow, { machineId: 'h', pool, state: 'resetting' }], now), false);
+  assert.equal(slowBoxYields(slow, job, [slow, { machineId: 'h', pool, state: 'busy' }], now), false, 'no healthy box free: the slow box serves');
+  assert.equal(slowBoxYields(slow, job, [slow, { machineId: 'h', pool: 'other', state: 'ready' }], now), false);
+  assert.equal(slowBoxYields(slow, job, [slow, { machineId: 'h2', pool, state: 'ready', slowHost: true }], now), false);
+  assert.equal(slowBoxYields(slow, { ...job, queuedAt: now - 130_000 }, [slow, { machineId: 'h', pool, state: 'ready' }], now), false, 'a long-waiting job is not held back');
+  assert.equal(slowBoxYields(slow, { ...job, queuedAt: now - 70_000 }, [slow, { machineId: 'h', pool, state: 'resetting' }], now), false);
+});
+
+test('reuse refusal: auto and enforce always enforce the reset check; marked reused boxes leave service', async () => {
+  assert.equal(reuseHealthMode({ reuse: { healthCheck: 'auto' } }), 'enforce');
+  assert.equal(reuseHealthMode({ reuse: { healthCheck: 'enforce' } }), 'enforce');
+  assert.equal(reuseHealthMode({ reuse: { healthCheck: 'observe' } }), 'observe');
+  assert.equal(reuseHealthMode({ reuse: {} }), 'observe');
+  const project = { id: 'demo', repo: 'owner/repo' };
+  const run = async (fields, reuseMode) => {
+    const storage = new Storage(); let registrations = 0;
+    const fleet = new BoxFleet(storage, { configure: async () => { registrations++; throw new Error('stop'); } }, () => 1000, { project, installation: 1 });
+    await storage.put('box:m', { machineId: 'm', pool: JSON.stringify(['owner/repo', 'boat-large']), originPool: JSON.stringify(['owner/repo', 'boat-large']), size: 'large', state: 'ready', since: 0, generation: 2, reusable: true, baselineHash: 'a'.repeat(64), ...fields });
+    await fleet.stepBox('m', {}, { reuseHealthMode: reuseMode });
+    return { box: await storage.get('box:m'), registrations };
+  };
+  const slow = await run({ slowHost: true }, 'enforce');
+  assert.equal(slow.box.state, 'destroying'); assert.equal(slow.box.retirementReason, 'health_check'); assert.equal(slow.registrations, 0);
+  const failed = await run({ lastResetSummary: { health: { failed: true } } }, 'enforce');
+  assert.equal(failed.box.state, 'destroying');
+  const observed = await run({ slowHost: true }, 'observe');
+  assert.equal(observed.registrations, 1, 'observe keeps a marked box');
+  const healthy = await run({ slowHost: false }, 'enforce');
+  assert.equal(healthy.registrations, 1);
+  const fresh = await run({ slowHost: true, generation: 0, freshHealth: { measured: false } }, 'enforce');
+  assert.equal(fresh.registrations, 1, 'a fresh box (generation 0) is not a reuse');
 });

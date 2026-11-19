@@ -1,5 +1,5 @@
 {
-  "name": "example-boat-router",
+  "name": "peek-boat-router",
   "main": "src/worker.mjs",
   "compatibility_date": "2026-07-30",
   "compatibility_flags": [
@@ -24,12 +24,14 @@
   "vars": {
     "ENABLED": "false",
     "PLUGIN_ROUTER": "true",
-    "BOAT_WALLET": "example-account",
-    "BOAT_PROVIDER_WALLET": "example-provider-wallet",
-    "ROUTER_PROJECTS": "project-a",
+    "BOAT_WALLET": "peek",
+    "BOAT_PROVIDER_WALLET": "sandbox_86a94b0d060c3c6145307bbcb419d258",
+    "ROUTER_PROJECTS": "peek",
     "START_PACING": "true",
-    "MACHINE_TTL_SECONDS": "3600",
-    "PUBLIC_ORIGIN": "https://example.invalid"
+    "MACHINE_TTL_SECONDS": "28800",
+    "PUBLIC_ORIGIN": "https://peek-boat-router.phonglearntodev.workers.dev",
+    "PROJECT_SNAPSHOT_NAME": "ci-base-20261119-b3245b3e",
+    "PROJECT_SNAPSHOT_MANIFEST_SHA256": "ddd7a9f58e641547e8ab4029ac4bce8ef67db89a1ed5bba862654707089def56"
   },
   "observability": {
     "enabled": false,

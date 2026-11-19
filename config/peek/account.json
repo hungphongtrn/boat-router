@@ -1,0 +1,27 @@
+{
+  "id": "peek",
+  "margin": 0.1,
+  "reuse": {
+    "enabled": true,
+    "floor": 0,
+    "maxJobs": 30,
+    "maxAgeSeconds": 14400,
+    "idleHoldSeconds": 420,
+    "healthCheck": "auto",
+    "healthEnforceMinStarts": 20
+  },
+  "starts": {
+    "minute": 12,
+    "hour": 60,
+    "day": 200
+  },
+  "poolPacing": {
+    "enabled": true,
+    "mode": "dynamic",
+    "unpaced": false,
+    "burst": 4,
+    "reserveStarts": 0
+  },
+  "openStartQueue": true,
+  "dayReserve": 0
+}

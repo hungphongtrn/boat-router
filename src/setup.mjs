@@ -1,6 +1,7 @@
 import { setupOwner, installedPage } from '../config/policy.mjs';
 import manifestTemplate from '../config/github-app-manifest.json' with { type: 'json' };
 import { createPrivateKey } from 'node:crypto';
+import { appCredentials, pushAppSecrets } from './app-secrets.mjs';
 
 export async function hash(value) {
   return [...new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(value)))].map(x => x.toString(16).padStart(2, '0')).join('');
@@ -26,9 +27,24 @@ export async function authorizedControl(request, env) {
   const value = request.headers.get('Authorization')?.match(/^Bearer ([A-Za-z0-9_-]{32,128})$/)?.[1];
   return Boolean(value && equal(await hash(value), bootstrap(env).controlHash));
 }
-export async function authorizedLocal(request, env) {
+// Local claimer tokens: LOCAL_CONTROL_HASH (one shared token, claimer id "default") and
+// LOCAL_CONTROL_HASHES, a JSON object of claimer id to SHA-256 hash for one token per agent
+// instance or mini. Returns the claimer id, or null. The control token is never a claimer.
+export async function localClaimer(request, env) {
   const value = request.headers.get('Authorization')?.match(/^Bearer ([A-Za-z0-9_-]{32,128})$/)?.[1];
-  return Boolean(value && equal(await hash(value), env.LOCAL_CONTROL_HASH));
+  if (!value) return null;
+  const digest = await hash(value);
+  let claimer = equal(digest, env.LOCAL_CONTROL_HASH) ? 'default' : null;
+  let hashes = {};
+  try { hashes = JSON.parse(env.LOCAL_CONTROL_HASHES ?? '{}'); } catch { hashes = {}; }
+  if (!hashes || typeof hashes !== 'object' || Array.isArray(hashes)) hashes = {};
+  for (const [id, expected] of Object.entries(hashes)) {
+    if (/^[a-z0-9][a-z0-9._-]{0,63}$/.test(id) && equal(digest, expected) && claimer === null) claimer = id;
+  }
+  return claimer;
+}
+export async function authorizedLocal(request, env) {
+  return (await localClaimer(request, env)) !== null;
 }
 export class SetupController {
   constructor(storage, env, api, now = Date.now, alert = async () => {}) { Object.assign(this, { storage, env, api, now, alert }); }
@@ -40,6 +56,7 @@ export class SetupController {
       if (!await authorizedControl(request, this.env)) return new Response(null, { status: 401 });
       return this.status();
     }
+    if (url.pathname === '/setup/secrets-to-worker' && request.method === 'POST') return this.secretsToWorker(request);
     if (url.pathname === '/setup/installed' && request.method === 'GET') {
       const app = await this.storage.get('github-app');
       return app ? this.installed(app) : page('Setup is incomplete.', { status: 409 });
@@ -60,10 +77,38 @@ export class SetupController {
     if (url.pathname === '/setup/callback' && request.method === 'GET') return this.complete(request, url);
     return page('Method not allowed.', { status: 405 });
   }
+  // One-shot transfer of the stored App credentials into this Worker's secrets (control token
+  // plus a Cloudflare API token for the account that owns PUBLIC_ORIGIN). Status codes only.
+  async secretsToWorker(request) {
+    const headers = { 'Cache-Control': 'no-store' };
+    if (!await authorizedControl(request, this.env)) return new Response(null, { status: 401, headers });
+    if (Number(request.headers.get('Content-Length')) > 4096) return new Response(null, { status: 413, headers });
+    let body;
+    try { const raw = await request.text(); if (raw.length > 4096) return new Response(null, { status: 413, headers }); body = JSON.parse(raw); } catch { return new Response(null, { status: 400, headers }); }
+    if (!body || typeof body !== 'object' || typeof body.cloudflareToken !== 'string' || typeof body.accountId !== 'string') return new Response(null, { status: 400, headers });
+    const result = await pushAppSecrets({ storage: this.storage, env: this.env, fetcher: this.api.fetch, cloudflareToken: body.cloudflareToken, accountId: body.accountId });
+    if (result.status === 202) await this.alert('alert_app_secrets_copied');
+    const { status, ...rest } = result;
+    return Response.json(rest, { status, headers });
+  }
   async status() {
     const headers = { 'Cache-Control': 'no-store' };
     const app = await this.storage.get('github-app');
-    if (!app) return Response.json({ app_configured: false, private_key_stored: false, webhook_secret_stored: false }, { headers });
+    const sources = appCredentials(this.env, app);
+    const stored = { private_key_stored: typeof sources.pem === 'string' && sources.pem.length > 0, private_key_source: sources.privateKeySource,
+      webhook_secret_stored: typeof sources.webhookSecret === 'string' && sources.webhookSecret.length > 0, webhook_secret_source: sources.webhookSecretSource,
+      private_key_in_storage: typeof app?.pem === 'string', webhook_secret_in_storage: typeof app?.webhookSecret === 'string' };
+    if (!app) return Response.json({ app_configured: false, ...stored }, { headers });
+    // appCredentials reads the Worker secrets only: the stored PEM is never
+    // used at runtime. Without them appJWT throws and the owner saw an opaque
+    // 502, so name the step that fixes it.
+    const missing = [];
+    if (!sources.pem) missing.push('GITHUB_APP_PRIVATE_KEY');
+    if (!sources.webhookSecret) missing.push('GITHUB_WEBHOOK_SECRET');
+    if (missing.length > 0) {
+      return Response.json({ app_configured: true, error: 'app_secrets_missing', missing, needs_secrets_to_worker: true,
+        hint: 'The App is registered, but the Worker has no App secrets yet: run scripts/app-secrets-to-worker.mjs (POST /setup/secrets-to-worker) with the control token, then retry this check.', ...stored }, { status: 409, headers });
+    }
     try {
       const token = await this.api.appJWT();
       const remote = await this.api.request('github', '/app', { token });
@@ -82,9 +127,7 @@ export class SetupController {
           repositories: repos.repositories.map(repo => repo.full_name) });
       }
       const deliveries = await this.api.request('github', '/app/hook/deliveries?per_page=20', { token });
-      return Response.json({ app_configured: true, app_id: app.id, slug: remote.slug,
-        private_key_stored: typeof app.pem === 'string' && app.pem.length > 0,
-        webhook_secret_stored: typeof app.webhookSecret === 'string' && app.webhookSecret.length > 0,
+      return Response.json({ app_configured: true, app_id: app.id, slug: remote.slug, ...stored, secrets_moved_at: app.secretsMovedAt ?? null,
         installations, deliveries: deliveries.map(item => ({ id: item.id, event: item.event, action: item.action,
           status_code: item.status_code, delivered_at: item.delivered_at, installation_id: item.installation_id, repository_id: item.repository_id })) }, { headers });
     } catch (error) {

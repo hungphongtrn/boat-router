@@ -1,7 +1,7 @@
 {
-  "name": "Example Boat CI",
-  "url": "https://example.invalid",
-  "description": "Example GitHub App for Boat Router.",
+  "name": "Peek CI",
+  "url": "https://github.com/hungphongtrn/peek",
+  "description": "Boat CI router for hungphongtrn/peek.",
   "public": false,
   "hook_attributes": { "url": "https://example.invalid/webhook", "active": true },
   "default_permissions": { "actions": "read", "administration": "write", "metadata": "read" },

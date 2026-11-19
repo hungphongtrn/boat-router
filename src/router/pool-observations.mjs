@@ -3,6 +3,10 @@ import { poolKey } from './pool.mjs';
 import { selectWorkflowJob } from './select.mjs';
 import { recordDuration } from './wait-for-busy.mjs';
 
+export function snapshotResumeAt(snapshot, now) {
+  return snapshot?.partialScan && Number.isFinite(snapshot.rateRemaining) && snapshot.rateRemaining > 2500 ? now + 5000 : null;
+}
+
 export async function observe(storage, event, at, source = 'webhook') {
   return storage.transaction(async tx => {
     const key = `gh-job:${event.id}`, previous = await tx.get(key);
@@ -10,10 +14,12 @@ export async function observe(storage, event, at, source = 'webhook') {
     if (source === 'webhook' && previous && previous.source !== 'legacy' && ((previous.status === 'completed' && event.status !== 'completed') || (previous.status === 'in_progress' && event.status === 'queued'))) return;
     const queuedAt = event.queuedAt ?? previous?.queuedAt ?? at;
     const job = { ...previous, id: event.id, pool: poolKey(event.repo, event.label), status: event.status,
-      runnerName: event.runnerName ?? null, runId: event.runId ?? null,
-      jobName: event.jobName ?? previous?.jobName ?? null, startedAt: event.startedAt ?? previous?.startedAt ?? null,
+      runnerName: event.runnerName ?? null, runId: event.runId ?? null, branch: event.branch ?? previous?.branch ?? null,
+      workflowPath: event.workflowPath ?? previous?.workflowPath ?? null, jobName: event.jobName ?? previous?.jobName ?? null, workflowName: event.workflowName ?? previous?.workflowName ?? null, startedAt: event.startedAt ?? previous?.startedAt ?? null,
       completedAt: event.completedAt ?? previous?.completedAt ?? null, conclusion: event.conclusion ?? previous?.conclusion ?? null,
-      queuedAt, observedAt: at, source, missing: false };
+      queuedAt, observedAt: at, source, missing: false, ...(event.boatOnly === true ? { boatOnly: true } : {}),
+      // the lane follows the run name; a later observation without a name keeps the earlier lane.
+      runName: event.runName ?? previous?.runName ?? null, lane: event.lane ?? previous?.lane ?? null, lanePriority: event.lanePriority ?? previous?.lanePriority ?? null, laneMaxParallel: event.laneMaxParallel ?? previous?.laneMaxParallel ?? null };
     if (job.status === 'completed' && !previous?.durationRecorded) await recordDuration(tx, job);
     await tx.put(key, job);
   });
@@ -33,7 +39,7 @@ async function saveSnapshot(storage, value) {
   const { pages, etags, partial, ...metadata } = value;
   const serialized = JSON.stringify({ pages, etags, partial });
   const chunks = serialized.match(/[\s\S]{1,100000}/g) ?? [];
-  let snapshot = { ...metadata, format: 2, cacheChunks: chunks.length };
+  let snapshot = { ...metadata, partialScan: Boolean(partial), format: 2, cacheChunks: chunks.length };
   if (new TextEncoder().encode(JSON.stringify(snapshot)).length > 1_000_000) {
     snapshot = { at: value.at, complete: false, rateRemaining: value.rateRemaining, format: 2, cacheChunks: 0 };
     chunks.length = 0;

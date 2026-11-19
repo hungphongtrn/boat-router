@@ -34,7 +34,7 @@ export function backoff(attempt, minimumSeconds = 0, random = Math.random) {
   return Math.max(minimumSeconds * 1000, Math.min(900_000, 5000 * 2 ** Math.min(attempt, 8))) + Math.floor(random() * 3000);
 }
 export function logEvent(logger, event, job, detail = {}) {
-  const record = { event, job_id: job?.id ?? null, machine_id: job?.machineId ?? null };
+  const record = { event, job_id: job?.id ?? null, machine_id: job?.machineId ?? detail.machine_id ?? null };
   for (const key of ['size', 'requested_size', 'phase', 'status', 'retry_ms', 'assigned_job_id', 'operation_id', 'runner_name', 'pool']) {
     if (detail[key] !== undefined) record[key] = detail[key];
   }

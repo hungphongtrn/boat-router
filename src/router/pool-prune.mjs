@@ -3,7 +3,7 @@ const RETENTION = 7 * 86400_000;
 export async function prunePool(storage, now) {
   const last = await storage.get('pool:pruned-at');
   if (Number.isFinite(last) && now - last < 86400_000) return;
-  for (const prefix of ['runner:', 'pool:drain-only:', 'gh-job:', 'legacy:', 'verification:attempt:', 'box:']) {
+  for (const prefix of ['runner:', 'pool:drain-only:', 'gh-job:', 'placement:', 'placement-queue:', 'legacy:', 'verification:attempt:', 'box:', 'local-runner:', 'run-name:']) {
     let cursor = '';
     for (;;) {
       const page = await storage.list({ prefix, startAfter: cursor, limit: 128 });
@@ -17,6 +17,7 @@ export async function prunePool(storage, now) {
           terminal = box?.state === 'deleted'; at = box?.since;
         } else if (prefix === 'box:') { terminal = value.state === 'deleted'; at = value.since; }
         else if (prefix === 'gh-job:') { terminal = value.status === 'completed'; at = value.observedAt; }
+        else if (prefix === 'local-runner:') { terminal = value.state === 'retired'; at = value.retiredAt ?? value.completedAt ?? value.at; }
         else at = value.at;
         if (terminal && Number.isFinite(at) && now - at >= RETENTION) await tx.delete(key);
       });

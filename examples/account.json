@@ -5,7 +5,10 @@
     "enabled": true,
     "floor": 0,
     "maxJobs": 10,
-    "maxAgeSeconds": 3600
+    "maxAgeSeconds": 3600,
+    "idleHoldSeconds": 420,
+    "healthCheck": "auto",
+    "healthEnforceMinStarts": 20
   },
   "starts": {
     "minute": 4,
@@ -14,8 +17,18 @@
   },
   "poolPacing": {
     "enabled": true,
-    "marginPct": 10,
-    "burst": 1,
+    "mode": "dynamic",
+    "unpaced": true,
+    "burst": 40,
     "reserveStarts": 0
-  }
+  },
+  "openStartQueue": true,
+  "dayReserve": 0,
+  "waitForBusyBox": {
+    "enabled": false,
+    "maxWaitMs": 180000,
+    "scarcityFrom": 0.5,
+    "scarcityFull": 0.95
+  },
+  "secondaryAccount": "example-secondary"
 }

@@ -2,6 +2,25 @@ import { safeLogger } from '../redact.mjs';
 
 const encoder = new TextEncoder();
 
+export function parseAlertConfig(value) {
+  if (value == null || value === '') return [];
+  let configs;
+  try { configs = JSON.parse(value); } catch { throw new TypeError('invalid alert config'); }
+  if (!Array.isArray(configs) || configs.length > 8) throw new TypeError('invalid alert config');
+  return configs.map(config => {
+    if (!config || typeof config !== 'object' || Array.isArray(config) || Object.keys(config).some(key => !['on', 'url', 'minutes', 'thresholdPct', 'secretEnv'].includes(key)) || !Array.isArray(config.on) || !config.on.length || config.on.some(event => typeof event !== 'string' || !/^[a-z_]+$/.test(event))) throw new TypeError('invalid alert config');
+    let url;
+    try { url = new URL(config.url); } catch { throw new TypeError('invalid alert config'); }
+    if (url.protocol !== 'https:' || url.username || url.password || url.search || url.hash || (config.secretEnv !== undefined && !/^[A-Z][A-Z0-9_]*$/.test(config.secretEnv)) || (config.minutes !== undefined && (!Number.isFinite(config.minutes) || config.minutes <= 0)) || (config.thresholdPct !== undefined && (!Number.isFinite(config.thresholdPct) || config.thresholdPct <= 0 || config.thresholdPct > 100))) throw new TypeError('invalid alert config');
+    return config;
+  });
+}
+
+export function queueWaitMinutes(waiting, directJobs, now) {
+  const times = [...waiting.map(item => item.at), ...directJobs.filter(job => job.status === 'queued').map(job => job.queuedAt)].filter(Number.isFinite);
+  return times.length ? Math.max(0, now - Math.min(...times)) / 60_000 : 0;
+}
+
 export class AlertHooks {
   constructor(storage, configs, env, { now = Date.now, fetcher = fetch.bind(globalThis), waitUntil = () => {}, deployment = 'unknown' } = {}) {
     Object.assign(this, { storage, configs, env, now, fetcher, waitUntil, deployment });

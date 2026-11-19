@@ -1,5 +1,6 @@
 import { jobRunnerName, runnerName } from '../domain.mjs';
 import { poolKey } from './pool.mjs';
+import { transition as applyBoxEvent } from './box-state.mjs';
 
 const prefixes = ['job:', 'machine:', 'runner-owner:', 'slot:', 'due:', 'jit-job:', 'webhook-pending:', 'attention-reconcile-'];
 const phaseState = {
@@ -44,7 +45,7 @@ export async function migrateProject(storage, project, commit, now = Date.now, b
               if (!await tx.get(boxKey)) {
                 const state = ['configuring', 'starting', 'running'].includes(job.phase) && !job.runnerId ? 'quarantined' : phaseState[job.phase];
                 const name = job.runnerId ? jobRunnerName(job) : job.runnerIdentity ?? null;
-                await tx.put(boxKey, { machineId: job.machineId, pool, size: job.machineSize ?? job.size, createKey: job.createKey, state, since: job.machineCreatedAt ?? job.createdAt ?? now(), createdAt: job.machineCreatedAt, generation: machine?.generation ?? job.generation ?? 0, runnerName: name, runnerId: job.runnerId ?? null, repo: project.repo, installation: job.installation, reusable: job.routerReusable === true, baselineHash: machine?.baselineHash, jobs: machine?.jobs ?? 0, processId: job.refreshProcessId, operationId: job.operationId });
+                await tx.put(boxKey, applyBoxEvent(null, 'migrate_legacy', { machineId: job.machineId, pool, size: job.machineSize ?? job.size, createKey: job.createKey, state, since: job.machineCreatedAt ?? job.createdAt ?? now(), createdAt: job.machineCreatedAt, generation: machine?.generation ?? job.generation ?? 0, runnerName: name, runnerId: job.runnerId ?? null, repo: project.repo, installation: job.installation, reusable: job.routerReusable === true, baselineHash: machine?.baselineHash, jobs: machine?.jobs ?? 0, processId: job.refreshProcessId, operationId: job.operationId }, now()));
                 if (name) await tx.put(`runner:${name}`, { kind: 'boat', machineId: job.machineId, generation: job.generation ?? 0 });
                 if (job.runnerId) await tx.put(`runner:${runnerName(job.id, job.generation)}`, { kind: 'boat', machineId: job.machineId, generation: job.generation ?? 0 });
               }
@@ -58,7 +59,7 @@ export async function migrateProject(storage, project, commit, now = Date.now, b
           } else if (key.startsWith('machine:') && value.state !== 'deleted') {
             const machineId = key.slice(8), boxKey = `box:${machineId}`;
             if (!await tx.get(boxKey)) {
-              await tx.put(boxKey, { machineId, pool: null, size: value.compatibility?.size, state: 'quarantined', drainOnly: true, noRunnerKnown: value.state === 'ready' && !value.lease && !value.runnerId, since: now(), createdAt: value.createdAt, generation: value.generation ?? 0, runnerId: value.runnerId ?? null, reusable: false, jobs: value.jobs ?? 0 });
+              await tx.put(boxKey, applyBoxEvent(null, 'migrate_legacy', { machineId, pool: null, size: value.compatibility?.size, state: 'quarantined', drainOnly: true, noRunnerKnown: value.state === 'ready' && !value.lease && !value.runnerId, createdAt: value.createdAt, generation: value.generation ?? 0, runnerId: value.runnerId ?? null, reusable: false, jobs: value.jobs ?? 0 }, now()));
               await tx.put(`pool:drain-only:${machineId}`, { at: now(), reason: 'pool_unknown' });
             }
           }

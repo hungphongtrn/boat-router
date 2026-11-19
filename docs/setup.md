@@ -18,3 +18,48 @@ Store `BOAT_CI_API_KEY`, `GITHUB_WEBHOOK_SECRET`, and the GitHub App private key
 Pool mode starts off. After setup, use an authenticated `POST /router/pool-mode?mode=on` to enable it. Pool activation sets the reuse override to `off`. After you review the reuse policy, send an authenticated `POST /router/reuse?project=project-a&mode=config` to use the configured policy. Replace `project-a` with your project ID. Verify both responses and the pool state before enabling machine starts. Reuse requires a successful reset.
 
 Account `poolPacing.fromPct` activates pacing when hourly or daily usage reaches that fraction. The default is 0.7. Optional `waitForBusyBox` settings let queued jobs wait for a reusable busy runner as account limits become scarce. Set `enabled`, `maxWaitMs`, `scarcityFrom`, and `scarcityFull` in the account data. It is disabled by default.
+
+## Open start queue
+
+Set `openStartQueue: true` and `dayReserve: 0` on the account. All projects then share one start queue in order of arrival, with no per-project cap and no lane reserve. Project `caps.concurrent`, `caps.startsPerDay` and `lanes` are ignored in this mode. Account start limits (`starts`, `poolPacing`) and money limits still apply.
+
+## Max-parallel matrix runs
+
+When a workflow uses `strategy.max-parallel`, add a rule to the project (or to `projects.<id>.workflowConcurrency` in the account file): `{ "workflowPath": ".github/workflows/ci.yml", "jobPrefix": "test", "maxParallel": 16 }`. The router plans at most `maxParallel` boxes for the run. When GitHub gives a reserved box to another shard of the same run, the reservation moves to a shard that still waits. Without a rule, the router plans one box for every held shard.
+
+## Box health check
+
+Set `reuse.healthCheck` on the account to `observe`, `enforce` or `auto`, and `reuse.healthEnforceMinStarts` (default 20).
+
+- The probe runs on every fresh box before its first job and after every reset. It measures 100 synchronous 4 KiB writes, a 64 MiB direct write, a CPU hash and free memory, and looks for leftover job processes. Floors are in `RESET_HEALTH_LIMITS` in `src/router/light-reset.mjs` (synchronous writes: 1,500 ms).
+- `observe` records the result only. `enforce` retires a box that fails. `auto` enforces on fresh boxes only while the account has at least `healthEnforceMinStarts` day starts left, credit above zero, and starts allowed. A box that fails after a reset is never reused in `auto` or `enforce`.
+- A box marked slow is handed out last: it yields to a healthy ready box of the same pool while the job has waited under 120 s. `GET /router/boxes?project=<id>` lists boxes and counts slow boxes by host CPU model (`hostClasses`).
+
+## Local runners
+
+Configure `externalClaimer` on a project with `enabled`, `labels`, and `offerSeconds` (default 30; we use 60). A queued job is offered to your claimer for `offerSeconds` before the router plans a Boat box for it. The claimer reports capacity to `POST /router/local/capacity`. List the host names that may report in `localHosts` in `config/policy.mjs`.
+
+## Two accounts as one pool
+
+1. Add the second account file to `accounts` in `config/installation.mjs` (see `examples/account-secondary.json`) and set `secondaryAccount` in the primary account file to its id.
+2. Set `ACCOUNT_CUTOVER=true` and `ACCOUNT_CUTOVER_POLICY` (JSON) with `ledgerKey` equal to `account:ledger:<primary id>`, `dayReserve`, `poolPacing` (`mode: "dynamic"`, `enabled: true`, `hardDayReserve`), and `forbidPaidStarts: true`.
+3. Store `BOAT_WORK_API_KEY` (primary account key) as a secret and set `BOAT_SECONDARY_PROVIDER_WALLET`.
+4. Set `ACCOUNT_POOL_POLICY` to `{"accounts":{"primary":{"enabled":true},"secondary":{"enabled":true}}}`. Set either flag to `false` to stop new starts on that account.
+
+Each start goes to the enabled account that has the larger free share of its limits. Snapshots live in one account each: pin the secondary copies with `PROJECT_SNAPSHOT_NAME_SECONDARY`, `PROJECT_SNAPSHOT_MANIFEST_SHA256_SECONDARY`, `LEASE_BASE_SNAPSHOT_ID_SECONDARY` and `BROWSER_BASE_SNAPSHOT_ID_SECONDARY`. Without a secondary pin, a secondary box boots plain.
+
+## Lease API
+
+`EXTERNAL_LEASE_CLIENTS` (JSON) names each client: `{ "<name>": { "enabled": true, "project": "<project id>", "tokenHash": "<sha256 hex>", "maxActive": 4, "startsPerDay": null, "seededBase": false } }`. Rotate a token with `EXTERNAL_LEASE_TOKEN_HASHES` (`{ "<name>": "<sha256 hex>" }`). The client sends `Authorization: Bearer <token>` and `X-Lease-Client: <name>` to `POST /router/lease/<action>`, where the action is `claim` (`size` `default` or `large`), `renew`, `execute`, `status`, `stream`, `file-write`, `file-read` or `release`. A file write waits up to 20 s for a running tick and returns 409 when it cannot get the write fence; retry it. A client with `seededBase: true` may ask for a pinned base snapshot (`LEASE_BASE_SNAPSHOT_*` or `BROWSER_BASE_*` variables).
+
+## Snapshot boot
+
+Set `snapshotBoot: true` on a project and pin `PROJECT_SNAPSHOT_NAME` (`<name>-<yyyymmdd>-<hex>`) and `PROJECT_SNAPSHOT_MANIFEST_SHA256`. The snapshot must be one this router can verify: `src/snapshot-build.mjs` prints the build script a project's own setup runs on a primed box (`node src/snapshot-build.mjs`), which installs the plain-boot layout, caches the reset helper's OCI blobs and writes `/home/user/.boat-ci/toolchain.sha256`; the manifest hash is the SHA-256 of that file, and `PROJECT_SNAPSHOT_NAME`/`_MANIFEST_SHA256` are re-pinned together every time the snapshot is rebuilt. The helper waits for systemd and Docker before its first container run. If the helper fails, or the snapshot is missing, the box boots plain.
+
+## Toolchain mirror
+
+`src/bootstrap.mjs` installs a pinned git package, the Actions runner, PowerShell and ShellCheck, each with a SHA-256 check. Set `toolchainMirror` in `config/policy.mjs` to your own HTTPS mirror. Mirrored files fall back to the upstream release URL; git has no upstream fallback, so put `git/2.56.0/git_amd64.deb` on the mirror first. A deployment that hosts no mirror can call `bootstrap({ git: 'system' })` to keep the image's git; a snapshot boot never runs the bootstrap, and `src/snapshot-build.mjs` builds with that mode and then manifests whichever git the box resolves.
+
+## Alerts
+
+Account `alerts` sends webhook alerts for `starts_day`, `starts_hour`, `sandboxes`, `hours`, `day_cap_hit`, `queue_wait` and `breaker_open`. Each alert fires once when it crosses its threshold and once when it clears. `tools/credit-alert.mjs` is a module for an external watcher: give it Boat account samples (`creditBalanceHours`, `dailyStartsUsed`, `dailyStartsLimit`), a `send` function and a `save` function. It sends one message for each level (credit under 24 h, under 6 h, zero; day starts under 60 free, zero free), a reminder after 12 h, and one recovery message. An idle account at zero credit sends nothing.

@@ -1,5 +1,9 @@
+import { dynamicPacing } from './dynamic-pacing.mjs';
 const WINDOWS = { minute: 60_000, hour: 3_600_000, day: 86_400_000 };
 const validCount = n => Number.isSafeInteger(n) && n >= 0;
+function releaseFloor(state, key) {
+  if (Array.isArray(state?.dynamicPacing?.floorStarts)) state.dynamicPacing.floorStarts = state.dynamicPacing.floorStarts.filter(item => item.key !== key);
+}
 // Convert the provider response without inventing missing counters. The
 // admission path rejects a missing or stale window rather than guessing.
 export function snapshotLimits(limits, at) {
@@ -18,9 +22,10 @@ export function snapshotLimits(limits, at) {
   }
   const active = limits?.activeSandboxes, maxActive = limits?.maxActiveSandboxes;
   const concurrency = validCount(active) && validCount(maxActive) && maxActive > 0 ? { active, limit: maxActive } : null;
-  return { at: limits?.observedAt ?? at, canStart: limits?.canStart === true && limits?.checkoutRequired !== true && !['past_due', 'unpaid', 'canceled'].includes(limits?.billingStatus), windows, concurrency };
+  return { at: limits?.observedAt ?? at, canStart: limits?.canStart === true && limits?.checkoutRequired !== true && !['past_due', 'unpaid', 'canceled'].includes(limits?.billingStatus), ...(limits?.nextStartDollars === undefined ? {} : { nextStartDollars: limits.nextStartDollars }), windows, concurrency };
 }
 function projectCap(policy, project, now) {
+  if (policy.openStartQueue === true) return null;
   const config = policy.projects?.[project];
   const override = config?.startsPerDayOverride;
   if (override) {
@@ -36,21 +41,26 @@ function projectCap(policy, project, now) {
 export class AccountLedger {
   constructor(storage, policy, now = Date.now) { Object.assign(this, { storage, policy, now }); this.key = policy.ledgerKey ?? 'account:ledger'; }
   async enqueue(project, key, at = this.now(), jobId, options) { return this.enqueueBatch(project, [key], at, jobId, options); }
-  async enqueueBatch(project, keys, at = this.now(), jobId, { pool = false, label } = {}) {
+  async enqueueBatch(project, keys, at = this.now(), jobId, { pool = false, label, client, snapshotRecovery = false } = {}) {
     if (!/^[a-z0-9][a-z0-9-]{0,62}$/.test(project) || !Array.isArray(keys) || keys.length < 1 || keys.length > 64 || new Set(keys).size !== keys.length || keys.some(key => typeof key !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(key) || ['__proto__', 'constructor', 'prototype'].includes(key)) || !Number.isFinite(at)) throw new TypeError('invalid start request');
+    if (client !== undefined && (typeof client !== 'string' || !/^[a-z0-9][a-z0-9-]{0,62}$/.test(client) || !(this.policy.externalClients?.[client] && (this.policy.externalClients[client].startsPerDay === null || validCount(this.policy.externalClients[client].startsPerDay))))) throw new TypeError('invalid external client');
     const group = JSON.stringify([...keys].sort());
     return this.storage.transaction(async tx => {
       const state = await tx.get(this.key) ?? { claims: {}, waiting: [] };
       const claims = keys.map(key => state.claims[key]);
-      if (claims.some(claim => claim && claim.project !== project)) throw new Error('claim belongs to another project');
+      if (claims.some(claim => claim && (claim.project !== project || claim.client !== client))) throw new Error('claim belongs to another client');
       if (claims.every(Boolean)) return;
       if (claims.some(Boolean)) throw new Error('partial batch');
       const waiting = keys.map(key => state.waiting.find(item => item.key === key));
-      if (waiting.some(item => item && (item.project !== project || (item.group ?? JSON.stringify([item.key])) !== group))) throw new Error('request belongs to another batch');
+      if (waiting.some(item => item && (item.project !== project || item.client !== client || (item.group ?? JSON.stringify([item.key])) !== group))) throw new Error('request belongs to another batch');
       if (waiting.some(Boolean) && !waiting.every(Boolean)) throw new Error('partial batch');
-      if (!waiting.some(Boolean)) for (const key of keys) state.waiting.push({ project, key, at, group, ...(pool ? { pool: true, ...(typeof label === 'string' ? { label } : {}) } : {}), ...(keys.length === 1 && Number.isSafeInteger(jobId) && jobId > 0 ? { jobId } : {}) });
+      if (!waiting.some(Boolean)) for (const key of keys) state.waiting.push({ project, key, at, group, ...(client ? { client } : {}), ...(pool ? { pool: true, ...(typeof label === 'string' ? { label } : {}) } : {}), ...(keys.length === 1 && Number.isSafeInteger(jobId) && jobId > 0 ? { jobId } : {}) });
       else if (keys.length === 1 && Number.isSafeInteger(jobId) && jobId > 0) waiting[0].jobId = jobId;
       if (pool) for (const item of waiting) if (item) { item.pool = true; if (typeof label === 'string') item.label = label; }
+      if (pool && snapshotRecovery && keys.length === 1) {
+        const item = state.waiting.find(entry => entry.key === keys[0] && entry.project === project);
+        if (item) item.snapshotRecovery = true;
+      }
       await tx.put(this.key, state);
     });
   }
@@ -60,6 +70,33 @@ export class AccountLedger {
       const state = await tx.get(this.key);
       if (!state) return;
       const waiting = state.waiting.filter(item => item.project !== project || item.pool === true);
+      if (waiting.length !== state.waiting.length) await tx.put(this.key, { ...state, waiting });
+    });
+  }
+  async withdrawPoolWaiters(project) {
+    return this.storage.transaction(async tx => {
+      const state = await tx.get(this.key);
+      if (!state) return;
+      const waiting = state.waiting.filter(item => item.project !== project || item.pool !== true);
+      if (waiting.length !== state.waiting.length) await tx.put(this.key, { ...state, waiting });
+    });
+  }
+  async clearOrphanPoolWaiters(project, createKeys, hashes) {
+    const expected = [...createKeys].sort();
+    const valid = new Set(hashes);
+    return this.storage.transaction(async tx => {
+      if (!['on', 'drain'].includes(await tx.get(`project:${project}:pool:mode`)) || !(await tx.get(`project:${project}:pool:migrated`))?.done) return;
+      const prefix = `project:${project}:create:`, actual = []; let startAfter = '';
+      for (;;) {
+        const page = await tx.list({ prefix, startAfter, limit: 128 });
+        actual.push(...[...page.keys()].map(key => key.slice(prefix.length)));
+        if (page.size < 128) break;
+        startAfter = [...page.keys()].at(-1);
+      }
+      if (JSON.stringify(actual.sort()) !== JSON.stringify(expected)) return;
+      const state = await tx.get(this.key);
+      if (!state) return;
+      const waiting = state.waiting.filter(item => item.project !== project || item.pool !== true || valid.has(item.key));
       if (waiting.length !== state.waiting.length) await tx.put(this.key, { ...state, waiting });
     });
   }
@@ -91,7 +128,7 @@ export class AccountLedger {
       }
       const claim = state.claims[key];
       const cancelled = claim?.project === project && claim.status === 'pending';
-      if (cancelled) delete state.claims[key];
+      if (cancelled) { delete state.claims[key]; releaseFloor(state, key); }
       if (item || cancelled) await tx.put(this.key, state);
       return Boolean(item || cancelled);
     });
@@ -109,11 +146,27 @@ export class AccountLedger {
       const group = JSON.stringify([...keys].sort());
       if (keys.some(key => !state.waiting.some(item => item.key === key && item.project === project && (item.group ?? JSON.stringify([item.key])) === group))) return { ok: false, reason: 'not_queued' };
       if (!snapshot || !Number.isFinite(snapshot.at) || snapshot.at > now || now - snapshot.at > 30_000 || snapshot.canStart !== true) return { ok: false, reason: 'limits_unavailable' };
+      if (this.policy.forbidPaidStarts && snapshot.nextStartDollars !== 0) return { ok: false, reason: 'paid_start_refused' };
       const margin = this.policy.margin ?? 0;
       if (!Number.isFinite(margin) || margin < 0 || margin >= 1) throw new TypeError('invalid margin');
       const dayReserve = this.policy.dayReserve ?? (this.policy.defaultDayReserve ?? 0);
       if (!validCount(dayReserve)) throw new TypeError('invalid day reserve');
       const claims = Object.values(state.claims);
+      const ownedDayCap = this.policy.maxOwnedStartsPerDay;
+      if (ownedDayCap !== undefined) {
+        if (!validCount(ownedDayCap)) throw new TypeError('invalid owned daily start cap');
+        const owned = claims.filter(claim => claim.status !== 'created' || (claim.settledAt ?? claim.at) > now - WINDOWS.day).length;
+        if (owned + keys.length > ownedDayCap) return { ok: false, reason: 'owned_day_cap' };
+      }
+      const dynamicEnabled = this.policy.poolPacing?.enabled === true && this.policy.poolPacing?.mode === 'dynamic';
+      const unpaced = dynamicEnabled && this.policy.poolPacing?.unpaced === true;
+      const dynamic = dynamicEnabled ? dynamicPacing({ snapshot, policy: this.policy, claims, previous: state.dynamicPacing, now }) : null;
+      if (dynamicEnabled && !dynamic) return { ok: false, reason: 'limits_unavailable' };
+      if (dynamic) {
+        state.dynamicPacing = dynamic.state;
+        state.pacingStatus = dynamic.status;
+        await tx.put(this.key, state);
+      }
       if (this.policy.requireConcurrency) {
         const concurrency = snapshot.concurrency;
         if (!concurrency || !validCount(concurrency.active) || !validCount(concurrency.limit) || concurrency.limit < 1) return { ok: false, reason: 'limits_unavailable' };
@@ -122,23 +175,51 @@ export class AccountLedger {
         const unobserved = claims.filter(c => c.status !== 'created' || (c.settledAt ?? c.at) >= snapshot.at).length;
         if (concurrency.active + unobserved + keys.length > concurrency.limit) return { ok: false, reason: 'concurrency' };
       }
+      let freeRefusal = null, freeDailyExhausted = false, freeDailyReserved = false, floorRequired = false;
       for (const [name, span] of Object.entries(WINDOWS)) {
+        if (dynamic && dynamic.status.hardRemaining[name] < keys.length) return { ok: false, reason: `${name}_cap` };
+        if (dynamic && !unpaced && dynamic.status.remaining[name] < keys.length) {
+          if (name !== 'day') return { ok: false, reason: `${name}_cap` };
+          floorRequired = true;
+        }
         const provider = snapshot.windows?.[name];
         const configured = this.policy.starts?.[name];
         if (!provider || !validCount(provider.limit) || !validCount(provider.used) || (configured != null && !validCount(configured)) || provider.limit < 1) return { ok: false, reason: 'limits_unavailable' };
         const windowMargin = this.policy.windowMargins?.[name] ?? margin;
         if (!Number.isFinite(windowMargin) || windowMargin < 0 || windowMargin >= 1) throw new TypeError('invalid window margin');
-        const cap = Math.max(0, Math.min(configured ?? Infinity, Math.floor(provider.limit * (1 - windowMargin))) - (name === 'day' ? dayReserve : 0));
+        const cappedLimit = unpaced ? Math.min(configured ?? Infinity, provider.limit) : dynamicEnabled ? Math.floor(Math.min(configured ?? Infinity, provider.limit) * (1 - windowMargin)) : Math.min(configured ?? Infinity, Math.floor(provider.limit * (1 - windowMargin)));
+        const cap = Math.max(0, cappedLimit - (name === 'day' ? (unpaced ? (this.policy.poolPacing.hardDayReserve ?? 0) : dayReserve) : 0));
         const local = claims.filter(c => (c.settledAt ?? c.at) > now - span || c.status !== 'created');
         const recent = local.filter(c => (c.settledAt ?? c.at) >= snapshot.at || c.status !== 'created').length;
-        if ((configured != null && local.length + keys.length > configured) || provider.used + recent + keys.length > cap) return { ok: false, reason: `${name}_cap` };
+        if (name === 'day') {
+          freeDailyExhausted = provider.used >= provider.limit;
+          freeDailyReserved = !freeDailyExhausted && provider.used + recent + keys.length > provider.limit;
+        }
+        if ((configured != null && local.length + keys.length > configured) || provider.used + recent + keys.length > cap) {
+          if (dynamicEnabled && !unpaced && name === 'day') floorRequired = true;
+          else if (name !== 'day' || !pool || this.policy.paidOverflow?.enabled !== true) return { ok: false, reason: `${name}_cap` };
+          else freeRefusal = 'day_cap';
+        }
+      }
+      const requested = state.waiting.filter(item => keys.includes(item.key) && item.project === project);
+      const client = requested[0]?.client;
+      if (requested.some(item => item.client !== client)) throw new Error('mixed client batch');
+      if (client) {
+        const limit = this.policy.externalClients?.[client]?.startsPerDay;
+        if (limit !== null && !validCount(limit)) return { ok: false, reason: 'client_disabled' };
+        const reserve = this.policy.externalClients[client].concurrencyReserve ?? 0;
+        const concurrency = snapshot.concurrency;
+        if (!validCount(reserve) || !concurrency || !validCount(concurrency.active) || !validCount(concurrency.limit)) return { ok: false, reason: 'limits_unavailable' };
+        const unobserved = claims.filter(c => c.status !== 'created' || (c.settledAt ?? c.at) >= snapshot.at).length;
+        if (concurrency.active + unobserved + keys.length + reserve > concurrency.limit) return { ok: false, reason: 'client_concurrency_reserve' };
+        if (limit !== null && claims.filter(c => c.client === client && ((c.settledAt ?? c.at) > now - WINDOWS.day || c.status !== 'created')).length + keys.length > limit) return { ok: false, reason: 'client_cap' };
       }
       const ceiling = projectCap(this.policy, project, now);
       if (ceiling != null && claims.filter(c => c.project === project && ((c.settledAt ?? c.at) > now - WINDOWS.day || c.status !== 'created')).length + keys.length > ceiling) return { ok: false, reason: 'project_cap' };
       const pacing = this.policy.poolPacing;
       const fromPct = pacing?.fromPct ?? 0.7;
       if (pacing?.enabled === true && (!Number.isFinite(fromPct) || fromPct < 0 || fromPct > 1)) throw new TypeError('invalid pool pacing threshold');
-      const pacingActive = pacing?.enabled === true && Math.max(snapshot.windows.day.used / snapshot.windows.day.limit, snapshot.windows.hour.used / snapshot.windows.hour.limit) >= fromPct;
+      const pacingActive = pacing?.enabled === true && !dynamicEnabled && Math.max(snapshot.windows.day.used / snapshot.windows.day.limit, snapshot.windows.hour.used / snapshot.windows.hour.limit) >= fromPct;
       const eligible = [], poolComplete = new Map(), poolStatuses = new Map();
       for (const item of state.waiting) {
         if (item.pool) {
@@ -152,9 +233,20 @@ export class AccountLedger {
             ? [...(await tx.list({ prefix: `project:${item.project}:pool:status:` })).values()]
             : [await tx.get(`project:${item.project}:pool:status:${item.label}`)]);
           const statuses = poolStatuses.get(statusKey);
-          if (poolComplete.get(item.project) === false || statuses.some(status => status?.reason && !status.reason.startsWith('ledger:'))) continue;
+          let recovered = false;
+          if (item.snapshotRecovery && Number.isSafeInteger(item.jobId)) {
+            const proof = await tx.get(`project:${item.project}:snapshot-recovery-proof:${item.key}`);
+            const job = await tx.get(`project:${item.project}:gh-job:${item.jobId}`);
+            const create = proof?.createKey && await tx.get(`project:${item.project}:create:${proof.createKey}`);
+            recovered = proof?.jobId === item.jobId && Number.isFinite(proof.until) && proof.until >= now && job?.status === 'queued' && job.source === 'webhook' && !job.missing && create?.state === 'pending' && create.snapshotRecoveryJobId === item.jobId;
+          }
+          if ((!recovered && poolComplete.get(item.project) === false) || statuses.some(status => status?.reason && !status.reason.startsWith('ledger:') && !(recovered && status.reason === 'snapshot_incomplete'))) continue;
         }
         const cap = projectCap(this.policy, item.project, now);
+        if (item.client) {
+          const clientCap = this.policy.externalClients?.[item.client]?.startsPerDay;
+          if (clientCap !== null && (!validCount(clientCap) || claims.filter(c => c.client === item.client && ((c.settledAt ?? c.at) > now - WINDOWS.day || c.status !== 'created')).length >= clientCap)) continue;
+        }
         const group = item.group ?? JSON.stringify([item.key]);
         const count = state.waiting.filter(entry => entry.project === item.project && (entry.group ?? JSON.stringify([entry.key])) === group).length;
         if (!pool && item.pool && pacingActive) {
@@ -168,29 +260,58 @@ export class AccountLedger {
         }
         if (cap == null || claims.filter(c => c.project === item.project && ((c.settledAt ?? c.at) > now - WINDOWS.day || c.status !== 'created')).length + count <= cap) eligible.push(item);
       }
-      eligible.sort((a, b) => a.at - b.at || (a.group ?? JSON.stringify([a.key])).localeCompare(b.group ?? JSON.stringify([b.key])) || a.key.localeCompare(b.key));
+      eligible.sort((a, b) => (this.policy.openStartQueue === true ? 0 : Number(Boolean(a.client)) - Number(Boolean(b.client))) || a.at - b.at || (a.group ?? JSON.stringify([a.key])).localeCompare(b.group ?? JSON.stringify([b.key])) || a.key.localeCompare(b.key));
       const selected = new Set(eligible.slice(0, keys.length).map(item => item.key));
       if (selected.size !== keys.length || keys.some(key => !selected.has(key))) return { ok: false, reason: 'fairness' };
-      if (pool && pacingActive) {
+      // Floor reservations are account-wide and are stored with the claims in
+      // this transaction. They never bypass provider hard limits.
+      const useFloor = dynamic && !unpaced && (floorRequired || dynamic.state.credit + 1e-9 < keys.length);
+      if (useFloor && state.dynamicPacing.floorStarts.length + keys.length > (pacing.floorStartsPerHour ?? 2)) return { ok: false, reason: floorRequired ? 'day_cap' : 'pacing' };
+      if ((pool || client) && pacingActive) {
         const marginPct = pacing.marginPct ?? 10, burst = pacing.burst ?? 1, reserve = pacing.reserveStarts ?? 0;
         if (!Number.isFinite(marginPct) || marginPct < 0 || marginPct >= 100 || !validCount(burst) || burst < 1 || !validCount(reserve)) throw new TypeError('invalid pool pacing');
         const day = snapshot.windows.day;
         const cap = Math.min(day.limit, this.policy.starts?.day ?? Infinity);
         const unobserved = claims.filter(c => (c.settledAt ?? c.at) >= snapshot.at || c.status !== 'created').length;
-        if (day.used + unobserved + keys.length + reserve > cap) return { ok: false, reason: 'pacing_reserve' };
+        if (day.used + unobserved + keys.length + reserve > cap) freeRefusal ??= 'pacing_reserve';
         const rate = cap * (1 - marginPct / 100) / WINDOWS.day;
         const previous = state.poolPacing;
         const tokens = previous ? Math.min(burst, previous.tokens + Math.max(0, now - previous.at) * rate) : burst;
-        if (tokens < keys.length) return { ok: false, reason: 'pacing' };
-        state.poolPacing = { tokens: tokens - keys.length, at: now };
+        if (tokens < keys.length) freeRefusal ??= 'pacing';
+        if (!freeRefusal) state.poolPacing = { tokens: tokens - keys.length, at: now };
+      }
+      let paid = false;
+      if (freeRefusal) {
+        if (freeDailyReserved) return { ok: false, reason: freeRefusal };
+        const cfg = this.policy.paidOverflow;
+        if (!pool || cfg?.enabled !== true) return { ok: false, reason: freeRefusal };
+        // Some accounts permit paid starts only after the provider's free
+        // allowance is exhausted. Keep pacing and configured limits intact
+        // before that point.
+        if (cfg.onlyAfterFreeExhausted === true && !freeDailyExhausted) return { ok: false, reason: freeRefusal };
+        const wait = cfg.afterWaitMinutes ?? 15, max = cfg.maxPaidStartsPerDay ?? 40, price = cfg.pricePerStartUsd ?? 0.05;
+        if (!Number.isFinite(wait) || wait < 0 || !validCount(max) || !Number.isFinite(price) || price < 0) throw new TypeError('invalid paid overflow');
+        const oldest = eligible[0];
+        const spacing = cfg.minSecondsBetweenPaid ?? 60;
+        if (!Number.isFinite(spacing) || spacing < 0) throw new TypeError('invalid paid overflow spacing');
+        const count = claims.filter(c => c.paid && (c.status !== 'created' || (c.settledAt ?? c.at) > now - WINDOWS.day)).length;
+        if (keys.length !== 1 || !oldest?.pool || oldest.key !== keys[0] || now - oldest.at < wait * 60_000 || (freeDailyExhausted && (count >= max || !this.paidTick || this.paidTick.used || (state.lastPaidCallAt != null && now - state.lastPaidCallAt < spacing * 1000)))) return { ok: false, reason: freeRefusal };
+        paid = freeDailyExhausted;
+      }
+      if (dynamic) {
+        if (useFloor) state.dynamicPacing.floorStarts.push(...keys.map(key => ({ key, at: now })));
+        else state.dynamicPacing.credit = Math.max(0, state.dynamicPacing.credit - keys.length);
+        state.pacingStatus.burstCredit = state.dynamicPacing.credit;
+        for (const name of Object.keys(state.pacingStatus.remaining)) state.pacingStatus.remaining[name] = Math.max(0, state.pacingStatus.remaining[name] - keys.length);
       }
       for (const key of keys) {
         const jobId = state.waiting.find(item => item.key === key && item.project === project)?.jobId;
-        state.claims[key] = { project, at: now, status: 'pending', ...(Number.isSafeInteger(jobId) ? { jobId } : {}) };
+        state.claims[key] = { project, at: now, status: 'pending', ...(client ? { client } : {}), ...(paid ? { paid: true, pricePerStartUsd: this.policy.paidOverflow.pricePerStartUsd ?? 0.05 } : {}), ...(Number.isSafeInteger(jobId) ? { jobId } : {}) };
       }
       state.waiting = state.waiting.filter(item => !selected.has(item.key));
       await tx.put(this.key, state);
-      return { ok: true, recovered: false };
+      if (paid) { this.paidTick.used = true; this.paidTick.key = keys[0]; }
+      return { ok: true, recovered: false, ...(paid ? { paid: true } : {}) };
     });
   }
   async cancelPending(project, key) {
@@ -198,6 +319,7 @@ export class AccountLedger {
       const state = await tx.get(this.key), claim = state?.claims[key];
       if (!claim || claim.project !== project || claim.status !== 'pending') return false;
       delete state.claims[key];
+      releaseFloor(state, key);
       await tx.put(this.key, state);
       return true;
     });
@@ -206,12 +328,26 @@ export class AccountLedger {
     return this.storage.transaction(async tx => {
       const state = await tx.get(this.key), claim = state?.claims[key];
       if (!claim || claim.project !== project || claim.status !== 'pending') return false;
+      if (claim.paid && (!this.paidTick || (this.paidTick.used && this.paidTick.key !== key))) return false;
+      const now = this.now();
+      if (claim.paid) {
+        const spacing = this.policy.paidOverflow?.minSecondsBetweenPaid ?? 60;
+        if (!Number.isFinite(spacing) || spacing < 0) throw new TypeError('invalid paid overflow spacing');
+        if (state.lastPaidCallAt != null && now - state.lastPaidCallAt < spacing * 1000) return false;
+        state.lastPaidCallAt = now;
+      }
       claim.status = 'calling';
-      claim.callingAt = this.now();
+      claim.callingAt = now;
       if (Number.isSafeInteger(jobId) && jobId > 0) claim.jobId = jobId;
       await tx.put(this.key, state);
+      if (claim.paid) { this.paidTick.used = true; this.paidTick.key = key; }
       return true;
     });
+  }
+  async paidStatus() {
+    const state = await this.storage.get(this.key);
+    const claims = Object.values(state?.claims ?? {}).filter(c => c.paid && (c.status !== 'created' || (c.settledAt ?? c.at) > this.now() - WINDOWS.day));
+    return { count: claims.length, estimatedUsd: claims.reduce((sum, c) => sum + c.pricePerStartUsd, 0) };
   }
   async claim(key) {
     const state = await this.storage.get(this.key);
@@ -223,7 +359,7 @@ export class AccountLedger {
       const state = await tx.get(this.key);
       if (!state?.claims[key]) return false;
       if (state.claims[key].status === 'created' && status !== 'created') throw new Error('created claim cannot be refunded');
-      if (status === 'not_created') delete state.claims[key];
+      if (status === 'not_created') { delete state.claims[key]; releaseFloor(state, key); }
       else {
         if (status === 'created' && state.claims[key].status !== 'created') state.claims[key].settledAt = this.now();
         state.claims[key].status = status;

@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { Buffer } from 'node:buffer';
-import { bootstrap, RELEASES } from './bootstrap.mjs';
+import { bootstrap, setupPhaseHelpers, RELEASES } from './bootstrap.mjs';
+import { telemetrySetup } from './runner-telemetry.mjs';
 import { REFRESH_HELPER_IMAGE } from './router/reset-constants.mjs';
 export { REFRESH_HELPER_IMAGE } from './router/reset-constants.mjs';
 
@@ -126,16 +127,23 @@ def helper_image_valid(actual, config_digest):
     return actual in (config_digest, HELPER_IMAGE_DIGEST)
 
 def verify_helper(container):
-    with urllib.request.urlopen('https://auth.docker.io/token?service=registry.docker.io&scope=repository:library/alpine:pull', timeout=20) as response:
-        token = json.loads(response.read(65537))['token']
-    if not isinstance(token, str) or not 1 <= len(token) <= 16384 or any(character.isspace() for character in token):
-        raise RuntimeError('helper')
+    offline = (CONTROL / 'snapshot-mode').is_file()
+    token = None
+    if not offline:
+        with urllib.request.urlopen('https://auth.docker.io/token?service=registry.docker.io&scope=repository:library/alpine:pull', timeout=20) as response:
+            token = json.loads(response.read(65537))['token']
+        if not isinstance(token, str) or not 1 <= len(token) <= 16384 or any(character.isspace() for character in token):
+            raise RuntimeError('helper')
     def fetch(path, expected, size=None):
         if re.fullmatch(r'sha256:[a-f0-9]{64}', expected) is None or (size is not None and (type(size) is not int or not 1 <= size <= 8 * 1024 * 1024)):
             raise RuntimeError('helper')
-        request = urllib.request.Request('https://registry-1.docker.io/v2/library/alpine/' + path, headers={'Authorization': 'Bearer ' + token, 'Accept': 'application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json'})
-        with urllib.request.urlopen(request, timeout=20) as response:
-            data = response.read((size if size is not None else 65536) + 1)
+        if offline:
+            with (CONTROL / 'helper-oci' / expected[7:]).open('rb') as response:
+                data = response.read((size if size is not None else 65536) + 1)
+        else:
+            request = urllib.request.Request('https://registry-1.docker.io/v2/library/alpine/' + path, headers={'Authorization': 'Bearer ' + token, 'Accept': 'application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json'})
+            with urllib.request.urlopen(request, timeout=20) as response:
+                data = response.read((size if size is not None else 65536) + 1)
         if 'sha256:' + digest(data) != expected or (size is not None and len(data) != size):
             raise RuntimeError('helper')
         return data
@@ -1172,10 +1180,11 @@ PATH="$(cat /home/ci/.path)"
 export PATH
 export TMPDIR=/tmp TZ=UTC LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
 export RUNNER_TOOL_CACHE=/opt/hostedtoolcache AGENT_TOOLSDIRECTORY=/opt/hostedtoolcache
+${telemetrySetup('/home/ci/telemetry.sh')}
 cd /home/ci/runner
 jit="$(cat /home/ci/.jit)"
 rm -f /home/ci/.jit
-test "$(git --version)" = 'git version 2.55.0'
+test "$(git --version)" = 'git version 2.56.0'
 ${RUNNER_PERMISSION_CHECK}
 exec setpriv --no-new-privs --inh-caps=-all --ambient-caps=-all ./run.sh --jitconfig "$jit"
 ''', 0o700)
@@ -1317,7 +1326,7 @@ printf '%s' '${PAYLOAD}' | base64 --decode > /home/user/.boat-ci/reuse-payload.p
 printf '%s  %s\\n' '${HASH}' /home/user/.boat-ci/reuse-payload.py | sha256sum --check --strict - >/dev/null
 helper_stage=helper_start
 launch_helper() {
-  timeout 30 docker create --rm --name '${helper}' --privileged --pid=host --network=host --volume /:/host:rw --entrypoint /bin/busybox --user 0:0 --workdir / --no-healthcheck --read-only '${REFRESH_HELPER_IMAGE}' chroot /host /usr/bin/nsenter --target 1 --mount --uts --ipc --net --pid -- /bin/bash --noprofile --norc -c ${quote(host)} boat-ci-control "$$" >/dev/null 2>&1 || return $?
+  timeout 30 docker create --pull=never --rm --name '${helper}' --privileged --pid=host --network=host --volume /:/host:rw --entrypoint /bin/busybox --user 0:0 --workdir / --no-healthcheck --read-only '${REFRESH_HELPER_IMAGE}' chroot /host /usr/bin/nsenter --target 1 --mount --uts --ipc --net --pid -- /bin/bash --noprofile --norc -c ${quote(host)} boat-ci-control "$$" >/dev/null 2>&1 || return $?
   helper_stage=helper_verify
   timeout 120 /usr/bin/python3 -I -B /home/user/.boat-ci/reuse-payload.py helper '${helper}' >/dev/null 2>&1 || return $?
   helper_stage=helper_start
@@ -1344,7 +1353,7 @@ printf '%s\\n' '{"ok":false,"gen":${generation},"seconds":300,"failed":["timeout
 }
 
 export function reuseBootstrap() {
-  return `set -e\n(\n${bootstrap()}\n)\nprintf '%s' "/home/user/.local/bin:$PATH" > /home/user/.boat-ci/reuse-path\nchmod 600 /home/user/.boat-ci/reuse-path\ndocker pull '${REFRESH_HELPER_IMAGE}' >/dev/null 2>&1\ndocker run --rm '${REFRESH_HELPER_IMAGE}' true >/dev/null 2>&1\n`;
+  return `set -e\n${setupPhaseHelpers()}\n(\n${bootstrap()}\n)\nprintf '%s' "/home/user/.local/bin:$PATH" > /home/user/.boat-ci/reuse-path\nchmod 600 /home/user/.boat-ci/reuse-path\nphase reuse_helper_download\ndocker pull '${REFRESH_HELPER_IMAGE}' >/dev/null 2>&1\nphase reuse_helper_check\ndocker run --rm '${REFRESH_HELPER_IMAGE}' true >/dev/null 2>&1\n`;
 }
 
 export function refreshCommand(mode, generation) {
