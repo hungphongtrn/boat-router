@@ -2,6 +2,7 @@ import { snapshot } from './github-snapshot.mjs';
 import { poolKey } from './pool.mjs';
 import { selectWorkflowJob } from './select.mjs';
 import { recordDuration } from './wait-for-busy.mjs';
+import { records } from './pool-records.mjs';
 
 export function snapshotResumeAt(snapshot, now) {
   return snapshot?.partialScan && Number.isFinite(snapshot.rateRemaining) && snapshot.rateRemaining > 2500 ? now + 5000 : null;
@@ -23,16 +24,6 @@ export async function observe(storage, event, at, source = 'webhook') {
     if (job.status === 'completed' && !previous?.durationRecorded) await recordDuration(tx, job);
     await tx.put(key, job);
   });
-}
-
-async function all(storage, prefix) {
-  const values = []; let startAfter = '';
-  for (;;) {
-    const page = await storage.list({ prefix, startAfter, limit: 128 });
-    values.push(...page.values());
-    if (page.size < 128) return values;
-    startAfter = [...page.keys()].at(-1);
-  }
 }
 
 async function saveSnapshot(storage, value) {
@@ -88,7 +79,7 @@ export async function reconcile(storage, api, config, installation, now = Date.n
     const queuedAt = Date.parse(job.created_at ?? '');
     await observe(storage, { ...event, ...(Number.isFinite(queuedAt) ? { queuedAt } : {}) }, observedAt, 'snapshot');
   }
-  const absent = (await all(storage, 'gh-job:')).filter(job => ['queued', 'in_progress'].includes(job.status) && job.observedAt < observedAt && !observed.has(job.id));
+  const absent = (await records(storage, 'gh-job:')).filter(job => ['queued', 'in_progress'].includes(job.status) && job.observedAt < observedAt && !observed.has(job.id));
   for (const job of absent) {
     await storage.transaction(async tx => {
       const current = await tx.get(`gh-job:${job.id}`);

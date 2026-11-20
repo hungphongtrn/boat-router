@@ -13,6 +13,7 @@ import { providerWallet } from './apis.mjs';
 import { BUILD_COMMIT, BUILD_DEPLOYMENT } from './build.mjs';
 import { installRouter } from './router/install.mjs';
 import { records } from './router/pool-records.mjs';
+import { ReadCache } from './router/read-cache.mjs';
 import { DOCKER_REUSE_KEY, localRoom } from './router/box-fleet.mjs';
 import { LOCAL_MODE_KEY, labelLocal } from './router/local-fleet.mjs';
 import { SETUP_WATCHDOG_SWITCH_KEY, SETUP_WATCHDOG_PREFIX, SETUP_WATCHDOG_CHECK_PREFIX, SETUP_WATCHDOG_RUN_PREFIX, listRecords } from './router/setup-watchdog.mjs';
@@ -532,12 +533,12 @@ export class Fleet {
   constructor(ctx, env, deployment = BUILD_DEPLOYMENT) {
     this.ctx = ctx;
     this.env = env;
-    this.storage = ctx.storage;
-    const api = new APIs(env, fetch, Date.now, () => ctx.storage.get('github-app'));
-    this.controller = new FleetController(ctx.storage, env, api);
-    this.setup = new SetupController(ctx.storage, env, api, Date.now, event => this.controller.emit(event, null));
-    this.router = env.PLUGIN_ROUTER === 'true' ? installRouter(ctx.storage, () => this.env, { api, waitUntil: promise => ctx.waitUntil(promise), deployment }) : null;
-    this.external = this.router ? new ExternalService(this.router, ctx.storage, this.router.externalApi ?? api, this.router.account.externalClients) : null;
+    this.storage = env.PLUGIN_ROUTER === 'true' ? new ReadCache().wrap(ctx.storage) : ctx.storage;
+    const api = new APIs(env, fetch, Date.now, () => this.storage.get('github-app'));
+    this.controller = new FleetController(this.storage, env, api);
+    this.setup = new SetupController(this.storage, env, api, Date.now, event => this.controller.emit(event, null));
+    this.router = env.PLUGIN_ROUTER === 'true' ? installRouter(this.storage, () => this.env, { api, waitUntil: promise => ctx.waitUntil(promise), deployment }) : null;
+    this.external = this.router ? new ExternalService(this.router, this.storage, this.router.externalApi ?? api, this.router.account.externalClients) : null;
     if (this.external) {
       this.router.externalSweep = () => this.external.sweep();
       this.router.externalAdmissionEntries = () => this.external.admissionEntries();
@@ -681,13 +682,7 @@ export class Fleet {
             const mode = await project.storage.get('pool:mode');
             const snapshot = await project.storage.get('pool:snapshot');
             if (mode !== 'on' || snapshot?.complete !== true) { projects[id] = { complete: false, labels: [] }; continue; }
-            const labels = new Set(), jobs = []; let startAfter = '';
-            for (;;) {
-              const page = await project.storage.list({ prefix: 'gh-job:', startAfter, limit: 128 });
-              for (const job of page.values()) if (!job.missing) jobs.push(job);
-              if (page.size < 128) break;
-              startAfter = [...page.keys()].at(-1);
-            }
+            const labels = new Set(), jobs = (await records(project.storage, 'gh-job:')).filter(job => !job.missing);
             for (const job of runnableDemand(jobs, project.config.workflowConcurrency, true, { laneCaps: await lanesSwitchOn(project.storage, project.config) })) {
               if (job.status !== 'queued') continue;
               try { const [repo, label] = JSON.parse(job.pool); if (repo === project.config.repo && project.config.labels?.includes(label)) labels.add(label); } catch {}

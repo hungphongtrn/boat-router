@@ -2,7 +2,7 @@ import { runnableDemand, matchesWorkflowRule } from './workflow-demand.mjs';
 import { plan, poolKey, poolSize, supplyCounts, uncovered, localOfferActive } from './pool.mjs';
 import { records } from './pool-records.mjs';
 import { isPlanRefusal, isSizeRefusal } from '../domain.mjs';
-import { prunePool } from './pool-prune.mjs';
+import { prunePool, RETENTION } from './pool-prune.mjs';
 import { waitClaims } from './wait-for-busy.mjs';
 import { reusePacing, reuseHold, nominalReuseHold, paidIdleHold } from './reuse-pacing.mjs';
 import { currentBreaker, breakerCanProbe, breakerForSize, reserveSizedProbe, releaseSizedProbe, releaseSizedProbeInTransaction, recordSizedBreakerOutcome, BREAKER_PROBE_DELAY_MS } from './verification-breaker.mjs';
@@ -923,6 +923,9 @@ export class BoxFleet {
           await this.verificationOutcome(box, 'job_completed', true, null, { jobId: job.id, completedAt: job.completedAt });
         }
         }
+        // Tombstones may still provide late job-success evidence, but have no
+        // next lifecycle step. Don't point-read each deleted box twice per tick.
+        if (box.state === 'deleted') continue;
         const retirementReason = !box.reusable ? 'created_without_reuse' : !box.baselineHash ? 'baseline_missing' : guarded ? (last?.slowBox || last?.conclusion === 'timed_out' ? 'slow_job' : 'missing_job_result') : override === 'off' || (box.resetMode === 'docker' && reuseFor(poolLabel(box.pool)) !== 'docker') ? 'reuse_disabled' : generationCapped(box) ? 'generation_limit' : !reuseEnabled ? 'reuse_ineligible' : null;
         // Jobs still offered to the minis are not reserved by a ready box.
         const offered = new Set(demand.filter(job => job.status === 'queued' && !offerAged(job)).map(job => job.id));
@@ -992,9 +995,16 @@ export class BoxFleet {
 
   async verificationOutcome(box, kind, ok, detail, evidence = {}) {
     const key = evidence.jobId ? `verification:attempt:job-success:${evidence.jobId}` : `verification:attempt:${ok ? 'online-success' : 'failure'}:${box.machineId}:${box.generation ?? 0}`;
+    // Only memoize confirmed job-success markers, never the breaker state.
+    // Expire no later than prunePool can delete a marker.
+    const seen = evidence.jobId ? this.jobSuccessSeen ??= new Map() : null;
+    if (seen?.get(key) > this.now()) return;
+    let recordedAt;
     const change = await this.storage.transaction(async tx => {
-      if (await tx.get(key)) return;
-      await tx.put(key, { at: this.now(), kind, ...(box.size ? { size: box.size } : {}), ...(Number.isFinite(box.createdAt) ? { createdAt: box.createdAt } : {}), ...(detail ? { phase: box.state, message: JSON.stringify(detail) } : {}) });
+      const existing = await tx.get(key);
+      recordedAt = existing ? existing.at : this.now();
+      if (existing) return;
+      await tx.put(key, { at: recordedAt, kind, ...(box.size ? { size: box.size } : {}), ...(Number.isFinite(box.createdAt) ? { createdAt: box.createdAt } : {}), ...(detail ? { phase: box.state, message: JSON.stringify(detail) } : {}) });
       this.logger?.(JSON.stringify({ event: 'verification_result', project: this.project?.id, machine_id: box.machineId, kind, phase: box.state, ok, ...(detail ? { detail } : {}) }));
       if ((box.generation ?? 0) > 0 && !evidence.jobId) return;
       if (evidence.jobId && (!Number.isFinite(evidence.completedAt) || evidence.completedAt > this.now())) return;
@@ -1003,6 +1013,10 @@ export class BoxFleet {
       if (change.opened) { const count = change.breaker.counts[box.size]; this.logger?.(JSON.stringify({ event: 'verification_breaker_trip', project: this.project?.id, size: box.size, failures: count })); await this.emit?.('alert_verification_breaker', null, { size: box.size, failures: count }, tx); }
       return change;
     });
+    if (seen && Number.isFinite(recordedAt)) {
+      if (seen.size >= 4096) seen.delete(seen.keys().next().value);
+      seen.set(key, recordedAt + RETENTION);
+    }
     if (change?.opened) this.alert?.('breaker_open', { value: 1, limit: 1, active: true });
     if (change?.cleared && !(await this.storage.get('verification:breaker'))?.tripped) this.alert?.('breaker_open', { value: 0, limit: 1, active: false });
   }

@@ -1,10 +1,14 @@
 export async function records(storage, prefix) {
-  const result = []; let startAfter = '';
+  if (storage.records) return storage.records(prefix);
+  return [...(await recordEntries(storage, prefix)).values()];
+}
+
+export async function recordEntries(storage, prefix) {
+  const result = new Map(); let startAfter = '';
   for (;;) {
     const page = await storage.list({ prefix, startAfter, limit: 128 });
-    result.push(...page.values());
+    for (const [key, value] of page) result.set(key, value);
     if (page.size < 128) return result;
     startAfter = [...page.keys()].at(-1);
   }
 }
-
