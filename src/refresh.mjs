@@ -1053,28 +1053,94 @@ def image_inventory():
     tags = sorted(set(run(['docker', 'image', 'ls', '--no-trunc', '--format', '{{.ID}} {{.Repository}}:{{.Tag}}']).splitlines()))
     return {'ids': ids, 'tags': tags}
 
+def snapshot_box():
+    # The flag snapshotBootstrap writes at boot. A snapshot box carries the
+    # primed tree and the runner under /home/user and runs each job as that
+    # user; it has no 'ci' user and no /home/ci loop mount.
+    return (CONTROL / 'snapshot-mode').is_file()
+
+def keep_containers():
+    # A Peek snapshot keeps an image alive through a container that never runs
+    # (ci-base-prime.sh names it peek-ci-keep-postgres). It belongs to the saved
+    # disk, not to a job, so a baseline or reset leaves it and its volumes alone.
+    return set(run(['docker', 'ps', '-aq', '--filter', 'name=^/peek-ci-keep-']).split())
+
+def volumes_of(containers):
+    names = set()
+    for container in containers:
+        for name in run(['docker', 'inspect', '-f', '{{range .Mounts}}{{if .Name}}{{.Name}} {{end}}{{end}}', container]).split():
+            names.add(name)
+    return names
+
+def docker_fail(reason):
+    # Keep the failure kind 'docker' so the router still records a Docker
+    # fault, and carry the one detail that says which check failed.
+    error = RuntimeError('docker')
+    error.boat_output = reason
+    raise error
+
 def assert_images(allowlist):
     if image_inventory() != allowlist:
-        raise RuntimeError('docker')
+        docker_fail('images')
+
+def docker_problem(allowlist, keep=()):
+    # The first way the store differs from the state a reset restores, or None.
+    keep = set(keep)
+    containers = set(run(['docker', 'ps', '-aq']).split()) - keep
+    if containers:
+        return 'containers=%d' % len(containers)
+    volumes = set(run(['docker', 'volume', 'ls', '-q']).split()) - volumes_of(keep)
+    if volumes:
+        return 'volumes=%d' % len(volumes)
+    networks = set(run(['docker', 'network', 'ls', '--format', '{{.Name}}']).split()) - {'bridge', 'host', 'none'}
+    if networks:
+        return 'networks=%d' % len(networks)
+    if allowlist is not None and image_inventory() != allowlist:
+        return 'images'
+    return None
+
+def docker_clean(allowlist, keep=()):
+    problem = docker_problem(allowlist, keep)
+    if problem:
+        docker_fail(problem)
+
+def settle_docker(allowlist, keep=(), attempts=6):
+    # A restored Docker store reconciles the saved metadata for a while after
+    # boot, so a removal can lose that race and a container or volume appears
+    # again seconds later (2026-11-20: two snapshot boxes retired at
+    # docker_reset and assert_clean, one of them after the removals had already
+    # succeeded). Remove what does not belong to the saved state, then require
+    # two clean observations two seconds apart before returning; a kept
+    # container and the volumes it mounts are part of the clean state.
+    keep = set(keep)
+    for attempt in range(attempts):
+        containers = set(run(['docker', 'ps', '-aq']).split()) - keep
+        if containers:
+            run_settling(['docker', 'rm', '-f', *sorted(containers)])
+        run(['docker', 'builder', 'prune', '-af'])
+        volumes = set(run(['docker', 'volume', 'ls', '-q']).split()) - volumes_of(keep)
+        if volumes:
+            run_settling(['docker', 'volume', 'rm', '-f', *sorted(volumes)])
+        run(['docker', 'volume', 'prune', '-f'])
+        networks = set(run(['docker', 'network', 'ls', '--format', '{{.Name}}']).split()) - {'bridge', 'host', 'none'}
+        if networks:
+            run_settling(['docker', 'network', 'rm', '-f', *sorted(networks)])
+        run(['docker', 'network', 'prune', '-f'])
+        if allowlist is not None:
+            extra = sorted(set(run(['docker', 'image', 'ls', '-aq', '--no-trunc']).split()) - set(allowlist['ids']))
+            if extra:
+                run_settling(['docker', 'image', 'rm', '-f', *extra])
+        if docker_problem(allowlist, keep) is None:
+            time.sleep(2)
+            if docker_problem(allowlist, keep) is None:
+                return
+        else:
+            time.sleep(2)
+    docker_fail(docker_problem(allowlist, keep) or 'settle')
 
 def docker_reset(allowlist):
-    containers = run(['docker', 'ps', '-aq']).split()
-    if containers:
-        run_settling(['docker', 'rm', '-f', *containers])
-    run(['docker', 'builder', 'prune', '-af'])
-    run(['docker', 'volume', 'prune', '-af'])
-    volumes = run(['docker', 'volume', 'ls', '-q']).split()
-    if volumes:
-        run_settling(['docker', 'volume', 'rm', '-f', *volumes])
-    run(['docker', 'network', 'prune', '-f'])
-    images = set(run(['docker', 'image', 'ls', '-aq', '--no-trunc']).split())
-    for image in sorted(images - set(allowlist['ids'])):
-        run_settling(['docker', 'image', 'rm', '-f', image])
-    if run(['docker', 'ps', '-aq']) or run(['docker', 'volume', 'ls', '-q']):
-        raise RuntimeError('docker')
-    assert_images(allowlist)
-    if set(run(['docker', 'network', 'ls', '--format', '{{.Name}}']).split()) != {'bridge', 'host', 'none'}:
-        raise RuntimeError('docker')
+    settle_docker(allowlist)
+    docker_clean(allowlist)
 
 def unmount_job():
     roots = ('/home/ci', '/tmp/w', '/opt/hostedtoolcache')
@@ -1153,10 +1219,47 @@ def fresh_job_filesystem():
     set_stage('fresh_temporary')
     wipe_temporary()
 
+def job_processes(ignored, roots=('/tmp/w', '/home/user/ci/peek')):
+    # A process still running out of the work folder or the primed tree is a
+    # job the reset did not end. The tree and the folder belong to the box's
+    # own user on a snapshot box, so a uid check would name the desktop session
+    # too; the executable and working directory do not.
+    found = []
+    for pid, value in processes(ignored).items():
+        targets = [value[2]]
+        try:
+            targets.append(os.readlink('/proc/' + pid + '/cwd'))
+        except OSError:
+            pass
+        for target in targets:
+            if any(target == root or target.startswith(root + '/') for root in roots):
+                found.append(target)
+                break
+    return found
+
 def assert_clean(allowlist):
-    if run(['docker', 'ps', '-aq']) or run(['docker', 'volume', 'ls', '-q']):
-        raise RuntimeError('docker')
-    assert_images(allowlist)
+    keep = keep_containers()
+    docker_clean(allowlist, keep)
+    if snapshot_box():
+        # A snapshot box has no 'ci' user and no /home/ci: its jobs run as the
+        # box's own user in the primed tree the snapshot carries. The baseline
+        # and the reset therefore check that tree, the runner the snapshot
+        # starts, and that no job process outlived the reset (2026-11-20: the
+        # baseline built the /home/ci layout a router-provisioned box has, so
+        # the next generation could not write the tree the first job chowned).
+        ignored = ancestors(os.getpid())
+        if job_processes(ignored):
+            raise RuntimeError('processes')
+        tree = pathlib.Path('/home/user/ci/peek')
+        for name in ('target', '.ci-base-built-at'):
+            if not (tree / name).exists():
+                raise RuntimeError('filesystem')
+        for name in ('/home/user/boat-ci-start.sh', '/home/user/boat-ci-runner/run.sh'):
+            if not os.access(name, os.X_OK):
+                raise RuntimeError('filesystem')
+        if shutil.disk_usage(STATE).free < 4 * 1024**3:
+            raise RuntimeError('disk')
+        return
     uid = pwd.getpwnam('ci').pw_uid
     if ci_processes(uid, ancestors(os.getpid())):
         raise RuntimeError('processes')
@@ -1224,6 +1327,25 @@ def start_job(generation, docker_access):
         atomic(marker, 'started')
         return
     jit = CONTROL / 'jit'
+    if snapshot_box():
+        # A snapshot box carries its runner and its start script under
+        # /home/user, and every job runs as the box's user in the primed tree
+        # the snapshot exists for. The generation start in light-reset.mjs
+        # already names that user, so the first job does too: the /home/ci
+        # layout below would take the primed tree away from the user the next
+        # generation runs as (2026-11-20, a generation 1 could not write the
+        # tree generation 0 had chowned).
+        if not jit.is_file() or jit.is_symlink() or jit.stat().st_size == 0:
+            raise RuntimeError('jit')
+        user = pwd.getpwnam('user')
+        os.chown(jit, user.pw_uid, user.pw_gid)
+        os.chmod(jit, 0o600)
+        script = '/home/user/boat-ci-start.sh'
+        if not os.access(script, os.X_OK):
+            raise RuntimeError('filesystem')
+        run(['systemd-run', '--quiet', '--unit=' + unit, '--property=User=user', '--property=Group=user', '--property=KillMode=control-group', '--property=RemainAfterExit=yes', '--property=TimeoutStopSec=10', '--property=RuntimeMaxSec=14400', '--property=WorkingDirectory=/home/user/boat-ci-runner', '--property=StandardOutput=null', '--property=StandardError=null', 'bash', script])
+        atomic(marker, 'started')
+        return
     destination = HOME / '.jit'
     if not destination.is_file():
         if not jit.is_file() or jit.is_symlink() or jit.stat().st_size == 0:
@@ -1291,26 +1413,47 @@ def main(mode, generation, waiter, helper, docker_access=False):
                     quiesce_packagekit()
                     quiesce_idle_reclaim()
                     quiesce_sysstat()
-                    os.chmod('/home/user', 0o755)
-                    run(['chown', '-R', 'root:root', '/home/user/.local', '/home/user/boat-ci-runner'])
-                    allowlist = image_inventory()
-                    atomic(STATE / 'images.json', json.dumps(allowlist))
-                    atomic(STATE / 'path', (CONTROL / 'reuse-path').read_text())
-                    set_stage('stop_job')
-                    stop_job()
-                    clear_ipc(ci_uids())
-                    set_stage('docker_reset')
-                    docker_reset(allowlist)
-                    set_stage('fresh_filesystem')
-                    fresh_job_filesystem()
-                    cron = pathlib.Path('/var/spool/cron/crontabs/ci')
-                    atomic(STATE / 'cron.json', json.dumps(cron.read_text() if cron.exists() else None))
-                    baseline = snapshot(waiter)
-                    set_stage('snapshot_diagnostics')
-                    atomic(STATE / 'baseline-diagnostics.json', json.dumps(diagnostic_inventory(baseline), sort_keys=True, separators=(',', ':')))
-                    set_stage('baseline_save')
-                    atomic(baseline_path, json.dumps(baseline, sort_keys=True, separators=(',', ':')))
-                    atomic(STATE / 'current', '0')
+                    if snapshot_box():
+                        # A snapshot box is the saved disk: /home/user holds the
+                        # primed tree and the runner, every job runs as 'user',
+                        # and there is no 'ci' user or /home/ci loop mount to
+                        # build. The baseline settles Docker (keeping the
+                        # snapshot's own image keeper) and records the state the
+                        # light reset restores; it must not create the /home/ci
+                        # layout, because the reset then cleans the wrong home
+                        # and the next generation cannot write the tree the
+                        # first job chowned (2026-11-20).
+                        set_stage('docker_reset')
+                        settle_docker(None)
+                        allowlist = image_inventory()
+                        atomic(STATE / 'images.json', json.dumps(allowlist))
+                        atomic(STATE / 'path', (CONTROL / 'reuse-path').read_text())
+                        atomic(STATE / 'ci-uids.json', json.dumps([]))
+                        baseline = {'version': 3, 'at': time.time(), 'mode': 'snapshot'}
+                        set_stage('baseline_save')
+                        atomic(baseline_path, json.dumps(baseline, sort_keys=True, separators=(',', ':')))
+                        atomic(STATE / 'current', '0')
+                    else:
+                        os.chmod('/home/user', 0o755)
+                        run(['chown', '-R', 'root:root', '/home/user/.local', '/home/user/boat-ci-runner'])
+                        allowlist = image_inventory()
+                        atomic(STATE / 'images.json', json.dumps(allowlist))
+                        atomic(STATE / 'path', (CONTROL / 'reuse-path').read_text())
+                        set_stage('stop_job')
+                        stop_job()
+                        clear_ipc(ci_uids())
+                        set_stage('docker_reset')
+                        docker_reset(allowlist)
+                        set_stage('fresh_filesystem')
+                        fresh_job_filesystem()
+                        cron = pathlib.Path('/var/spool/cron/crontabs/ci')
+                        atomic(STATE / 'cron.json', json.dumps(cron.read_text() if cron.exists() else None))
+                        baseline = snapshot(waiter)
+                        set_stage('snapshot_diagnostics')
+                        atomic(STATE / 'baseline-diagnostics.json', json.dumps(diagnostic_inventory(baseline), sort_keys=True, separators=(',', ':')))
+                        set_stage('baseline_save')
+                        atomic(baseline_path, json.dumps(baseline, sort_keys=True, separators=(',', ':')))
+                        atomic(STATE / 'current', '0')
                 else:
                     set_stage('baseline_load')
                     if not baseline_path.exists():
@@ -1326,22 +1469,33 @@ def main(mode, generation, waiter, helper, docker_access=False):
                         stop_job()
                         clear_ipc(ci_uids())
                         set_stage('docker_reset')
-                        docker_reset(allowlist)
-                        set_stage('fresh_filesystem')
-                        fresh_job_filesystem()
-                        cron = json.loads((STATE / 'cron.json').read_text())
-                        restore_cron(cron)
+                        if snapshot_box():
+                            # A snapshot box resets with the light reset, which
+                            # owns the primed tree and the runner; this path only
+                            # has to settle Docker.
+                            settle_docker(None)
+                        else:
+                            docker_reset(allowlist)
+                            set_stage('fresh_filesystem')
+                            fresh_job_filesystem()
+                            cron = json.loads((STATE / 'cron.json').read_text())
+                            restore_cron(cron)
                     set_stage('baseline_load')
                     baseline = json.loads(baseline_path.read_text())
-                    current = snapshot(waiter)
-                    result['failed'] = differences(baseline, current)
-                    if result['failed']:
-                        set_stage('snapshot_diagnostics')
-                        details_path = STATE / 'baseline-diagnostics.json'
-                        previous_details = json.loads(details_path.read_text()) if details_path.exists() else {}
-                        current_details = diagnostic_inventory(current)
-                        set_stage('drift_save')
-                        save_drift(result, drift_entries(baseline, current, previous_details, current_details), mode, generation)
+                    if snapshot_box():
+                        # The light reset, not this controller, restores a
+                        # snapshot box, so there is no ci-owned snapshot to diff.
+                        result['failed'] = []
+                    else:
+                        current = snapshot(waiter)
+                        result['failed'] = differences(baseline, current)
+                        if result['failed']:
+                            set_stage('snapshot_diagnostics')
+                            details_path = STATE / 'baseline-diagnostics.json'
+                            previous_details = json.loads(details_path.read_text()) if details_path.exists() else {}
+                            current_details = diagnostic_inventory(current)
+                            set_stage('drift_save')
+                            save_drift(result, drift_entries(baseline, current, previous_details, current_details), mode, generation)
                 set_stage('assert_clean')
                 assert_clean(allowlist)
                 set_stage('baseline_hash')

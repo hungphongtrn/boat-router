@@ -31,23 +31,27 @@ export function healthGateFromLimits(limits, minStarts = 20) {
   const remaining = limits?.starts?.day?.remaining, credit = limits?.creditBalanceHours;
   return Number.isSafeInteger(remaining) && remaining >= minStarts && Number.isFinite(credit) && credit > 0 && limits?.canStart === true;
 }
-// A box that failed its post-reset check is never reused : with 'auto' or 'enforce' the reset path
-// always enforces, whatever the start window. The window gate above applies only to fresh boxes, whose retirement
-// costs a start before they have served a job.
-export function reuseHealthMode(account) {
-  return ['auto', 'enforce'].includes(account?.reuse?.healthCheck) ? 'enforce' : 'observe';
+// 'enforce' retires a box that fails its health check; 'auto' does so only while the account can replace the
+// box, and every other mode only observes. The same window governs a reused box: with the day's starts used
+// up, a slow host is kept and handed out last instead of burning a paid start to replace it (2026-11-20,
+// bx_u2wnajhs was retired by health_check while the day window was empty).
+export function reuseHealthMode(account, limits) {
+  const mode = account?.reuse?.healthCheck;
+  if (mode === 'enforce') return 'enforce';
+  if (mode !== 'auto') return 'observe';
+  return healthGateFromLimits(limits, account.reuse?.healthEnforceMinStarts ?? 20) ? 'enforce' : 'observe';
 }
 export async function effectiveHealthMode(account, api, now) {
   const mode = account?.reuse?.healthCheck;
-  if (mode === 'enforce') return 'enforce';
-  if (mode !== 'auto' || typeof api?.limits !== 'function') return 'observe';
+  if (mode === 'enforce' || mode !== 'auto') return reuseHealthMode(account);
+  if (typeof api?.limits !== 'function') return 'observe';
   let entry = healthLimitCache.get(api);
   if (!entry || now - entry.at > 30_000 || entry.at > now) {
-    let ok = false;
-    try { ok = healthGateFromLimits(await api.limits(), account.reuse?.healthEnforceMinStarts ?? 20); } catch { ok = false; }
-    entry = { at: now, ok }; healthLimitCache.set(api, entry);
+    let limits = null;
+    try { limits = await api.limits(); } catch { limits = null; }
+    entry = { at: now, limits }; healthLimitCache.set(api, entry);
   }
-  return entry.ok ? 'enforce' : 'observe';
+  return reuseHealthMode(account, entry.limits);
 }
 // A slow box is handed out last: it yields while a healthy box of the same pool is ready and
 // unreserved. For a large box it also yields for 60 s to a healthy box that is resetting or finishing its
@@ -897,7 +901,7 @@ export class BoxFleet {
         const retirementReason = !box.reusable ? 'created_without_reuse' : !box.baselineHash ? 'baseline_missing' : guarded ? (last?.slowBox || last?.conclusion === 'timed_out' ? 'slow_job' : 'missing_job_result') : override === 'off' || (box.resetMode === 'docker' && reuseFor(poolLabel(box.pool)) !== 'docker') ? 'reuse_disabled' : generationCapped(box) ? 'generation_limit' : !reuseEnabled ? 'reuse_ineligible' : null;
         // Jobs still offered to the minis are not reserved by a ready box.
         const offered = new Set(demand.filter(job => job.status === 'queued' && !offerAged(job)).map(job => job.id));
-        const view = { complete, at: snapshot?.at, runners, jobs: demand }, options = { reuseEnabled: reuseEnabled && !guarded, retirementReason, healthMode, reuseHealthMode: executor === 'jit' ? reuseHealthMode(account) : 'observe', missingResult: missingResult && reuseEnabled, ttlSeconds: ttl, offered, ...(executor === 'direct' ? { executor } : {}) };
+        const view = { complete, at: snapshot?.at, runners, jobs: demand }, options = { reuseEnabled: reuseEnabled && !guarded, retirementReason, healthMode, reuseHealthMode: executor === 'jit' ? healthMode : 'observe', missingResult: missingResult && reuseEnabled, ttlSeconds: ttl, offered, ...(executor === 'direct' ? { executor } : {}) };
         await this.stepBox(box.machineId, view, options);
         const next = await this.storage.get(`box:${box.machineId}`);
         const localPool = pools.find(pool => pool.key === box.pool);

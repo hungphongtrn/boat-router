@@ -705,9 +705,13 @@ test('a slow box is handed out last and never takes a large shard when a healthy
   assert.equal(slowBoxYields(slow, { ...job, queuedAt: now - 70_000 }, [slow, { machineId: 'h', pool, state: 'resetting' }], now), false);
 });
 
-test('reuse refusal: auto and enforce always enforce the reset check; marked reused boxes leave service', async () => {
-  assert.equal(reuseHealthMode({ reuse: { healthCheck: 'auto' } }), 'enforce');
+test('reuse refusal: enforce enforces the reset check; a window without spare starts observes', async () => {
+  const limits = (remaining, credit, canStart = true) => ({ starts: { day: { remaining } }, creditBalanceHours: credit, canStart });
+  assert.equal(reuseHealthMode({ reuse: { healthCheck: 'auto' } }), 'observe', 'no reading of the window keeps the box');
+  assert.equal(reuseHealthMode({ reuse: { healthCheck: 'auto' } }, limits(150, 3)), 'enforce');
+  assert.equal(reuseHealthMode({ reuse: { healthCheck: 'auto' } }, limits(0, 3)), 'observe', 'an empty day window keeps a slow host rather than burning a start');
   assert.equal(reuseHealthMode({ reuse: { healthCheck: 'enforce' } }), 'enforce');
+  assert.equal(reuseHealthMode({ reuse: { healthCheck: 'enforce' } }, limits(0, 0)), 'enforce');
   assert.equal(reuseHealthMode({ reuse: { healthCheck: 'observe' } }), 'observe');
   assert.equal(reuseHealthMode({ reuse: {} }), 'observe');
   const project = { id: 'demo', repo: 'owner/repo' };

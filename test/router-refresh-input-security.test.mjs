@@ -315,3 +315,87 @@ with tempfile.TemporaryDirectory() as directory:
     assert any(args[:2] == ['systemd-run', '--quiet'] for args in commands), commands
 print('ok')
 `));
+
+test('the docker clean check keeps the snapshot image keeper and names what is left', () => {
+  const output = python(String.raw`
+def fake(args, allowed=(0,), stdin=None):
+    if args[:2] == ['docker', 'ps']:
+        return 'keep1\n' if '--filter' in args else 'keep1\n'
+    if args[:2] == ['docker', 'volume']:
+        return ''
+    if args[:2] == ['docker', 'network']:
+        return 'bridge\nhost\nnone\n'
+    if args[:2] == ['docker', 'inspect']:
+        return ''
+    return ''
+run = fake
+image_inventory = lambda: {'ids': ['a'], 'tags': []}
+print(json.dumps([docker_problem({'ids': ['a'], 'tags': []}, {'keep1'}), docker_problem({'ids': ['a'], 'tags': []})]))
+`);
+  assert.deepEqual(JSON.parse(output), [null, 'containers=1']);
+});
+
+test('a snapshot box baselines without building the /home/ci layout', () => {
+  const output = python(String.raw`
+import tempfile, types
+with tempfile.TemporaryDirectory() as directory:
+    root = pathlib.Path(directory)
+    STATE = root / 'state'; STATE.mkdir()
+    CONTROL = root / 'control'; CONTROL.mkdir()
+    (CONTROL / 'snapshot-mode').write_text('')
+    (CONTROL / 'reuse-path').write_text('/home/user/.local/bin:/usr/bin')
+    calls = []
+    settle_docker = lambda allowlist: calls.append(['settle', allowlist])
+    image_inventory = lambda: {'ids': ['a'], 'tags': ['a postgres:17']}
+    assert_clean = lambda allowlist: calls.append(['clean', allowlist])
+    fresh_job_filesystem = lambda: calls.append('filesystem')
+    stop_job = lambda: calls.append('stop')
+    clear_ipc = lambda uids: calls.append('ipc')
+    quiesce_packagekit = lambda: None
+    quiesce_idle_reclaim = lambda: None
+    quiesce_sysstat = lambda: None
+    run = lambda *args, **kwargs: ''
+    subprocess.run = lambda *args, **kwargs: types.SimpleNamespace(returncode=1)
+    pwd.getpwnam = lambda name: types.SimpleNamespace(pw_uid=os.getuid(), pw_gid=os.getgid())
+    os.chown = lambda *args: None
+    main('baseline', 0, os.getpid(), 'gone-helper')
+    print(json.dumps({'calls': calls, 'baseline': json.loads((STATE / 'baseline.json').read_text()), 'uids': json.loads((STATE / 'ci-uids.json').read_text()), 'result': json.loads((CONTROL / 'baseline-0.json').read_text())}))
+`);
+  const value = JSON.parse(output);
+  assert.deepEqual(value.calls, [['settle', null], ['clean', { ids: ['a'], tags: ['a postgres:17'] }]]);
+  assert.equal(value.baseline.version, 3);
+  assert.equal(value.baseline.mode, 'snapshot');
+  assert.deepEqual(value.uids, []);
+  assert.equal(value.result.ok, true);
+  assert.match(value.result.baselineHash, /^[a-f0-9]{64}$/);
+});
+
+test('a snapshot box starts its first job as the box user', () => {
+  const output = python(String.raw`
+import tempfile, types
+with tempfile.TemporaryDirectory() as directory:
+    root = pathlib.Path(directory)
+    STATE = root / 'state'; STATE.mkdir()
+    CONTROL = root / 'control'; CONTROL.mkdir()
+    (CONTROL / 'snapshot-mode').write_text('')
+    (CONTROL / 'jit').write_text('{"encoded":"x"}')
+    (STATE / 'current').write_text('0')
+    (STATE / 'refresh-0.json').write_text(json.dumps({'ok': True, 'gen': 0, 'seconds': 0, 'failed': []}))
+    commands = []
+    def fake(args, allowed=(0,), stdin=None):
+        commands.append(' '.join(args))
+        return 'not-found'
+    run = fake
+    os.access = lambda *args: True
+    os.chown = lambda *args: None
+    pwd.getpwnam = lambda name: types.SimpleNamespace(pw_uid=1000, pw_gid=1000)
+    start_job(0, False)
+    print(json.dumps({'commands': commands, 'started': (STATE / 'started-0').exists()}))
+`);
+  const value = JSON.parse(output);
+  assert.equal(value.started, true);
+  const unit = value.commands.find(command => command.startsWith('systemd-run'));
+  assert.match(unit, /--property=User=user --property=Group=user/);
+  assert.match(unit, /bash \/home\/user\/boat-ci-start\.sh$/);
+  assert.equal(value.commands.some(command => command.includes('/home/ci')), false);
+});

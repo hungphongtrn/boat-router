@@ -164,6 +164,17 @@ if [ -d "$tree/.git" ]; then
   git -C "$tree" -c safe.directory="$tree" reset --hard --quiet || true
   git -C "$tree" -c safe.directory="$tree" clean -ffdxq -e target -e node_modules -e .next -e .ci-base-built-at || true
 fi
+# Every job on a snapshot box runs as the box's own user, so that user must own
+# the tree it checks out into. A generation that ran as another uid (the /home/ci
+# layout a router-provisioned box has, or a snapshot box before 2026-11-20)
+# chowned it away, and the next job then failed its checkout on "Permission
+# denied". Hand the tree back only when it is not already the box user's.
+if [ -d "$tree" ] && [ -d /home/user ]; then
+  home_uid=$(stat -c %u /home/user); home_gid=$(stat -c %g /home/user)
+  if [ "$(stat -c %u "$tree")" != "$home_uid" ]; then
+    chown -R -h "$home_uid:$home_gid" "$tree" 2>/dev/null || true
+  fi
+fi
 # The next job writes its own JIT config and must start from a clean marker and
 # registration, and the snapshot verifier requires both absent at boot.
 rm -f /home/user/.boat-ci/jit /home/user/.boat-ci/started /home/user/.boat-ci/runner.log
