@@ -1,5 +1,33 @@
 # Local repository admission
 
+## Budgeted local slots
+
+Use `GITHUB_POLL_MAX_LIVE=<1..100>` with repository-token routing instead of
+`GITHUB_POLL_UNPACED=true`. These settings are mutually exclusive. Slot mode
+restores a project concurrency cap even for the open start queue, and bounds
+account admission by the provider's live count plus uncertain local claims.
+It keeps FIFO and the existing provider windows and paid-start budget, but
+does not consume hourly pacing-floor credit: an available slot can start now.
+`/router/claims` reports `admissionMode=slot_budget` when admission is sampled.
+
+Idle holds (including the paid-start extension) are zero. A completed box can
+reset for queued work inside the cap; surplus boxes close on the normal lifecycle
+tick. When reducing an existing fleet, excess boxes finish their jobs before
+retiring; no busy runner is killed merely to reach the new cap.
+
+Calculate a ceiling from `0.85 * creditBalanceSeconds / 3600 / hoursToRenewal`
+and each machine's billing multiplier. `creditBalanceSeconds` includes prepaid
+credit: do not mistake it for the monthly plan allowance. A $20 renewal includes
+555.56 VM-hours, not the entire existing balance. Default boxes cost one VM-hour
+per live hour. Job length converts slots to jobs/hour, not to free compute time.
+
+Important: Peek's `ci` job holds its box while waiting for separate shards.
+One slot cannot complete that dependency graph. Two slots are the operational
+minimum, not a claim of sustainable continuous operation; when the sustainable
+rate is below two, the workflow must reduce parent waiting or overall duty cycle.
+No setting can guarantee both immediate admission whenever a slot frees and a
+lower long-run burn rate under an indefinitely nonempty queue.
+
 The local router may set `GITHUB_POLL_UNPACED=true` alongside `GITHUB_POLL_REPO`.
 This opts into the existing ledger's unpaced mode: queued work uses available
 start windows immediately instead of spreading the remaining allowance over

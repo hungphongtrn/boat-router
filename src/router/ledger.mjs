@@ -163,7 +163,7 @@ export class AccountLedger {
         if (owned + keys.length > ownedDayCap) return { ok: false, reason: 'owned_day_cap' };
       }
       const dynamicEnabled = this.policy.poolPacing?.enabled === true && this.policy.poolPacing?.mode === 'dynamic';
-      const unpaced = dynamicEnabled && this.policy.poolPacing?.unpaced === true;
+      const unpaced = dynamicEnabled && (this.policy.poolPacing?.unpaced === true || this.policy.poolPacing?.slotBudget === true);
       const dynamic = dynamicEnabled ? dynamicPacing({ snapshot, policy: this.policy, claims, previous: state.dynamicPacing, now }) : null;
       if (dynamicEnabled && !dynamic) return { ok: false, reason: 'limits_unavailable' };
       if (dynamic) {
@@ -177,7 +177,9 @@ export class AccountLedger {
         // The provider snapshot includes existing boxes. Claims that may not
         // be reflected in that snapshot must also occupy account slots.
         const unobserved = claims.filter(c => c.status !== 'created' || (c.settledAt ?? c.at) >= snapshot.at).length;
-        if (concurrency.active + unobserved + keys.length > concurrency.limit) return { ok: false, reason: 'concurrency' };
+        const liveCap = this.policy.liveSandboxCap ?? concurrency.limit;
+        if (!validCount(liveCap) || liveCap < 1) throw new TypeError('invalid live sandbox budget');
+        if (concurrency.active + unobserved + keys.length > Math.min(concurrency.limit, liveCap)) return { ok: false, reason: 'concurrency' };
       }
       let freeRefusal = null, freeDailyExhausted = false, freeDailyReserved = false, floorRequired = false;
       for (const [name, span] of Object.entries(WINDOWS)) {

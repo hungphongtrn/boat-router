@@ -10,6 +10,38 @@ import { snapshotLimits } from '../src/router/ledger.mjs';
 const repo = 'hungphongtrn/peek';
 const env = { BOAT_WALLET: 'peek', BOAT_PROVIDER_WALLET: 'provider', ROUTER_PROJECTS: 'peek', ENABLED: 'false', GITHUB_POLL_REPO: repo, GITHUB_POLL_TOKEN: 'test-poll-token', GITHUB_POLL_PAID_CAP_USD: '1.50' };
 
+test('local slot budget preserves FIFO and starts immediately after a slot frees despite spent hourly floor', async () => {
+  const now = () => 100_000_000, storage = new Storage();
+  const localEnv = { ...env, GITHUB_POLL_MAX_LIVE: '1' };
+  const router = installRouter(storage, () => localEnv, { api: new APIs(localEnv), now, logger: () => {} });
+  assert.equal(router.account.poolPacing.unpaced, false);
+  assert.equal(router.account.poolPacing.slotBudget, true);
+  assert.equal(router.account.liveSandboxCap, 1);
+  assert.equal(router.projects.get('peek').config.caps.concurrent, 1);
+  assert.equal(router.projects.get('peek').config.reuse.idleHoldSeconds, 0);
+  assert.equal(router.projects.get('peek').config.reuse.idleHoldSecondsWhenStartsPaid, 0);
+  await storage.put(router.ledger.key, { claims: {}, waiting: [], dynamicPacing: { at: now(), credit: 0, ratePerMs: 0, floorStarts: [{ key: 'spent1', at: now() }, { key: 'spent2', at: now() }], floorOverflow: [] } });
+  const limits = active => snapshotLimits({ canStart: true, activeSandboxes: active, maxActiveSandboxes: 100, nextStartDollars: 0, starts: { minute: { limit: 12, used: 0 }, hour: { limit: 60, used: 9 }, day: { limit: 200, used: 138 } } }, now());
+  await router.ledger.enqueue('peek', 'first', now()-2000);
+  await router.ledger.enqueue('peek', 'second', now()-1000);
+  assert.equal((await router.ledger.admit('peek', 'first', limits(1), { pool: true })).reason, 'concurrency');
+  assert.equal((await router.ledger.admit('peek', 'second', limits(0), { pool: true })).reason, 'fairness');
+  assert.equal((await router.ledger.admit('peek', 'first', limits(0), { pool: true })).ok, true);
+  assert.equal((await router.ledger.admit('peek', 'second', limits(0), { pool: true })).reason, 'concurrency', 'in-flight starts hold the slot');
+  await router.ledger.cancelPending('peek', 'first');
+  assert.equal((await router.ledger.admit('peek', 'second', limits(0), { pool: true })).ok, true);
+  const state = await storage.get(router.ledger.key);
+  assert.equal(state.pacingStatus.admissionMode, 'slot_budget');
+  state.paidExtraSpend = [{ at: now(), dollars: 1.5 }];
+  await storage.put(router.ledger.key, state);
+  await router.ledger.cancelPending('peek', 'second');
+  await router.ledger.enqueue('peek', 'paid');
+  const paid = limits(0); paid.nextStartDollars = 0.03;
+  assert.equal((await router.ledger.admit('peek', 'paid', paid, { pool: true })).reason, 'paid_extra_budget');
+  for (const value of ['0', '-1', '1.5', '101', 'NaN']) assert.throws(() => installRouter(new Storage(), () => ({ ...env, GITHUB_POLL_MAX_LIVE: value }), { api: new APIs(env), now }), /invalid poll live budget/);
+  assert.throws(() => installRouter(new Storage(), () => ({ ...localEnv, GITHUB_POLL_UNPACED: 'true' }), { api: new APIs(env), now }), /invalid poll live budget/);
+});
+
 test('local unpaced admission drains a spent pacing floor but preserves FIFO, provider limits and paid budget', async () => {
   const now = () => 100_000_000;
   const storage = new Storage();

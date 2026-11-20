@@ -105,11 +105,11 @@ export function dynamicPacing({ snapshot, policy, claims, previous, now }) {
     floorLimitPerHour: floorLimit, floorUsedLastHour: floorStarts.length, floorRemainingLastHour: Math.max(0, floorLimit - floorStarts.length),
     floorOverflowLimitPerHour: overflowLimit, floorOverflowUsedLastHour: floorOverflow.length, floorOverflowRemainingLastHour: Math.max(0, overflowLimit - floorOverflow.length),
     softRemaining: { ...remaining }, hardRemaining, idleHoldSecondsByProject };
-  if (cfg.unpaced === true) {
+  if (cfg.unpaced === true || cfg.slotBudget === true) {
     status.remaining = { ...hardRemaining };
     status.burstCredit = Math.min(...Object.values(hardRemaining));
     status.effectiveStartsPerHour = hardLimitBlocked ? 0 : Math.min(snapshot.windows.hour.limit, policy.starts?.hour ?? Infinity);
-    status.admissionMode = 'unpaced';
+    status.admissionMode = cfg.slotBudget === true ? 'slot_budget' : 'unpaced';
   }
   return { state, status };
 }

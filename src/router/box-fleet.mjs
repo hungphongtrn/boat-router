@@ -917,7 +917,12 @@ export class BoxFleet {
       if (complete && (mode === 'drain' || box.drainOnly) && box.state === 'idle' && !byName.get(box.runnerName)?.busy) { if (executor === 'direct') await this.transition(box.machineId, 'retire_direct', { runnerFenced: true, retirementReason: 'pool_drain' }); else await this.retire(box.machineId, 'pool_drain'); continue; }
       if (complete && override === 'off' && box.state === 'idle' && (box.jobs ?? 0) > 0) { if (executor === 'direct') await this.transition(box.machineId, 'retire_direct', { runnerFenced: true, retirementReason: 'reuse_disabled' }); else await this.retire(box.machineId, 'reuse_disabled'); continue; }
       const ttl = ttlFor(box);
-      const reuseEnabled = !box.drainOnly && mode !== 'drain' && reuseFor(poolLabel(box.pool)) === (box.resetMode ?? 'light') && !generationCapped(box) && ageAllows(box);
+      // Drain an over-budget fleet only after jobs finish, never kill a busy
+      // runner. Keep the oldest boxes for warm reuse inside the new slot cap.
+      const budgetKeepers = account.poolPacing?.slotBudget === true ? boxes.filter(item => item.state !== 'deleted').sort((a, b) => (a.createdAt ?? a.since) - (b.createdAt ?? b.since) || a.machineId.localeCompare(b.machineId)).slice(0, project.caps.concurrent) : null;
+      const withinBudget = !budgetKeepers || budgetKeepers.some(item => item.machineId === box.machineId);
+      if (complete && !withinBudget && box.state === 'idle' && !byName.get(box.runnerName)?.busy) { await this.retire(box.machineId, 'live_budget'); continue; }
+      const reuseEnabled = withinBudget && !box.drainOnly && mode !== 'drain' && reuseFor(poolLabel(box.pool)) === (box.resetMode ?? 'light') && !generationCapped(box) && ageAllows(box);
       try {
         const { associated, last, guarded, missingResult } = jobGuard(box);
         if (executor === 'jit') {

@@ -125,6 +125,14 @@ export function installRouter(storage, getEnv, { api, now = Date.now, logger = c
   if (selected.starts?.allowPaidExtra !== undefined && typeof selected.starts.allowPaidExtra !== 'boolean') throw new TypeError('invalid paid extra starts');
   if (selected.starts?.paidExtraMaxDollarsPerMonth !== undefined && (!Number.isFinite(selected.starts.paidExtraMaxDollarsPerMonth) || selected.starts.paidExtraMaxDollarsPerMonth < 0)) throw new TypeError('invalid paid extra budget');
   const pollRepo = getEnv().GITHUB_POLL_REPO;
+  // Slot admission budgets VM time, not starts. It is local-only and retains
+  // the existing FIFO and paid-start ledger without its hourly pacing floor.
+  const liveCap = getEnv().GITHUB_POLL_MAX_LIVE;
+  if (liveCap !== undefined) {
+    if (!pollRepo || !/^[1-9]\d*$/.test(liveCap) || !Number.isSafeInteger(Number(liveCap)) || Number(liveCap) > 100 || getEnv().GITHUB_POLL_UNPACED === 'true') throw new TypeError('invalid poll live budget');
+    account.liveSandboxCap = Number(liveCap);
+    account.poolPacing = { ...account.poolPacing, slotBudget: true, unpaced: false };
+  }
   // Local repository routing can drain demand immediately rather than spread
   // starts across 24 hours. The ledger still enforces provider windows,
   // concurrency, FIFO and the rolling paid-extra budget. Deployed App routing
@@ -158,6 +166,11 @@ export function installRouter(storage, getEnv, { api, now = Date.now, logger = c
       // GitHub's own max-parallel hold, so a held matrix shard does not get a box of its own.
       return { ...definition, config: { ...definition.config, caps, lanes: [] } };
     });
+  if (liveCap !== undefined) {
+    for (const definition of configurations) {
+      definition.config = { ...definition.config, caps: { ...definition.config.caps, concurrent: Number(liveCap) }, reuse: { ...definition.config.reuse, idleHoldSeconds: 0, idleHoldSecondsWhenStartsPaid: 0 } };
+    }
+  }
   if (projects && (configurations.length !== projects.length)) throw new TypeError('unknown router project');
   if (pollRepo && (!getEnv().GITHUB_POLL_TOKEN || configurations.length !== 1 || configurations[0].config.repo !== pollRepo)) throw new TypeError('invalid GitHub polling configuration');
   const cutover = cutoverEnabled;
