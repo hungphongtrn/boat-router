@@ -124,6 +124,12 @@ export function installRouter(storage, getEnv, { api, now = Date.now, logger = c
   const account = { ...selected, ...cutoverPolicy, requireConcurrency: true, externalClients: accountClients };
   if (selected.starts?.allowPaidExtra !== undefined && typeof selected.starts.allowPaidExtra !== 'boolean') throw new TypeError('invalid paid extra starts');
   if (selected.starts?.paidExtraMaxDollarsPerMonth !== undefined && (!Number.isFinite(selected.starts.paidExtraMaxDollarsPerMonth) || selected.starts.paidExtraMaxDollarsPerMonth < 0)) throw new TypeError('invalid paid extra budget');
+  const pollRepo = getEnv().GITHUB_POLL_REPO;
+  const paidCap = getEnv().GITHUB_POLL_PAID_CAP_USD;
+  if (paidCap !== undefined) {
+    if (!pollRepo || !/^\d+(?:\.\d{1,2})?$/.test(paidCap) || !Number.isFinite(Number(paidCap)) || Number(paidCap) > (account.starts?.paidExtraMaxDollarsPerMonth ?? 0)) throw new TypeError('invalid poll paid extra cap');
+    account.starts = { ...account.starts, paidExtraMaxDollarsPerMonth: Number(paidCap) };
+  }
   const provisionerFingerprint = createHash('sha256').update(reuseBootstrap()).update('\0').update(getEnv().TOOLCHAIN_REVISION ?? 'default').digest('hex');
   const snapshotName = getEnv().PROJECT_SNAPSHOT_NAME, snapshotManifest = getEnv().PROJECT_SNAPSHOT_MANIFEST_SHA256;
   if ((snapshotName || snapshotManifest) && (!/^[a-z][a-z0-9-]{0,40}-\d{8}-[a-f0-9]{8,64}$/.test(snapshotName ?? '') || !/^[a-f0-9]{64}$/.test(snapshotManifest ?? ''))) throw new TypeError('invalid project snapshot configuration');
@@ -142,6 +148,7 @@ export function installRouter(storage, getEnv, { api, now = Date.now, logger = c
       return { ...definition, config: { ...definition.config, caps, lanes: [] } };
     });
   if (projects && (configurations.length !== projects.length)) throw new TypeError('unknown router project');
+  if (pollRepo && (!getEnv().GITHUB_POLL_TOKEN || configurations.length !== 1 || configurations[0].config.repo !== pollRepo)) throw new TypeError('invalid GitHub polling configuration');
   const cutover = cutoverEnabled;
   const workApi = cutover ? new APIs({ ...getEnv(), BOAT_CI_API_KEY: getEnv().BOAT_WORK_API_KEY }, api.fetch, now, api.credentials) : api;
   const secondaryApi = cutover ? new APIs({ ...getEnv(), BOAT_PROVIDER_WALLET: getEnv().BOAT_SECONDARY_PROVIDER_WALLET }, api.fetch, now, api.credentials) : api;
@@ -239,9 +246,11 @@ export function installRouter(storage, getEnv, { api, now = Date.now, logger = c
         const secondaryHashes = await Promise.all(creates.filter(item => item.account === 'secondary' && eligible.has(item.createKey)).map(item => controller.sharedBudget.claimKey(item.createKey)));
         await secondaryLedger.clearOrphanPoolWaiters(config.id, createKeys, secondaryHashes);
       }
-      const installation = await ctx.storage.get('pool:installation') ?? config.installation ?? (await records(ctx.storage, 'job:')).find(job => job.repo === config.repo && Number.isSafeInteger(job.installation))?.installation ?? (await records(ctx.storage, 'webhook-pending:')).find(event => event.repo === config.repo && Number.isSafeInteger(event.installation))?.installation;
+      // Snapshot and runner records use a positive installation ID internally. Polling
+      // uses a placeholder only; never persist it as discovered App configuration.
+      const installation = pollRepo ? 1 : await ctx.storage.get('pool:installation') ?? config.installation ?? (await records(ctx.storage, 'job:')).find(job => job.repo === config.repo && Number.isSafeInteger(job.installation))?.installation ?? (await records(ctx.storage, 'webhook-pending:')).find(event => event.repo === config.repo && Number.isSafeInteger(event.installation))?.installation;
       controller.boxFleet.installation = installation;
-      if (installation) await ctx.storage.put('pool:installation', installation);
+      if (installation && !pollRepo) await ctx.storage.put('pool:installation', installation);
       const last = await ctx.storage.get('pool:snapshot'), due = await ctx.storage.get('pool:snapshot-due'), first = !await ctx.storage.get('pool:first-snapshot');
       if (installation && (first || !last || now() - last.at >= 60000 || due && due <= now())) {
         if (await reconcile(ctx.storage, scopedApi, config, installation, now)) await ctx.storage.put('pool:first-snapshot', true);

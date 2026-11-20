@@ -69,6 +69,12 @@ export class APIs {
   }
   async github(job, path, options = {}) {
     const { actionsWrite = false, permissions = null, ...requestOptions } = options;
+    if (this.env.GITHUB_POLL_REPO) {
+      if (job.repo !== this.env.GITHUB_POLL_REPO || !this.env.GITHUB_POLL_TOKEN || actionsWrite) {
+        throw new ApiError('github', 0, 'poll_auth_denied');
+      }
+      return this.request('github', `/repos/${job.repo}${path}`, { ...requestOptions, token: this.env.GITHUB_POLL_TOKEN });
+    }
     // a call may ask for its own token scope (e.g. checks:read) so that a permission the App
     // lacks fails only that call, never the shared read or write tokens.
     const scope = permissions ? `scope:${Object.entries(permissions).map(([k, v]) => `${k}=${v}`).sort().join(',')}` : actionsWrite ? 'write' : 'read';

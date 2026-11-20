@@ -549,6 +549,7 @@ export class Fleet {
     this.env = { ...this.env, ENABLED: request.headers.get('X-Boat-CI-Enabled') === 'true' ? 'true' : 'false' };
     this.controller.env = this.setup.env = this.env;
     const url = new URL(request.url);
+    if (this.env.GITHUB_POLL_REPO && (url.pathname.startsWith('/setup') || url.pathname === '/webhook' || url.pathname === '/router/resync')) return new Response(null, { status: 404 });
     if (url.pathname.startsWith('/setup')) return this.setup.fetch(request);
     if (url.pathname === '/webhook' && request.method === 'POST') {
       const { webhookSecret } = appCredentials(this.env, await this.storage.get('github-app'));
