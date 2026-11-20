@@ -335,6 +335,37 @@ print(json.dumps([docker_problem({'ids': ['a'], 'tags': []}, {'keep1'}), docker_
   assert.deepEqual(JSON.parse(output), [null, 'containers=1']);
 });
 
+test('the baseline records an image inventory only once two observations agree', () => {
+  const output = python(String.raw`
+calls = []
+readings = [{'ids': ['a'], 'tags': []}, {'ids': ['a', 'b'], 'tags': []}, {'ids': ['a', 'b'], 'tags': []}]
+def inventory():
+    calls.append(1)
+    return readings[min(len(calls) - 1, len(readings) - 1)]
+image_inventory = inventory
+time.sleep = lambda seconds: None
+print(json.dumps({'value': settle_images(), 'reads': len(calls)}))
+`);
+  assert.deepEqual(JSON.parse(output), { value: { ids: ['a', 'b'], tags: [] }, reads: 3 });
+});
+
+test('an image inventory that never settles fails the baseline as a docker fault', () => {
+  const output = python(String.raw`
+calls = []
+def inventory():
+    calls.append(1)
+    return {'ids': ['a', str(len(calls))], 'tags': []}
+image_inventory = inventory
+time.sleep = lambda seconds: None
+try:
+    settle_images(attempts=3)
+    print(json.dumps({'failed': False}))
+except RuntimeError as error:
+    print(json.dumps({'failed': True, 'kind': str(error), 'output': getattr(error, 'boat_output', None), 'reads': len(calls)}))
+`);
+  assert.deepEqual(JSON.parse(output), { failed: true, kind: 'docker', output: 'images', reads: 3 });
+});
+
 test('a snapshot box baselines without building the /home/ci layout', () => {
   const output = python(String.raw`
 import tempfile, types
@@ -362,7 +393,7 @@ with tempfile.TemporaryDirectory() as directory:
     print(json.dumps({'calls': calls, 'baseline': json.loads((STATE / 'baseline.json').read_text()), 'uids': json.loads((STATE / 'ci-uids.json').read_text()), 'result': json.loads((CONTROL / 'baseline-0.json').read_text())}))
 `);
   const value = JSON.parse(output);
-  assert.deepEqual(value.calls, [['settle', null], ['clean', { ids: ['a'], tags: ['a postgres:17'] }]]);
+  assert.deepEqual(value.calls, [['settle', null], ['settle', { ids: ['a'], tags: ['a postgres:17'] }], ['clean', { ids: ['a'], tags: ['a postgres:17'] }]]);
   assert.equal(value.baseline.version, 3);
   assert.equal(value.baseline.mode, 'snapshot');
   assert.deepEqual(value.uids, []);

@@ -1138,6 +1138,20 @@ def settle_docker(allowlist, keep=(), attempts=6):
             time.sleep(2)
     docker_fail(docker_problem(allowlist, keep) or 'settle')
 
+def settle_images(attempts=8):
+    # The restored store reconciles its images too, and one appeared between the
+    # inventory the baseline recorded and the clean check a moment later, so
+    # bx_cp6put6t was retired at assert_clean for 'images' (2026-11-20). Record
+    # an inventory only once two observations two seconds apart agree.
+    previous = None
+    for attempt in range(attempts):
+        current = image_inventory()
+        if previous is not None and current == previous:
+            return current
+        previous = current
+        time.sleep(2)
+    docker_fail('images')
+
 def docker_reset(allowlist):
     settle_docker(allowlist)
     docker_clean(allowlist)
@@ -1425,7 +1439,8 @@ def main(mode, generation, waiter, helper, docker_access=False):
                         # first job chowned (2026-11-20).
                         set_stage('docker_reset')
                         settle_docker(None)
-                        allowlist = image_inventory()
+                        allowlist = settle_images()
+                        settle_docker(allowlist)
                         atomic(STATE / 'images.json', json.dumps(allowlist))
                         atomic(STATE / 'path', (CONTROL / 'reuse-path').read_text())
                         atomic(STATE / 'ci-uids.json', json.dumps([]))
@@ -1472,8 +1487,10 @@ def main(mode, generation, waiter, helper, docker_access=False):
                         if snapshot_box():
                             # A snapshot box resets with the light reset, which
                             # owns the primed tree and the runner; this path only
-                            # has to settle Docker.
-                            settle_docker(None)
+                            # has to settle Docker against the inventory the
+                            # baseline recorded, so a late image goes instead of
+                            # failing the clean check.
+                            settle_docker(allowlist)
                         else:
                             docker_reset(allowlist)
                             set_stage('fresh_filesystem')
