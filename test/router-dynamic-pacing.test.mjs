@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { dynamicPacing } from '../src/router/dynamic-pacing.mjs';
-import { AccountLedger } from '../src/router/ledger.mjs';
+import { AccountLedger, snapshotLimits } from '../src/router/ledger.mjs';
 import { Storage } from './helpers.mjs';
 
 const now = 100_000_000;
@@ -274,4 +274,48 @@ test('unpaced admission ignores soft credit and margins but retains provider and
   const reserved = new AccountLedger(new Storage(), { ...unpaced, poolPacing: { ...unpaced.poolPacing, hardDayReserve: 150 } }, () => now);
   await reserved.enqueue('project-a', 'x');
   assert.equal((await reserved.admit('project-a', 'x', snapshot(0, 0, 250))).reason, 'day_cap');
+});
+
+const paidPolicy = { ...policy, starts: { ...policy.starts, allowPaidExtra: true, paidExtraMaxDollarsPerMonth: 2 }, poolPacing: { ...policy.poolPacing, floorOverflowPerHour: 1 } };
+const paidLimits = (used = 380) => ({ observedAt: now, canStart: true, nextStartDollars: 0.03, billingStatus: 'active', startLimits: { perMinute: 24, perHour: 120, perDay: 200 }, starts: { minute: { limit: 24, used: 0 }, hour: { limit: 120, used: 0 }, day: { limit: 200, used } } });
+const paidSnap = used => ({ ...snapshotLimits(paidLimits(used), now), at: now });
+const spentFloor = async (policy, used = 380) => {
+  const storage = new Storage();
+  await storage.put('account:ledger', { claims: {}, waiting: [], dynamicPacing: { at: now, credit: 0, ratePerMs: 0, floorStarts: [{ key: 'a', at: now }, { key: 'b', at: now }], floorOverflow: [] } });
+  const ledger = new AccountLedger(storage, policy, () => now);
+  await ledger.enqueue('project-a', 'c', now - 1);
+  return { result: await ledger.admit('project-a', 'c', paidSnap(used), { pool: true }), storage };
+};
+
+test('a spent floor lets one billed start per hour through while the day window is empty', async () => {
+  const ledger = new AccountLedger(new Storage(), paidPolicy, () => now), snap = paidSnap();
+  for (const key of ['a', 'b', 'c', 'd']) await ledger.enqueue('project-a', key, now - 1);
+  assert.equal((await ledger.admit('project-a', 'a', snap, { pool: true })).ok, true);
+  assert.equal((await ledger.admit('project-a', 'b', snap, { pool: true })).ok, true);
+  assert.equal((await ledger.admit('project-a', 'c', snap, { pool: true })).ok, true, 'the emergency start covers a queued job');
+  assert.equal((await ledger.admit('project-a', 'd', snap, { pool: true })).reason, 'day_cap', 'only one emergency start per hour');
+  const state = await ledger.storage.get(ledger.key);
+  assert.equal(state.dynamicPacing.floorStarts.length, 2);
+  assert.equal(state.dynamicPacing.floorOverflow.length, 1);
+  assert.equal(state.paidExtraSpend.length, 3, 'every start past the free window is billed, the floor ones included');
+});
+
+test('the emergency floor start still obeys the paid budget, the opt-in, the override and the hard ceiling', async () => {
+  assert.equal((await spentFloor(paidPolicy)).result.ok, true);
+  assert.equal((await spentFloor({ ...paidPolicy, starts: { ...paidPolicy.starts, paidExtraMaxDollarsPerMonth: 0 } })).result.reason, 'paid_extra_budget');
+  assert.equal((await spentFloor({ ...paidPolicy, starts: { ...paidPolicy.starts, allowPaidExtra: false } })).result.reason, 'day_cap');
+  assert.equal((await spentFloor({ ...paidPolicy, poolPacing: { ...paidPolicy.poolPacing, floorOverflowPerHour: 0 } })).result.reason, 'day_cap');
+  assert.equal((await spentFloor(paidPolicy, 400)).result.reason, 'day_cap', 'the hard ceiling never moves');
+});
+
+test('floor status reports the emergency starts and carries them forward', () => {
+  const value = dynamicPacing({ snapshot: paidSnap(), policy: paidPolicy, claims: [], previous: null, now }).status;
+  assert.equal(value.floorOverflowLimitPerHour, 1);
+  assert.equal(value.floorOverflowUsedLastHour, 0);
+  assert.equal(value.floorOverflowRemainingLastHour, 1);
+  const previous = { at: now - 1000, credit: 0, ratePerMs: 0, floorStarts: [], floorOverflow: [{ key: 'a', at: now - 1000 }] };
+  const carried = dynamicPacing({ snapshot: paidSnap(), policy: paidPolicy, claims: [], previous, now }).status;
+  assert.equal(carried.floorOverflowUsedLastHour, 1);
+  assert.equal(carried.floorOverflowRemainingLastHour, 0);
+  assert.equal(dynamicPacing({ snapshot: paidSnap(), policy: paidPolicy, claims: [], previous: { ...previous, floorOverflow: [{ key: 'a', at: now + 1 }] }, now }), null);
 });

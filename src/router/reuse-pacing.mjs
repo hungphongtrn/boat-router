@@ -1,7 +1,22 @@
 import { snapshotLimits } from './ledger.mjs';
 import { dynamicPacing } from './dynamic-pacing.mjs';
+import { paidExtraBudget, paidExtraEnabled, paidExtraSpend } from './paid-extra.mjs';
 
 const samples = new WeakMap();
+
+// A kept box is not free. Past the plan's included VM hours a box-hour costs
+// about what one paid start costs, so while the day window is empty a hold
+// longer than this buys nothing over paying for a start (2026-11-20).
+export const PAID_IDLE_HOLD_SECONDS = 1200;
+
+// The hold a warm box gets while the free day window is empty and the account's
+// paid-extra budget still has room. `null` keeps the ordinary hold: the window
+// has free starts, or nothing can replace the box anyway.
+export function paidIdleHold({ pacing, baseSeconds, configured }) {
+  if (pacing?.dayRoomEmpty !== true || pacing?.paidExtraRoom !== true) return null;
+  const seconds = Number.isSafeInteger(configured) && configured >= 0 ? configured : PAID_IDLE_HOLD_SECONDS;
+  return Math.max(baseSeconds, seconds);
+}
 
 // Use a current account-level rate without changing the ledger's token balance.
 // Unknown data preserves the configured hold and never grants extra starts.
@@ -31,8 +46,23 @@ export async function reusePacing({ account, api, budget, now }) {
       sample = entry.sample;
     }
     return sample && Number.isFinite(sample.sampledAt) && sample.sampledAt <= at && at - sample.sampledAt <= 30_000 && Number.isFinite(sample.effectiveStartsPerHour) && sample.effectiveStartsPerHour >= 0
-      ? { sampledAt: sample.sampledAt, startsPerHour: sample.effectiveStartsPerHour } : null;
+      ? { sampledAt: sample.sampledAt, startsPerHour: sample.effectiveStartsPerHour, dayRoomEmpty: dayRoomEmpty(sample), paidExtraRoom: paidExtraRoom({ account, state, at }) } : null;
   } catch { return null; }
+}
+
+// The free day window is empty but the configured ceiling still allows a billed
+// start: the floor rate is what is left, and every start is a paid extra.
+function dayRoomEmpty(sample) {
+  return Number.isFinite(sample?.remaining?.day) && sample.remaining.day < 1 && Number.isFinite(sample?.hardRemaining?.day) && sample.hardRemaining.day >= 1;
+}
+
+// The rolling paid-extra budget, read from the same ledger state as the claims.
+function paidExtraRoom({ account, state, at }) {
+  if (!paidExtraEnabled(account)) return false;
+  const budget = paidExtraBudget(account);
+  if (budget == null) return false;
+  const spent = paidExtraSpend(state?.paidExtraSpend, at).reduce((total, record) => total + record.dollars, 0);
+  return spent < budget;
 }
 
 export function nominalReuseHold(baseSeconds, startsPerHour) {

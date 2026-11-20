@@ -4,6 +4,7 @@ const WINDOWS = { minute: 60_000, hour: 3_600_000, day: 86_400_000 };
 const validCount = n => Number.isSafeInteger(n) && n >= 0;
 function releaseFloor(state, key) {
   if (Array.isArray(state?.dynamicPacing?.floorStarts)) state.dynamicPacing.floorStarts = state.dynamicPacing.floorStarts.filter(item => item.key !== key);
+  if (Array.isArray(state?.dynamicPacing?.floorOverflow)) state.dynamicPacing.floorOverflow = state.dynamicPacing.floorOverflow.filter(item => item.key !== key);
 }
 // Convert the provider response without inventing missing counters. The
 // admission path rejects a missing or stale window rather than guessing.
@@ -270,7 +271,18 @@ export class AccountLedger {
       // Floor reservations are account-wide and are stored with the claims in
       // this transaction. They never bypass provider hard limits.
       const useFloor = dynamic && !unpaced && (floorRequired || dynamic.state.credit + 1e-9 < keys.length);
-      if (useFloor && state.dynamicPacing.floorStarts.length + keys.length > (pacing.floorStartsPerHour ?? 2)) return { ok: false, reason: floorRequired ? 'day_cap' : 'pacing' };
+      let useOverflow = false;
+      if (useFloor) {
+        const floorLimit = pacing.floorStartsPerHour ?? 2, overflowLimit = pacing.floorOverflowPerHour ?? 1;
+        if (state.dynamicPacing.floorStarts.length + keys.length > floorLimit) {
+          // With the free day window empty, one billed start per hour may pass
+          // the spent floor so a queued job is not stranded behind a retired
+          // box. The paid-extra budget still bounds it below.
+          const overflow = state.dynamicPacing.floorOverflow ?? [];
+          if (!floorRequired || !allowPaidExtra || !validCount(overflowLimit) || overflowLimit < 1 || overflow.length + keys.length > overflowLimit) return { ok: false, reason: floorRequired ? 'day_cap' : 'pacing' };
+          useOverflow = true;
+        }
+      }
       if ((pool || client) && pacingActive) {
         const marginPct = pacing.marginPct ?? 10, burst = pacing.burst ?? 1, reserve = pacing.reserveStarts ?? 0;
         if (!Number.isFinite(marginPct) || marginPct < 0 || marginPct >= 100 || !validCount(burst) || burst < 1 || !validCount(reserve)) throw new TypeError('invalid pool pacing');
@@ -314,7 +326,10 @@ export class AccountLedger {
         if (spent + extraPrice * keys.length > budget + 1e-9) return { ok: false, reason: 'paid_extra_budget', nextAt: (extraSpend.length ? Math.min(...extraSpend.map(record => record.at)) : now) + PAID_EXTRA_WINDOW_MS };
       }
       if (dynamic) {
-        if (useFloor) state.dynamicPacing.floorStarts.push(...keys.map(key => ({ key, at: now })));
+        if (useFloor) {
+          if (useOverflow) state.dynamicPacing.floorOverflow.push(...keys.map(key => ({ key, at: now })));
+          else state.dynamicPacing.floorStarts.push(...keys.map(key => ({ key, at: now })));
+        }
         else state.dynamicPacing.credit = Math.max(0, state.dynamicPacing.credit - keys.length);
         state.pacingStatus.burstCredit = state.dynamicPacing.credit;
         for (const name of Object.keys(state.pacingStatus.remaining)) state.pacingStatus.remaining[name] = Math.max(0, state.pacingStatus.remaining[name] - keys.length);

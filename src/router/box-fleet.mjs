@@ -4,7 +4,7 @@ import { records } from './pool-records.mjs';
 import { isPlanRefusal, isSizeRefusal } from '../domain.mjs';
 import { prunePool } from './pool-prune.mjs';
 import { waitClaims } from './wait-for-busy.mjs';
-import { reusePacing, reuseHold, nominalReuseHold } from './reuse-pacing.mjs';
+import { reusePacing, reuseHold, nominalReuseHold, paidIdleHold } from './reuse-pacing.mjs';
 import { currentBreaker, breakerCanProbe, breakerForSize, reserveSizedProbe, releaseSizedProbe, releaseSizedProbeInTransaction, recordSizedBreakerOutcome, BREAKER_PROBE_DELAY_MS } from './verification-breaker.mjs';
 import { MACHINE_SIZES } from './sizes.mjs';
 import { SetupWatchdog } from './setup-watchdog.mjs';
@@ -599,10 +599,15 @@ export class BoxFleet {
     const pacing = await reusePacing({ account, api: this.api, budget: this.budget, now: this.now });
     const healthMode = executor === 'jit' ? await effectiveHealthMode(account, this.api, now) : 'observe';
     const baseHold = project.reuse?.idleHoldSeconds ?? account.reuse?.idleHoldSeconds ?? 120;
-    const nominalHold = nominalReuseHold(baseHold, pacing?.startsPerHour);
+    // With the free day window empty every start is billed, so a longer hold only
+    // trades a paid start for VM hours; `idleHoldSecondsWhenStartsPaid` (default
+    // 20 min) is the whole extension, after which the box retires as normal.
+    const paidHold = paidIdleHold({ pacing, baseSeconds: baseHold, configured: project.reuse?.idleHoldSecondsWhenStartsPaid ?? account.reuse?.idleHoldSecondsWhenStartsPaid });
+    const nominalHold = paidHold ?? nominalReuseHold(baseHold, pacing?.startsPerHour);
     const reuseStatus = { reuseIdleHoldSeconds: nominalHold,
       reusePacingStartsPerHour: pacing?.startsPerHour ?? null, reusePacingSampledAt: pacing?.sampledAt ?? null,
-      reuseHoldBasis: !pacing ? 'unknown' : pacing.startsPerHour <= 5 ? 'low_rate' : pacing.startsPerHour >= 15 ? 'normal_rate' : 'transition' };
+      reuseDayRoomEmpty: pacing?.dayRoomEmpty ?? null, reusePaidExtraRoom: pacing?.paidExtraRoom ?? null,
+      reuseHoldBasis: paidHold != null ? 'paid_starts' : !pacing ? 'unknown' : pacing.startsPerHour <= 5 ? 'low_rate' : pacing.startsPerHour >= 15 ? 'normal_rate' : 'transition' };
     const waitPools = pools.map(pool => pool.reason === 'breaker' ? { ...pool, reason: null } : pool);
     const waitUnits = account.paidOverflow?.enabled === true ? units.filter(unit => unit.kind !== 'create' || unit.state !== 'pending') : units;
     const waits = await waitClaims({ storage: this.storage, api: this.api, jobs: demand, boxes, pools: waitPools, units: waitUnits, now, account, project, env, enabled: false, logger: this.logger });
@@ -672,6 +677,18 @@ export class BoxFleet {
       if (mode === 'on' && env.ENABLED === 'true' && !preparationFailed) await this.prepareSnapshotRecovery({ pools, demand, boxes, creates, locals, project, account, env, override, now, dockerSwitches });
       return output;
     }
+    // A job that landed while the retirement was in flight should take the box
+    // it was retiring: the runner is still live until the fence, so canceling
+    // the retirement is cheaper than paying a start for that job.
+    if (!prepareOnly && complete) {
+      for (const box of boxes.filter(item => item.state === 'retiring' && item.retirementReason === 'idle_hold_expired' && item.runnerFenced !== true && item.reusable === true && !item.afterFence && !item.retargetPool)) {
+        if (!(output[box.pool]?.create > 0) || !(await this.queuedCount(box))) continue;
+        if (await this.transition(box.machineId, 'retire_cancel', { retirementReason: null, afterFence: null, retargetPool: null })) {
+          output[box.pool].create = Math.max(0, output[box.pool].create - 1);
+          this.logger?.(JSON.stringify({ event: 'retire_cancel', project: this.project?.id, machineId: box.machineId, pool: box.pool }));
+        }
+      }
+    }
     const cap = project.caps?.concurrent ?? Infinity;
     let room = Math.max(0, cap - boxes.filter(box => box.state !== 'deleted').length - creates.length - await this.pendingLeaseStarts());
     const candidates = [];
@@ -688,11 +705,19 @@ export class BoxFleet {
         if (cancelled) { await this.discardCreate(create.createKey); excessPending--; surplus = Math.max(0, surplus - 1); room++; }
       }
       if (!prepareOnly && surplus && complete) {
+        // A webhook can record a job after this tick read its demand, so a
+        // retirement compares the pool's fresh queued count with that read: a
+        // job the snapshot did not see keeps the box that would have covered it.
+        const queuedSnapshot = jobs.filter(job => job.pool === pool.key && job.status === 'queued' && !job.missing).length;
         for (const box of boxes.filter(item => item.pool === pool.key && item.state === 'idle').sort((a, b) => a.since - b.since)) {
           if (!surplus) break;
           const hold = reuseHold({ box, baseSeconds: baseHold, nominalSeconds: nominalHold, now, account, project, env, enabled: waitEnabled });
           if (now - (box.onlineAt ?? box.since) < hold * 1000 || byName.get(box.runnerName)?.busy) continue;
-          if (executor === 'direct' ? await this.transition(box.machineId, 'retire_direct', { runnerFenced: true, retirementReason: 'idle_hold_expired' }) : await this.retire(box.machineId, 'idle_hold_expired')) surplus--;
+          const retired = executor === 'direct'
+            ? ((await this.queuedCount(box)) > queuedSnapshot ? false : await this.transition(box.machineId, 'retire_direct', { runnerFenced: true, retirementReason: 'idle_hold_expired' }))
+            : await this.retire(box.machineId, 'idle_hold_expired', { queuedSnapshot });
+          if (!retired) break;
+          surplus--;
         }
       }
       result.surplus = surplus;
@@ -1411,9 +1436,24 @@ export class BoxFleet {
     return reason;
   }
 
-  async retire(machineId, retirementReason = null) {
+  // A webhook can record a queued job after the tick's demand snapshot, so the
+  // last word before a box leaves is a fresh read of its pool's queued records.
+  async queuedCount(box) {
+    const prefix = box.executor === 'direct' ? 'direct:job:' : 'gh-job:';
+    return (await records(this.storage, prefix)).filter(job => job.pool === box.pool && job.status === 'queued' && !job.missing).length;
+  }
+
+  async retire(machineId, retirementReason = null, { queuedSnapshot = null } = {}) {
     const box = await this.transition(machineId, 'retire_idle', { retirementReason });
     if (!box) return false;
+    // A job that landed after the snapshot keeps a box whose runner is still
+    // live; canceling the retirement is cheaper than paying a start for it.
+    if (retirementReason === 'idle_hold_expired' && Number.isSafeInteger(queuedSnapshot) && box.reusable === true && box.runnerFenced !== true && !box.afterFence && (await this.queuedCount(box)) > queuedSnapshot) {
+      if (await this.transition(machineId, 'retire_cancel', { retirementReason: null, afterFence: null, retargetPool: null })) {
+        this.logger?.(JSON.stringify({ event: 'retire_cancel', project: this.project?.id, machineId, pool: box.pool }));
+        return false;
+      }
+    }
     return this.fenceRunner(box);
   }
 

@@ -111,6 +111,9 @@ export const TRANSITIONS = Object.freeze({
   fenced_finished: { from: ['retiring'], to: 'finished' },
   fenced_destroy: { from: ['retiring'], to: 'destroying' },
   retire_timeout: { from: ['retiring'], to: STAY },
+  // A job landed while an idle box was being retired but its runner is not
+  // fenced yet: keep the box and let it take the job instead of paying a start.
+  retire_cancel: { from: ['retiring'], to: 'idle' },
   // Destroying, unregister, purging: provider cleanup
   destroy_requested: { from: ['destroying'], to: 'purging' },
   destroy_unregister: { from: ['destroying'], to: 'unregister' },

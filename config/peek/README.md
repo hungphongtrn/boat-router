@@ -15,7 +15,7 @@ project is registered, so an unregistered repository is refused by the webhook.
 | `margin` | 0.1 | The router stops at 90 % of each window, which leaves about 20 daily starts for `publish`, which stays on native `runs-on: boat`. |
 | `openStartQueue`, `dayReserve` | `true`, `0` | One queue in arrival order, no per-project reserve. |
 | `poolPacing` | `dynamic`, `unpaced: false` | Starts follow the provider's rolling windows instead of a free-running burst. |
-| `reuse` | `enabled`, `maxJobs: 30`, `maxAgeSeconds: 14400`, `idleHoldSeconds: 420` | A finished box is reset in place and handed to the next queued job. `idleHoldSeconds` keeps it warm long enough for the next pull request rather than spending a start on it. |
+| `reuse` | `enabled`, `maxJobs: 30`, `maxAgeSeconds: 14400`, `idleHoldSeconds: 420`, `idleHoldSecondsWhenStartsPaid: 1200` | A finished box is reset in place and handed to the next queued job. `idleHoldSeconds` keeps it warm long enough for the next pull request rather than spending a start on it. While the free day window is empty every start is billed, so the hold extends only to `idleHoldSecondsWhenStartsPaid` (20 min) and then the box retires as normal: past the plan's VM hours a kept box-hour costs about one paid start. |
 | `reuse.healthCheck` | `auto` | The probe runs on a fresh box and after every reset; a box that misses a floor is retired instead of reused. |
 | `machineTtlSeconds` | 28800 | The reuse window is `min(maxAge, ttl − headroom)` and the headroom is `max(300, 1200 + maxJobTimeoutMinutes × 60)`. A shorter TTL silently turns reuse off for Peek's 30–40-minute jobs. |
 | labels | `peek-router` → `default` | The one label Peek's jobs ask for. `boat-size-default` remains available but is not what the workflow uses. |
