@@ -408,3 +408,42 @@ test('placement evidence includes browser Git Pro admission failures', () => {
   const capacity = { at: 1000, offers: 0, reasons: { lease_browser_git_copy: 1, lease_launch_exit_98: 1 } };
   assert.deepEqual(placementEvidence(capacity, 2000).categories, ['browser_git_copy', 'lease_exit_98']);
 });
+
+test('an idle retirement cancels when a job landed after the demand snapshot', async () => {
+  const clock = { now: 10_000_000 }, cfg = project('alpha', 'example/alpha');
+  cfg.machineTtlSeconds = 86400; cfg.reuse = { mode: 'on', idleHoldSeconds: 900 };
+  const p = await setupProject(cfg, new AccountLedger(new Storage(), {}, () => clock.now), clock, [], [{ id: 1, queuedAt: clock.now - 1000 }]);
+  const pool = JSON.stringify([cfg.repo, 'work-large']);
+  await p.storage.put('box:one', { machineId: 'one', pool, state: 'idle', since: clock.now - 900_000, onlineAt: clock.now - 900_000, createdAt: clock.now - 1_000_000, generation: 1, reusable: true, baselineHash: 'ok', runnerFenced: false, runnerId: 7, runnerName: 'boat-one' });
+  // The snapshot this retirement was planned from saw no queued job.
+  assert.equal(await p.fleet.retire('one', 'idle_hold_expired', { queuedSnapshot: 0 }), false);
+  const box = await p.storage.get('box:one');
+  assert.equal(box.state, 'idle');
+  assert.equal(box.exitReason ?? null, null);
+  assert.equal(box.history.at(-1).event, 'retire_cancel');
+});
+
+test('a retirement the snapshot already covered still fences the runner', async () => {
+  const clock = { now: 10_000_000 }, cfg = project('alpha', 'example/alpha');
+  cfg.machineTtlSeconds = 86400; cfg.reuse = { mode: 'on', idleHoldSeconds: 900 };
+  const p = await setupProject(cfg, new AccountLedger(new Storage(), {}, () => clock.now), clock, [], [{ id: 1, queuedAt: clock.now - 1000 }]);
+  const pool = JSON.stringify([cfg.repo, 'work-large']);
+  p.fleet.api.removeRunner = async () => ({});
+  await p.storage.put('box:one', { machineId: 'one', pool, state: 'idle', since: clock.now - 900_000, onlineAt: clock.now - 900_000, createdAt: clock.now - 1_000_000, generation: 1, reusable: true, baselineHash: 'ok', runnerFenced: false, runnerId: 7, runnerName: 'boat-one' });
+  assert.equal(await p.fleet.retire('one', 'idle_hold_expired', { queuedSnapshot: 1 }), true);
+  assert.equal((await p.storage.get('box:one')).state, 'destroying');
+});
+
+test('a retiring box comes back when the pool still wants a box and a job is queued', async () => {
+  const clock = { now: 10_000_000 }, cfg = project('alpha', 'example/alpha');
+  cfg.machineTtlSeconds = 86400; cfg.reuse = { mode: 'on', idleHoldSeconds: 900 };
+  const p = await setupProject(cfg, new AccountLedger(new Storage(), {}, () => clock.now), clock, [], [{ id: 1, queuedAt: clock.now - 1000 }]);
+  const pool = JSON.stringify([cfg.repo, 'work-large']);
+  await p.storage.put('box:one', { machineId: 'one', pool, state: 'retiring', since: clock.now - 5000, createdAt: clock.now - 1_000_000, generation: 1, reusable: true, baselineHash: 'ok', runnerFenced: false, retirementReason: 'idle_hold_expired', runnerId: 7, runnerName: 'boat-one' });
+  await p.fleet.tick({ mode: 'on', env: { ENABLED: 'true' }, account: { reuse: { enabled: true } }, project: cfg, preprepared: true });
+  const box = await p.storage.get('box:one');
+  assert.equal(box.state, 'idle');
+  assert.equal(box.retirementReason, null);
+  assert.equal(box.history.at(-1).event, 'retire_cancel');
+  assert.equal((await p.storage.list({ prefix: 'create:' })).size, 0, 'the kept box covers the job instead of a new create');
+});

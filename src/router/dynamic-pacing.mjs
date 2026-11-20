@@ -10,8 +10,8 @@ export function dynamicPacing({ snapshot, policy, claims, previous, now }) {
   if (!snapshot || !Number.isFinite(snapshot.at) || snapshot.at > now || now - snapshot.at > 30_000 || snapshot.canStart !== true || !Array.isArray(claims)) return null;
   const cfg = policy.poolPacing ?? {}, burst = cfg.burst ?? 40, reserve = cfg.reserveStarts ?? 0;
   if (!count(burst) || burst < 1 || !count(reserve)) throw new TypeError('invalid dynamic pacing');
-  const hardDayReserve = cfg.hardDayReserve ?? 0, floorLimit = cfg.floorStartsPerHour ?? 2;
-  if (!count(hardDayReserve) || !count(floorLimit)) throw new TypeError('invalid dynamic pacing floor or hard reserve');
+  const hardDayReserve = cfg.hardDayReserve ?? 0, floorLimit = cfg.floorStartsPerHour ?? 2, overflowLimit = cfg.floorOverflowPerHour ?? 1;
+  if (!count(hardDayReserve) || !count(floorLimit) || !count(overflowLimit)) throw new TypeError('invalid dynamic pacing floor or hard reserve');
   const ownedDayCap = policy.maxOwnedStartsPerDay;
   if (ownedDayCap !== undefined && !count(ownedDayCap)) throw new TypeError('invalid owned daily start cap');
   const margin = policy.margin ?? 0, dayReserve = policy.dayReserve ?? policy.defaultDayReserve ?? 0;
@@ -83,7 +83,13 @@ export function dynamicPacing({ snapshot, policy, claims, previous, now }) {
   const oldFloor = previous?.floorStarts ?? [];
   if (!Array.isArray(oldFloor) || oldFloor.some(item => !item || typeof item.key !== 'string' || !Number.isFinite(item.at) || item.at > now)) return null;
   const floorStarts = oldFloor.filter(item => item.at > now - SPANS.hour);
-  const state = { at: now, credit, ratePerMs, floorStarts };
+  // The emergency floor start lets one billed start through per hour while the
+  // free day window is empty, so a queued job is not stranded behind a spent
+  // floor and a surplus idle box (2026-11-20).
+  const oldOverflow = previous?.floorOverflow ?? [];
+  if (!Array.isArray(oldOverflow) || oldOverflow.some(item => !item || typeof item.key !== 'string' || !Number.isFinite(item.at) || item.at > now)) return null;
+  const floorOverflow = oldOverflow.filter(item => item.at > now - SPANS.hour);
+  const state = { at: now, credit, ratePerMs, floorStarts, floorOverflow };
   const idleHoldSecondsByProject = Object.fromEntries(Object.entries(policy.projects ?? {}).flatMap(([id, project]) => {
     const seconds = project.idleHoldSeconds ?? policy.reuse?.idleHoldSeconds;
     return count(seconds) ? [[id, seconds]] : [];
@@ -97,6 +103,7 @@ export function dynamicPacing({ snapshot, policy, claims, previous, now }) {
     nextTrackedRollOffUpperBound: tracked[0] ?? null, nextTrackedRollOffKind: 'tracked_settlement_upper_bound',
     forecastAssumptions: 'no_new_starts_unmatched_held_24h', forecastAt: now, hourlyForecast,
     floorLimitPerHour: floorLimit, floorUsedLastHour: floorStarts.length, floorRemainingLastHour: Math.max(0, floorLimit - floorStarts.length),
+    floorOverflowLimitPerHour: overflowLimit, floorOverflowUsedLastHour: floorOverflow.length, floorOverflowRemainingLastHour: Math.max(0, overflowLimit - floorOverflow.length),
     softRemaining: { ...remaining }, hardRemaining, idleHoldSecondsByProject };
   if (cfg.unpaced === true) {
     status.remaining = { ...hardRemaining };

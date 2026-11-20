@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { reusePacing, reuseHold, nominalReuseHold } from '../src/router/reuse-pacing.mjs';
+import { reusePacing, reuseHold, nominalReuseHold, paidIdleHold, PAID_IDLE_HOLD_SECONDS } from '../src/router/reuse-pacing.mjs';
 
 const now = 10_000_000;
 const account = { poolPacing: { enabled: true, mode: 'dynamic', burst: 40 }, reuse: { maxJobs: 60, maxAgeSeconds: 86400 }, starts: { minute: 24, hour: 120, day: 400 }, windowMargins: { minute: 0, hour: 0, day: 0.05 }, dayReserve: 0 };
@@ -41,7 +41,7 @@ test('fresh shared ledger pacing status is used without an extra provider reques
   const state = { pacingStatus: { sampledAt: now - 1000, effectiveStartsPerHour: 4.99 } };
   const budget = { ledger: { key: 'ledger', storage: { get: async () => state } } };
   const got = await reusePacing({ account, budget, api: { limits: async () => { reads++; throw Error(); } }, now: () => now });
-  assert.deepEqual(got, { sampledAt: now - 1000, startsPerHour: 4.99 });
+  assert.deepEqual(got, { sampledAt: now - 1000, startsPerHour: 4.99, dayRoomEmpty: false, paidExtraRoom: false });
   assert.equal(reads, 0);
 });
 
@@ -70,4 +70,30 @@ test('provider reads without an observation time use request start, not response
   const budget = { ledger: { key: 'ledger', storage: { get: async () => ({ claims: {} }) } } };
   const api = { limits: async () => { clock += 10_000; return { canStart: true, starts: { minute: { limit: 24, used: 0 }, hour: { limit: 120, used: 0 }, day: { limit: 400, used: 360 } } }; } };
   assert.equal((await reusePacing({ account, budget, api, now: () => clock })).sampledAt, now);
+});
+
+test('paid idle hold extends only while the free day window is empty and the paid budget has room', () => {
+  const pacing = { dayRoomEmpty: true, paidExtraRoom: true };
+  assert.equal(PAID_IDLE_HOLD_SECONDS, 1200);
+  assert.equal(paidIdleHold({ pacing, baseSeconds: 420 }), 1200);
+  assert.equal(paidIdleHold({ pacing, baseSeconds: 420, configured: 900 }), 900);
+  assert.equal(paidIdleHold({ pacing, baseSeconds: 420, configured: 300 }), 420);
+  assert.equal(paidIdleHold({ pacing, baseSeconds: 1800, configured: 600 }), 1800);
+  assert.equal(paidIdleHold({ pacing: { dayRoomEmpty: false, paidExtraRoom: true }, baseSeconds: 420 }), null);
+  assert.equal(paidIdleHold({ pacing: { dayRoomEmpty: true, paidExtraRoom: false }, baseSeconds: 420 }), null);
+  assert.equal(paidIdleHold({ pacing: null, baseSeconds: 420 }), null);
+});
+
+test('a fresh pacing status reports the empty day window and the paid budget room', async () => {
+  const paid = { ...account, starts: { ...account.starts, allowPaidExtra: true, paidExtraMaxDollarsPerMonth: 2 } };
+  const status = { sampledAt: now - 1000, effectiveStartsPerHour: 2, remaining: { day: 0 }, hardRemaining: { day: 14 } };
+  const room = await reusePacing({ account: paid, budget: { ledger: { key: 'ledger', storage: { get: async () => ({ pacingStatus: status, paidExtraSpend: [{ at: now - 1000, dollars: 0.39 }] }) } } }, api: { limits: async () => { throw Error(); } }, now: () => now });
+  assert.equal(room.dayRoomEmpty, true);
+  assert.equal(room.paidExtraRoom, true);
+  const spent = await reusePacing({ account: paid, budget: { ledger: { key: 'ledger', storage: { get: async () => ({ pacingStatus: status, paidExtraSpend: [{ at: now - 1000, dollars: 2 }] }) } } }, api: { limits: async () => { throw Error(); } }, now: () => now });
+  assert.equal(spent.dayRoomEmpty, true);
+  assert.equal(spent.paidExtraRoom, false);
+  const free = await reusePacing({ account, budget: { ledger: { key: 'ledger', storage: { get: async () => ({ pacingStatus: { ...status, remaining: { day: 9 } }, paidExtraSpend: [] }) } } }, api: { limits: async () => { throw Error(); } }, now: () => now });
+  assert.equal(free.dayRoomEmpty, false);
+  assert.equal(free.paidExtraRoom, false);
 });

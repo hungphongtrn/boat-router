@@ -3,7 +3,8 @@
   "repo": "hungphongtrn/peek",
   "account": "peek",
   "reuse": {
-    "mode": "on"
+    "mode": "on",
+    "idleHoldSecondsWhenStartsPaid": 1200
   },
   "labels": [
     "peek-router"

@@ -29,6 +29,7 @@ export function validateSuite(config, hooks = {}) {
   if (config.reuse?.maxJobs !== undefined && (!Number.isSafeInteger(config.reuse.maxJobs) || config.reuse.maxJobs < 1)) errors.push('invalid maximum jobs');
   if (config.reuse?.maxAgeSeconds !== undefined && (!Number.isSafeInteger(config.reuse.maxAgeSeconds) || config.reuse.maxAgeSeconds < 1)) errors.push('invalid maximum age');
   if (config.reuse?.idleHoldSeconds !== undefined && (!Number.isSafeInteger(config.reuse.idleHoldSeconds) || config.reuse.idleHoldSeconds < 0)) errors.push('invalid idle hold');
+  if (config.reuse?.idleHoldSecondsWhenStartsPaid !== undefined && (!Number.isSafeInteger(config.reuse.idleHoldSecondsWhenStartsPaid) || config.reuse.idleHoldSecondsWhenStartsPaid < 0)) errors.push('invalid paid idle hold');
   for (const floor of [config.reuse?.diskFloorKiB, config.reuse?.homeDiskFloorKiB]) if (floor !== undefined && (!floor || typeof floor !== 'object' || Array.isArray(floor) || Object.entries(floor).some(([size, value]) => !['small', 'default', 'large', 'xlarge'].includes(size) || !Number.isSafeInteger(value) || value < 4194304))) errors.push('invalid disk floor');
   if (!Array.isArray(config.labels) || config.labels.some(x => typeof x !== 'string' || !x)) errors.push('invalid labels');
   // Boat labels: extra runs-on labels every Boat runner of the tenant registers with; never a pool or size label.
