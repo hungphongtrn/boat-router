@@ -918,6 +918,68 @@ def quiesce_timed_units(names, flag_name, unit_root):
 def quiesce_idle_reclaim(unit_root=pathlib.Path('/run/systemd/system')):
     quiesce_timed_units(('ascii-idle-reclaim.timer', 'ascii-idle-reclaim.service'), 'idle-reclaim-enabled', unit_root)
 
+LAZY_ROOT = pathlib.Path('/var/lib/ascii-lazy')
+LAZY_SETTLE_SECONDS = 30
+LAZY_START_SETTLE_SECONDS = 15
+LAZY_ENTRY_LIMIT = 20000
+
+def lazy_pending(paths, root=LAZY_ROOT):
+    prefix = str(root) + '/'
+    for path in paths:
+        try:
+            if str(pathlib.Path(path).resolve()).startswith(prefix):
+                return True
+        except (OSError, RuntimeError):
+            # A path that cannot be resolved yet is not proof the layer still
+            # owns it; the bounded wait below simply ends.
+            continue
+    return False
+
+def settle_lazy_disk(paths=None, seconds=LAZY_SETTLE_SECONDS, limit=LAZY_ENTRY_LIMIT, root=LAZY_ROOT):
+    # A snapshot box serves its saved disk through the provider's lazy layer
+    # (/var/lib/ascii-lazy) and copies each entry up on its first read. A job
+    # that starts before the primed tree settles can resolve a path into the
+    # layer's retired copy: on 2026-11-20 nextest read its package graph from
+    # /var/lib/ascii-lazy/retired instead of /home/user/ci/peek and failed a
+    # module that passed on the next box. Walk the job tree's metadata (bounded)
+    # so the layer copies it up, then wait, bounded, until no job path resolves
+    # into the layer. A box without the layer is untouched, and the whole step
+    # stays far below the baseline deadline.
+    if not root.exists():
+        return 0.0
+    started = time.monotonic()
+    deadline = started + seconds
+    if paths is None:
+        paths = job_paths() or ['/home/user/ci/peek']
+    seen = 0
+    for path in paths:
+        top = pathlib.Path(path)
+        try:
+            if not top.is_dir() or top.is_symlink():
+                continue
+        except OSError:
+            continue
+        stack = [top]
+        while stack and seen < limit and time.monotonic() < deadline:
+            directory = stack.pop()
+            try:
+                with os.scandir(directory) as scan:
+                    for entry in scan:
+                        seen += 1
+                        try:
+                            entry.stat(follow_symlinks=False)
+                            if entry.is_dir(follow_symlinks=False):
+                                stack.append(pathlib.Path(entry.path))
+                        except OSError:
+                            pass
+                        if seen >= limit or time.monotonic() >= deadline:
+                            break
+            except OSError:
+                continue
+    while time.monotonic() < deadline and lazy_pending(paths, root):
+        time.sleep(0.25)
+    return round(time.monotonic() - started, 3)
+
 def quiesce_sysstat(unit_root=pathlib.Path('/run/systemd/system')):
     quiesce_timed_units(('sysstat-collect.timer', 'sysstat-collect.service', 'sysstat-summary.timer', 'sysstat-summary.service'), 'sysstat-enabled', unit_root)
 
@@ -1339,7 +1401,7 @@ def start_job(generation, docker_access):
     existing = run(['systemctl', 'show', unit, '--property=LoadState', '--value'], (0, 1))
     if existing != 'not-found':
         atomic(marker, 'started')
-        return
+        return 0.0
     jit = CONTROL / 'jit'
     if snapshot_box():
         # A snapshot box carries its runner and its start script under
@@ -1351,6 +1413,9 @@ def start_job(generation, docker_access):
         # tree generation 0 had chowned).
         if not jit.is_file() or jit.is_symlink() or jit.stat().st_size == 0:
             raise RuntimeError('jit')
+        # The first job's reads must see the primed tree at its own path, not
+        # the lazy layer's retired copy (see settle_lazy_disk).
+        seconds = settle_lazy_disk(seconds=LAZY_START_SETTLE_SECONDS)
         user = pwd.getpwnam('user')
         os.chown(jit, user.pw_uid, user.pw_gid)
         os.chmod(jit, 0o600)
@@ -1359,7 +1424,7 @@ def start_job(generation, docker_access):
             raise RuntimeError('filesystem')
         run(['systemd-run', '--quiet', '--unit=' + unit, '--property=User=user', '--property=Group=user', '--property=KillMode=control-group', '--property=RemainAfterExit=yes', '--property=TimeoutStopSec=10', '--property=RuntimeMaxSec=14400', '--property=WorkingDirectory=/home/user/boat-ci-runner', '--property=StandardOutput=null', '--property=StandardError=null', 'bash', script])
         atomic(marker, 'started')
-        return
+        return seconds
     destination = HOME / '.jit'
     if not destination.is_file():
         if not jit.is_file() or jit.is_symlink() or jit.stat().st_size == 0:
@@ -1397,6 +1462,7 @@ exec setpriv --no-new-privs --inh-caps=-all --ambient-caps=-all ./run.sh --jitco
     groups = job_groups(docker_access)
     run(['systemd-run', '--quiet', '--unit=' + unit, '--property=User=ci', '--property=Group=ci'] + (['--property=SupplementaryGroups=' + ','.join(groups)] if groups else []) + ['--property=KillMode=control-group', '--property=RemainAfterExit=yes', '--property=TimeoutStopSec=10', '--property=RuntimeMaxSec=14400', '--property=WorkingDirectory=/home/ci/runner', '--property=StandardOutput=null', '--property=StandardError=null', str(script)])
     atomic(marker, 'started')
+    return 0.0
 
 def main(mode, generation, waiter, helper, docker_access=False):
     started = time.monotonic()
@@ -1418,7 +1484,7 @@ def main(mode, generation, waiter, helper, docker_access=False):
                 raise RuntimeError('helper')
             if mode == 'start':
                 set_stage('start_job')
-                start_job(generation, docker_access)
+                result['lazySettleSeconds'] = start_job(generation, docker_access)
             else:
                 if mode == 'baseline' and not baseline_path.exists():
                     set_stage('baseline_init')
@@ -1438,6 +1504,7 @@ def main(mode, generation, waiter, helper, docker_access=False):
                         # and the next generation cannot write the tree the
                         # first job chowned (2026-11-20).
                         set_stage('docker_reset')
+                        result['lazySettleSeconds'] = settle_lazy_disk(seconds=LAZY_SETTLE_SECONDS)
                         settle_docker(None)
                         allowlist = settle_images()
                         settle_docker(allowlist)
@@ -1696,11 +1763,14 @@ export function parseRefreshResult(response, generation) {
   try { result = JSON.parse(text.trim()); } catch { return null; }
   if (!result || result.gen !== generation || typeof result.ok !== 'boolean' || !Number.isFinite(result.seconds) || result.seconds < 0 || !Array.isArray(result.failed) || result.failed.some(code => !FAILURES.has(code)) || result.ok !== (result.failed.length === 0)) return null;
   if (result.baselineHash !== undefined && !/^[a-f0-9]{64}$/.test(result.baselineHash)) return null;
+  // How long the first job waited for the snapshot's lazy disk layer to copy the
+  // job tree up, so a slow first job is explainable rather than mysterious.
+  if (result.lazySettleSeconds !== undefined && (!Number.isFinite(result.lazySettleSeconds) || result.lazySettleSeconds < 0 || result.lazySettleSeconds > 600)) return null;
   const diagnostic = result.diagnostic === undefined ? null : parseDiagnostic(result.diagnostic);
   if (result.diagnostic !== undefined && (!diagnostic || result.ok)) return null;
   const drift = result.drift === undefined ? null : parseDrift(result.drift, generation);
   if (result.drift !== undefined && (!drift || result.ok)) return null;
-  return { ok: result.ok, gen: generation, seconds: result.seconds, failed: [...new Set(result.failed)], ...(result.baselineHash ? { baselineHash: result.baselineHash } : {}), ...(diagnostic ? { diagnostic } : {}), ...(drift ? { drift } : {}) };
+  return { ok: result.ok, gen: generation, seconds: result.seconds, failed: [...new Set(result.failed)], ...(result.baselineHash ? { baselineHash: result.baselineHash } : {}), ...(result.lazySettleSeconds !== undefined ? { lazySettleSeconds: result.lazySettleSeconds } : {}), ...(diagnostic ? { diagnostic } : {}), ...(drift ? { drift } : {}) };
 }
 
 export function parseRefreshDriftArtifact(text, generation, expectedDrift) {
