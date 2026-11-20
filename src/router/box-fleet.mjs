@@ -1226,7 +1226,7 @@ export class BoxFleet {
       const result = box.resetMode === 'docker' ? await this.api.dockerBaselineResult(box, box.processId) : await this.api.refreshResult(box, box.processId, 0);
       if (result === null) return;
       if (result?.ok !== true || !/^[a-f0-9]{64}$/.test(result.baselineHash ?? '')) { await this.verificationOutcome(box, 'baseline_failed', false, box.resetMode === 'docker' ? { step: result?.step ?? 'baseline', exitCode: result?.exitCode ?? null, output: result?.output ?? '' } : { step: 'baseline', failed: result?.failed ?? null, diagnostic: result?.diagnostic ?? null }); return this.transition(machineId, 'baseline_failed', { failureReason: 'baseline_failed' }); }
-      return this.transition(machineId, 'baseline_done', { baselineHash: result.baselineHash, generation: 0, ...(result.summary ? { baselineSummary: result.summary } : {}) });
+      return this.transition(machineId, 'baseline_done', { baselineHash: result.baselineHash, generation: 0, ...(result.summary ? { baselineSummary: result.summary } : {}), ...(result.lazySettleSeconds !== undefined ? { baselineLazySettleSeconds: result.lazySettleSeconds } : {}) });
     }
     if (box.state === 'ready') {
       if (options.executor === 'direct') return this.transition(machineId, 'direct_online', { executor: 'direct', online: true, onlineAt: this.now(), everOnline: true });

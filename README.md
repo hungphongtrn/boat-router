@@ -15,7 +15,7 @@ The Worker receives signed GitHub webhooks. The Durable Object keeps admission a
 - **Local runners first (optional).** With an external claimer, a queued job is offered to your own runners for `offerSeconds` (we use 60) before the router plans a Boat box for it. A claimed local runner counts as supply of its pool, so the planner does not start a box for a job that a local runner holds.
 - **Two accounts as one pool (optional).** A primary and a secondary Boat account can serve the same projects. Each start goes to the account with more free share. A refusal on the secondary account parks only that account.
 - **Lease API (optional).** An authenticated client can lease a whole box of a given size, optionally from a pinned base snapshot, upload files with a fenced write, run commands over a stream, and return the box for reuse.
-- **Snapshot boot (optional).** A project with `snapshotBoot: true` boots from a pinned Boat snapshot and falls back to a plain boot if the snapshot helper fails.
+- **Snapshot boot (optional).** A project with `snapshotBoot: true` boots from a pinned Boat snapshot and falls back to a plain boot if the snapshot helper fails. The provider serves the snapshot's disk through a lazy layer, so the baseline and a box's first job walk the job tree's metadata and wait, bounded, until no job path still resolves into that layer; `lazySettleSeconds` in the refresh result records the cost of each first job.
 - **Alerts.** The router posts webhook alerts for start windows, sandboxes, queue wait and the verification breaker. `tools/credit-alert.mjs` is a watcher module for credit runway and day-start alerts, with one message for each level and no repeats.
 
 ## Configure

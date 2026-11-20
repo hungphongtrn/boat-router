@@ -258,6 +258,16 @@ test('a retired box keeps the failing command message in its diagnostic', () => 
   }
 });
 
+test('the lazy settle time travels with a refresh result and stays bounded', () => {
+  const base = { ok: true, gen: 1, seconds: 2, failed: [], baselineHash: 'a'.repeat(64) };
+  assert.equal(parseRefreshResult({ stdout: JSON.stringify(base) }, 1)?.lazySettleSeconds, undefined);
+  assert.equal(parseRefreshResult({ stdout: JSON.stringify({ ...base, lazySettleSeconds: 12.5 }) }, 1)?.lazySettleSeconds, 12.5);
+  assert.equal(parseRefreshResult({ stdout: JSON.stringify({ ...base, lazySettleSeconds: 0 }) }, 1)?.lazySettleSeconds, 0);
+  for (const value of [-1, 601, 1e9, '4', null, true, Number.NaN]) {
+    assert.equal(parseRefreshResult({ stdout: JSON.stringify({ ...base, lazySettleSeconds: value }) }, 1), null, String(value));
+  }
+});
+
 test('job paths come from the snapshot marker and stay under /home/user', () => python(String.raw`
 import tempfile
 with tempfile.TemporaryDirectory() as directory:
