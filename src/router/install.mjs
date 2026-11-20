@@ -125,6 +125,8 @@ export function installRouter(storage, getEnv, { api, now = Date.now, logger = c
   if (selected.starts?.allowPaidExtra !== undefined && typeof selected.starts.allowPaidExtra !== 'boolean') throw new TypeError('invalid paid extra starts');
   if (selected.starts?.paidExtraMaxDollarsPerMonth !== undefined && (!Number.isFinite(selected.starts.paidExtraMaxDollarsPerMonth) || selected.starts.paidExtraMaxDollarsPerMonth < 0)) throw new TypeError('invalid paid extra budget');
   const pollRepo = getEnv().GITHUB_POLL_REPO;
+  const repoWebhook = Boolean(pollRepo && getEnv().GITHUB_WEBHOOK_SECRET);
+  const snapshotInterval = repoWebhook ? 15 * 60_000 : 60_000;
   const paidCap = getEnv().GITHUB_POLL_PAID_CAP_USD;
   if (paidCap !== undefined) {
     if (!pollRepo || !/^\d+(?:\.\d{1,2})?$/.test(paidCap) || !Number.isFinite(Number(paidCap)) || Number(paidCap) > (account.starts?.paidExtraMaxDollarsPerMonth ?? 0)) throw new TypeError('invalid poll paid extra cap');
@@ -246,13 +248,13 @@ export function installRouter(storage, getEnv, { api, now = Date.now, logger = c
         const secondaryHashes = await Promise.all(creates.filter(item => item.account === 'secondary' && eligible.has(item.createKey)).map(item => controller.sharedBudget.claimKey(item.createKey)));
         await secondaryLedger.clearOrphanPoolWaiters(config.id, createKeys, secondaryHashes);
       }
-      // Snapshot and runner records use a positive installation ID internally. Polling
+      // Snapshot and runner records use a positive installation ID internally. Repo-token mode
       // uses a placeholder only; never persist it as discovered App configuration.
       const installation = pollRepo ? 1 : await ctx.storage.get('pool:installation') ?? config.installation ?? (await records(ctx.storage, 'job:')).find(job => job.repo === config.repo && Number.isSafeInteger(job.installation))?.installation ?? (await records(ctx.storage, 'webhook-pending:')).find(event => event.repo === config.repo && Number.isSafeInteger(event.installation))?.installation;
       controller.boxFleet.installation = installation;
       if (installation && !pollRepo) await ctx.storage.put('pool:installation', installation);
       const last = await ctx.storage.get('pool:snapshot'), due = await ctx.storage.get('pool:snapshot-due'), first = !await ctx.storage.get('pool:first-snapshot');
-      if (installation && (first || !last || now() - last.at >= 60000 || due && due <= now())) {
+      if (installation && (!last || now() - last.at >= snapshotInterval || due && due <= now() || first && !repoWebhook)) {
         if (await reconcile(ctx.storage, scopedApi, config, installation, now)) await ctx.storage.put('pool:first-snapshot', true);
         await ctx.storage.delete('pool:snapshot-due');
         const current = await ctx.storage.get('pool:snapshot');
@@ -263,7 +265,8 @@ export function installRouter(storage, getEnv, { api, now = Date.now, logger = c
         }
       }
       if (!await ctx.storage.get('pool:first-snapshot')) await ctx.storage.transaction(async tx => {
-        await tx.put('pool:snapshot', { ...(await tx.get('pool:snapshot')), at: now(), complete: false });
+        const snapshot = await tx.get('pool:snapshot');
+        await tx.put('pool:snapshot', { ...snapshot, at: snapshot?.at ?? now(), complete: false });
         await tx.put('pool:snapshot-complete', false);
       });
       await ctx.storage.setAlarm(now() + 60000);
@@ -278,7 +281,7 @@ export function installRouter(storage, getEnv, { api, now = Date.now, logger = c
       const hashes = await Promise.all(createKeys.map(key => controller.sharedBudget.claimKey(key)));
       await ctx.ledger.clearOrphanPoolWaiters(config.id, createKeys, hashes);
       }
-      await ctx.storage.put('pool:installation', event.installation);
+      if (!pollRepo) await ctx.storage.put('pool:installation', event.installation);
       // a webhook event carries no run name; look the run up once per run so the job's lane is known at once.
       if (source === 'webhook' && event.status === 'queued') event = await attachLane(ctx.storage, scopedApi, config, event, now());
       await observe(ctx.storage, event, now(), source);
@@ -297,7 +300,9 @@ export function installRouter(storage, getEnv, { api, now = Date.now, logger = c
         }
       }
       if (controller.localFleet) await controller.localFleet.ingest(event);
-      if (event.status === 'queued') await ctx.storage.put('pool:snapshot-due', now() + 5000);
+      // In repo-hook mode the observation wakes admission directly. Don't turn busy webhook traffic
+      // into repeated full snapshots; the fallback scan still repairs missed events and runner state.
+      if (event.status === 'queued' && !repoWebhook) await ctx.storage.put('pool:snapshot-due', now() + 5000);
       await controller.wake(1000);
     };
     return { config, hooks, ingest: async (event, ctx) => {

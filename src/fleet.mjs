@@ -549,9 +549,19 @@ export class Fleet {
     this.env = { ...this.env, ENABLED: request.headers.get('X-Boat-CI-Enabled') === 'true' ? 'true' : 'false' };
     this.controller.env = this.setup.env = this.env;
     const url = new URL(request.url);
-    if (this.env.GITHUB_POLL_REPO && (url.pathname.startsWith('/setup') || url.pathname === '/webhook' || url.pathname === '/router/resync')) return new Response(null, { status: 404 });
+    const pollRepo = this.env.GITHUB_POLL_REPO;
+    if (pollRepo && (url.pathname.startsWith('/setup') || url.pathname === '/router/resync')) return new Response(null, { status: 404 });
     if (url.pathname.startsWith('/setup')) return this.setup.fetch(request);
     if (url.pathname === '/webhook' && request.method === 'POST') {
+      if (pollRepo) {
+        const secret = this.env.GITHUB_WEBHOOK_SECRET;
+        if (!this.router || !secret) return new Response(null, { status: 404 });
+        return webhook(request, this.env, secret, selection => this.router.ingest(selection), (name, payload) => {
+          if (name !== 'workflow_job' || payload?.repository?.full_name !== pollRepo) return null;
+          // Use the same internal placeholder as the repo-token snapshot. No App installation is consulted.
+          return this.router.select(name, { ...payload, installation: { id: 1 } });
+        });
+      }
       const { webhookSecret } = appCredentials(this.env, await this.storage.get('github-app'));
       if (this.router) return webhook(request, this.env, webhookSecret, selection => this.router.ingest(selection), (n, p) => this.router.select(n, p));
       return webhook(request, this.env, webhookSecret, event => this.controller.ingest(event));

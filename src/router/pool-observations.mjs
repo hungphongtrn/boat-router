@@ -12,7 +12,7 @@ export async function observe(storage, event, at, source = 'webhook') {
   return storage.transaction(async tx => {
     const key = `gh-job:${event.id}`, previous = await tx.get(key);
     if (previous && (previous.observedAt > at || (previous.observedAt === at && previous.source === 'webhook' && source === 'snapshot'))) return;
-    if (source === 'webhook' && previous && previous.source !== 'legacy' && ((previous.status === 'completed' && event.status !== 'completed') || (previous.status === 'in_progress' && event.status === 'queued'))) return;
+    if (previous && previous.source !== 'legacy' && ((previous.status === 'completed' && event.status !== 'completed') || (previous.status === 'in_progress' && event.status === 'queued'))) return;
     const queuedAt = event.queuedAt ?? previous?.queuedAt ?? at;
     const job = { ...previous, id: event.id, pool: poolKey(event.repo, event.label), status: event.status,
       runnerName: event.runnerName ?? null, runId: event.runId ?? null, branch: event.branch ?? previous?.branch ?? null,
