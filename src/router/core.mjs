@@ -37,11 +37,11 @@ export class Router {
     }
     return null;
   }
-  async ingest(selection) {
+  async ingest(selection, { receivedAt } = {}) {
     const project = this.projects.get(selection?.project), event = selection?.event;
     if (!project || event?.repo !== project.config.repo || !Number.isSafeInteger(event.installation) || event.installation < 1) throw new TypeError('invalid selection');
     this.localCounts = null;
-    await project.ingest(event, { storage: project.storage, ledger: this.ledger, config: project.config, hooks: project.hooks });
+    await project.ingest(event, { storage: project.storage, ledger: this.ledger, config: project.config, hooks: project.hooks, receivedAt });
     this.localCounts = null;
   }
   localCountsCache() {

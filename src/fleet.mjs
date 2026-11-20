@@ -24,6 +24,7 @@ import { SetupController, authorizedControl, authorizedLocal, hash } from './set
 import { appCredentials, moveAppSecrets } from './app-secrets.mjs';
 import { exportResponse } from './export.mjs';
 import { webhook } from './webhook.mjs';
+import { RepoWebhookInbox } from './router/repo-webhook-inbox.mjs';
 import { APIs } from './apis.mjs';
 import { ApiError, backoff, isPlanRefusal, isSizeRefusal, reservationId, runnerName, jobRunnerName, REPOSITORIES } from './domain.mjs';
 
@@ -538,6 +539,7 @@ export class Fleet {
     this.controller = new FleetController(this.storage, env, api);
     this.setup = new SetupController(this.storage, env, api, Date.now, event => this.controller.emit(event, null));
     this.router = env.PLUGIN_ROUTER === 'true' ? installRouter(this.storage, () => this.env, { api, waitUntil: promise => ctx.waitUntil(promise), deployment }) : null;
+    this.repoWebhookInbox = this.router && env.GITHUB_POLL_REPO && env.GITHUB_WEBHOOK_SECRET ? new RepoWebhookInbox(this.storage, this.router) : null;
     this.external = this.router ? new ExternalService(this.router, this.storage, this.router.externalApi ?? api, this.router.account.externalClients) : null;
     if (this.external) {
       this.router.externalSweep = () => this.external.sweep();
@@ -556,7 +558,11 @@ export class Fleet {
       if (pollRepo) {
         const secret = this.env.GITHUB_WEBHOOK_SECRET;
         if (!this.router || !secret) return new Response(null, { status: 404 });
-        return webhook(request, this.env, secret, selection => this.router.ingest(selection), (name, payload) => {
+        return webhook(request, this.env, secret, async (selection, { receivedAt, verifiedAt }) => {
+          const selectedAt = Date.now(), { event } = selection;
+          await this.repoWebhookInbox.enqueue(selection, receivedAt);
+          if (event.status === 'queued') console.info(JSON.stringify({ event: 'repo_webhook_ack', job_id: event.id, run_id: event.runId, verify_ms: verifiedAt - receivedAt, select_ms: selectedAt - verifiedAt, persist_ms: Date.now() - selectedAt }));
+        }, (name, payload) => {
           if (name !== 'workflow_job' || payload?.repository?.full_name !== pollRepo) return null;
           // Use the same internal placeholder as the repo-token snapshot. No App installation is consulted.
           return this.router.select(name, { ...payload, installation: { id: 1 } });
@@ -1284,5 +1290,5 @@ export class Fleet {
       return new Response(null, { status: 503, headers });
     }
   }
-  alarm() { return this.router ? this.router.tick() : this.controller.tick(); }
+  alarm() { return this.repoWebhookInbox ? this.repoWebhookInbox.alarm() : this.router ? this.router.tick() : this.controller.tick(); }
 }

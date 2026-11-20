@@ -170,7 +170,7 @@ export class BoxFleet {
   }
 
   async prepare(pool, size, count, queuedAt, reusable = false, options = {}) {
-    const laneFields = { ...(options.lane ? { lane: options.lane, lanePriority: options.lanePriority ?? null } : {}), ...(options.orderJobId !== undefined ? { orderJobId: options.orderJobId } : {}), ...(Number.isSafeInteger(options.orderRunId) ? { orderRunId: options.orderRunId } : {}) };
+    const laneFields = { ...(options.lane ? { lane: options.lane, lanePriority: options.lanePriority ?? null } : {}), ...(options.orderJobId !== undefined ? { orderJobId: options.orderJobId } : {}), ...(Number.isSafeInteger(options.orderRunId) ? { orderRunId: options.orderRunId } : {}), ...(options.orderSource === 'webhook' ? { orderSource: 'webhook' } : {}) };
     if (!this.budget || !Number.isSafeInteger(count) || count < 0) throw new TypeError('invalid admission');
     if (options.executor && (options.executor !== 'direct' || options.prefix !== 'direct-' || typeof options.golden !== 'string' || !options.golden)) throw new TypeError('invalid direct executor');
     if (options.resetMode !== undefined && (options.resetMode !== 'docker' || !reusable)) throw new TypeError('invalid reset mode');
@@ -230,7 +230,7 @@ export class BoxFleet {
       claim = await this.budget.claim(createKey);
       this.logger?.(JSON.stringify({ event: 'create_claim', project: this.project?.id, size: record.size, status: claim?.status ?? 'missing' }));
     }
-    let sandbox;
+    let sandbox, createMs;
     if (claim?.status !== 'pending') {
       sandbox = await this.api.findCreated(record);
       if (!sandbox) {
@@ -268,7 +268,9 @@ export class BoxFleet {
       record = { ...record, state: 'calling', callingAt: this.now(), machineTtlSeconds: ttl, ...(fingerprint ? { provisionerFingerprint: fingerprint } : {}) };
       await this.storage.put(key, record);
       try {
+        const started = this.now();
         const result = await this.api.create({ ...record, machineSize: record.size, routerReusable: record.reusable, ...(record.resetMode ? { routerResetMode: record.resetMode } : {}), ...(record.executor !== 'direct' && this.project?.dockerAccess === true ? { routerDockerAccess: true } : {}) }, ttl);
+        createMs = this.now() - started;
         sandbox = result?.sandbox;
         if (!/^bx_[23456789abcdefghjkmnpqrstuvwxyz]{8}$/.test(sandbox?.id ?? '')) throw new Error('invalid sandbox');
       } catch (error) {
@@ -307,7 +309,7 @@ export class BoxFleet {
     await afterStart?.(record, 'created');
     this.alert?.('create_failures', { value: 0, limit: 1, active: false });
     if (!await this.budget.settle(createKey, 'created')) return false;
-    this.logger?.(JSON.stringify({ event: 'create', project: this.project?.id, machine_id: sandbox.id, size: record.size }));
+    this.logger?.(JSON.stringify({ event: 'create', project: this.project?.id, machine_id: sandbox.id, size: record.size, job_id: record.orderJobId, run_id: record.orderRunId, source: record.orderSource, create_ms: createMs }));
     return this.storage.transaction(async tx => {
       const current = await tx.get(key);
       if (!current) return false;
@@ -785,7 +787,7 @@ export class BoxFleet {
         this.logger?.(JSON.stringify({ event: 'lane_borrow', project: project.id, job_id: job.id, lane: job.lane ?? null, used: laneUsed, reserved, lend, borrowed: borrowedSlots({ used: laneUsed, cap, reserved }) + 1 }));
       }
       const resetMode = reuseFor(pool.label);
-      const laneOptions = { orderJobId: job.id, orderRunId: job.runId, ...(lanesOn && job.lane ? { lane: job.lane, lanePriority: lanePriorityOf(job) } : {}) };
+      const laneOptions = { orderJobId: job.id, orderRunId: job.runId, orderSource: job.source, ...(lanesOn && job.lane ? { lane: job.lane, lanePriority: lanePriorityOf(job) } : {}) };
       await this.prepare(pool.key, pool.size, 1, job.queuedAt, resetMode !== null, executor === 'direct' ? { executor, prefix: 'direct-', golden: job.golden, ...laneOptions } : resetMode === 'docker' ? { resetMode, ...laneOptions } : laneOptions);
       if (scopedBreaker?.tripped) preparedProbes.add(pool.size);
       if (lanesOn) { const key = job.lane ?? 'none'; laneUsed[key] = (laneUsed[key] ?? 0) + 1; }
@@ -1084,7 +1086,7 @@ export class BoxFleet {
         .sort(reserveOrder)[0];
       if (!job) return null;
       if (box.slowHost === true && slowBoxYields(box, job, boxes, this.now())) return null;
-      const reserved = applyBoxEvent(box, 'reserve', { dispatchJobId: job.id, dispatchAt: this.now(), ...(job.lane ? { lane: job.lane } : {}) }, this.now());
+      const reserved = applyBoxEvent(box, 'reserve', { dispatchJobId: job.id, dispatchAt: this.now(), dispatchSource: job.source ?? null, dispatchRunId: job.runId ?? null, ...(job.lane ? { lane: job.lane } : {}) }, this.now());
       await tx.put(key, reserved);
       const queuedEvidence = await tx.get(`placement-queue:${job.id}`) ?? null;
       const placement = { at: this.now(), jobId: job.id, machineId, generation: box.generation ?? 0, boxCreatedAt: box.createdAt ?? null, bootDoneObservedAt: box.bootDoneObservedAt ?? null, boxReadyAt: box.timing?.ready ?? null, ...evidence, queuedEvidence };
@@ -1092,7 +1094,7 @@ export class BoxFleet {
       if (!snapshot?.complete) await tx.put('dispatch:snapshot-recovery-last', this.now());
       return reserved;
     });
-    if (result) this.logger?.(JSON.stringify({ event: 'boat_job_reserved', project: this.project?.id, job_id: result.dispatchJobId, machine_id: machineId, ...(result.lane ? { lane: result.lane } : {}), ...evidence }));
+    if (result) this.logger?.(JSON.stringify({ event: 'boat_job_reserved', project: this.project?.id, job_id: result.dispatchJobId, run_id: result.dispatchRunId, source: result.dispatchSource, machine_id: machineId, ...(result.lane ? { lane: result.lane } : {}), ...evidence }));
     return result;
   }
 
@@ -1295,6 +1297,7 @@ export class BoxFleet {
       box = await this.transition(machineId, 'register', { repo, installation: this.installation, label, labels, runnerName, runnerIdentity: runnerName, boxGeneration: true, routerReusable: box.reusable, ...(box.resetMode ? { routerResetMode: box.resetMode } : {}), runnerId: null });
       if (!box) return;
       try {
+        const configureAt = this.now();
         await this.api.configure(box, async runnerId => {
           await this.storage.transaction(async tx => {
             const current = await tx.get(`box:${machineId}`);
@@ -1303,6 +1306,7 @@ export class BoxFleet {
             await tx.put(`runner:${runnerName}`, { kind: 'boat', machineId, generation: box.generation });
           });
         });
+        const configureMs = this.now() - configureAt;
         box = await this.storage.get(`box:${machineId}`);
         if (!box?.runnerId) throw new Error('runner missing');
         if (this.project?.dispatchOnly === true) {
@@ -1311,8 +1315,10 @@ export class BoxFleet {
           // a matrix shard reservation moves to another queued shard of its run; the runner still starts.
           if (lost && !await this.retargetMatrixReservation(machineId, 'registering')) return this.transition(machineId, lost, lost === 'reservation_timeout' ? { reservationExpiredJobId: box.dispatchJobId } : {});
         }
+        const startAt = this.now();
         const result = await this.api.start(box);
         if (result?.success === false) throw new Error('start failed');
+        this.logger?.(JSON.stringify({ event: 'boat_runner_started', project, machine_id: machineId, job_id: box.dispatchJobId, run_id: box.dispatchRunId, source: box.dispatchSource, configure_ms: configureMs, start_ms: this.now() - startAt }));
         return this.transition(machineId, 'start', { startedAt: this.now(), online: false, everOnline: false, onlineAt: null, offlineSince: null });
       } catch (error) {
         const detail = box.generation > 0 ? { step: 're-register runner', exitCode: null, output: '', service: ['boat', 'github'].includes(error?.service) ? error.service : null, status: Number.isInteger(error?.status) && error.status >= 0 && error.status <= 599 ? error.status : null } : undefined;

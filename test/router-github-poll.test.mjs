@@ -9,7 +9,7 @@ import { Storage } from './helpers.mjs';
 const repo = 'hungphongtrn/peek';
 const env = { BOAT_WALLET: 'peek', BOAT_PROVIDER_WALLET: 'provider', ROUTER_PROJECTS: 'peek', ENABLED: 'false', GITHUB_POLL_REPO: repo, GITHUB_POLL_TOKEN: 'test-poll-token', GITHUB_POLL_PAID_CAP_USD: '1.50' };
 
-test('a signed repo hook and an overlapping poll start only one Boat box for the same job', async t => {
+test('a signed repo hook acknowledges before admission and starts one Boat box even when a poll sees the same job', { timeout: 5000 }, async t => {
   const secret = 'test-repo-secret';
   const job = { id: 52, run_id: 912, status: 'queued', labels: ['peek-router'], name: 'ci' };
   let now = Date.now();
@@ -57,11 +57,22 @@ test('a signed repo hook and an overlapping poll start only one Boat box for the
   assert.equal((await post('ping', {})).status, 204);
   assert.equal((await post('workflow_job', payload, 'wrong-key')).status, 401);
   assert.equal((await post('workflow_job', { ...payload, repository: { full_name: 'other/repo' } })).status, 204);
+  const project = fleet.router.projects.get('peek');
+  const ingest = project.ingest;
+  let ingested = false;
+  project.ingest = (...args) => { ingested = true; return ingest(...args); };
+  const received = performance.now();
+  assert.equal((await post('workflow_job', payload)).status, 202);
+  assert.ok(performance.now() - received < 1000);
+  assert.equal(ingested, false, 'ack does not wait for router ingestion');
+  assert.equal(starts, 0);
+  assert.ok(await storage.getAlarm() <= now + 1000, 'ack leaves a durable wakeup');
   const tick = fleet.alarm();
   await Promise.race([polling, tick.then(() => assert.fail('no GitHub scan'))]);
-  try { assert.equal((await post('workflow_job', payload)).status, 202); }
+  try { assert.ok(await storage.get('project:peek:gh-job:52')); }
   finally { resume(); }
   await tick;
+  assert.equal(starts, 1, 'the webhook alarm starts without waiting for the minute sweep');
   assert.equal((await post('workflow_job', payload)).status, 202);
   now += 60_000;
   await fleet.alarm();

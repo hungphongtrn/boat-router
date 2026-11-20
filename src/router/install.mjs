@@ -284,7 +284,7 @@ export function installRouter(storage, getEnv, { api, now = Date.now, logger = c
       if (!pollRepo) await ctx.storage.put('pool:installation', event.installation);
       // a webhook event carries no run name; look the run up once per run so the job's lane is known at once.
       if (source === 'webhook' && event.status === 'queued') event = await attachLane(ctx.storage, scopedApi, config, event, now());
-      await observe(ctx.storage, event, now(), source);
+      await observe(ctx.storage, event, ctx.receivedAt ?? now(), source);
       if (event.status === 'queued' && !await ctx.storage.get(`placement-queue:${event.id}`)) {
         const evidence = placementEvidence(router?.localCapacity, now(), getEnv().CI_TO_MINIS !== 'false');
         await ctx.storage.put(`placement-queue:${event.id}`, { at: now(), ...evidence, ...(evidence.reason === 'no_claim_in_time' ? { reason: 'queue_observation' } : {}) });
@@ -303,7 +303,7 @@ export function installRouter(storage, getEnv, { api, now = Date.now, logger = c
       // In repo-hook mode the observation wakes admission directly. Don't turn busy webhook traffic
       // into repeated full snapshots; the fallback scan still repairs missed events and runner state.
       if (event.status === 'queued' && !repoWebhook) await ctx.storage.put('pool:snapshot-due', now() + 5000);
-      await controller.wake(1000);
+      if (ctx.receivedAt === undefined) await controller.wake(1000);
     };
     return { config, hooks, ingest: async (event, ctx) => {
       return ingestPool(event, ctx);
