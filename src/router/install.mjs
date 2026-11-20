@@ -125,6 +125,15 @@ export function installRouter(storage, getEnv, { api, now = Date.now, logger = c
   if (selected.starts?.allowPaidExtra !== undefined && typeof selected.starts.allowPaidExtra !== 'boolean') throw new TypeError('invalid paid extra starts');
   if (selected.starts?.paidExtraMaxDollarsPerMonth !== undefined && (!Number.isFinite(selected.starts.paidExtraMaxDollarsPerMonth) || selected.starts.paidExtraMaxDollarsPerMonth < 0)) throw new TypeError('invalid paid extra budget');
   const pollRepo = getEnv().GITHUB_POLL_REPO;
+  // Local repository routing can drain demand immediately rather than spread
+  // starts across 24 hours. The ledger still enforces provider windows,
+  // concurrency, FIFO and the rolling paid-extra budget. Deployed App routing
+  // keeps its existing policy unless this local-only override is supplied.
+  const pollUnpaced = getEnv().GITHUB_POLL_UNPACED;
+  if (pollUnpaced !== undefined) {
+    if (!pollRepo || !['true', 'false'].includes(pollUnpaced)) throw new TypeError('invalid poll unpaced mode');
+    account.poolPacing = { ...account.poolPacing, unpaced: pollUnpaced === 'true' };
+  }
   const repoWebhook = Boolean(pollRepo && getEnv().GITHUB_WEBHOOK_SECRET);
   const snapshotInterval = repoWebhook ? 15 * 60_000 : 60_000;
   const paidCap = getEnv().GITHUB_POLL_PAID_CAP_USD;

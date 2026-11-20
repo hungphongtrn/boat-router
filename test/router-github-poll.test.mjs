@@ -5,9 +5,37 @@ import { APIs } from '../src/apis.mjs';
 import { Fleet } from '../src/fleet.mjs';
 import { installRouter } from '../src/router/install.mjs';
 import { Storage } from './helpers.mjs';
+import { snapshotLimits } from '../src/router/ledger.mjs';
 
 const repo = 'hungphongtrn/peek';
 const env = { BOAT_WALLET: 'peek', BOAT_PROVIDER_WALLET: 'provider', ROUTER_PROJECTS: 'peek', ENABLED: 'false', GITHUB_POLL_REPO: repo, GITHUB_POLL_TOKEN: 'test-poll-token', GITHUB_POLL_PAID_CAP_USD: '1.50' };
+
+test('local unpaced admission drains a spent pacing floor but preserves FIFO, provider limits and paid budget', async () => {
+  const now = () => 100_000_000;
+  const storage = new Storage();
+  const localEnv = { ...env, GITHUB_POLL_UNPACED: 'true' };
+  const router = installRouter(storage, () => localEnv, { api: new APIs(localEnv), now, logger: () => {} });
+  assert.equal(router.account.poolPacing.unpaced, true);
+  assert.equal(router.account.starts.paidExtraMaxDollarsPerMonth, 1.5);
+  const ledger = router.ledger;
+  await storage.put(ledger.key, { claims: {}, waiting: [], dynamicPacing: { at: now(), credit: 0.13, ratePerMs: 4 / 3_600_000, floorStarts: [{ key: 'used1', at: now() }, { key: 'used2', at: now() }], floorOverflow: [] } });
+  await ledger.enqueue('peek', 'oldest', now() - 2000);
+  await ledger.enqueue('peek', 'next', now() - 1000);
+  const limits = (changes = {}) => snapshotLimits({ canStart: true, activeSandboxes: 15, maxActiveSandboxes: 100, nextStartDollars: 0, starts: { minute: { limit: 12, used: 0 }, hour: { limit: 60, used: 9 }, day: { limit: 200, used: 138 } }, ...changes }, now());
+  assert.equal((await ledger.admit('peek', 'next', limits(), { pool: true })).reason, 'fairness');
+  assert.equal((await ledger.admit('peek', 'oldest', limits(), { pool: true })).ok, true);
+  assert.equal((await ledger.admit('peek', 'next', limits(), { pool: true })).ok, true);
+  await ledger.enqueue('peek', 'blocked');
+  assert.equal((await ledger.admit('peek', 'blocked', limits({ activeSandboxes: 100 }), { pool: true })).reason, 'concurrency');
+  const full = { minute: { limit: 12, used: 12 }, hour: { limit: 60, used: 9 }, day: { limit: 200, used: 138 } };
+  assert.equal((await ledger.admit('peek', 'blocked', limits({ starts: full }), { pool: true })).reason, 'minute_cap');
+  const state = await storage.get(ledger.key);
+  state.paidExtraSpend = [{ at: now(), dollars: 1.5 }];
+  await storage.put(ledger.key, state);
+  assert.equal((await ledger.admit('peek', 'blocked', limits({ nextStartDollars: 0.03 }), { pool: true })).reason, 'paid_extra_budget');
+  assert.equal(installRouter(new Storage(), () => env, { api: new APIs(env), now, logger: () => {} }).account.poolPacing.unpaced, false);
+  assert.throws(() => installRouter(new Storage(), () => ({ ...env, GITHUB_POLL_UNPACED: 'yes' }), { api: new APIs(env), now }), /invalid poll unpaced/);
+});
 
 test('a signed repo hook acknowledges before admission and starts one Boat box even when a poll sees the same job', { timeout: 5000 }, async t => {
   const secret = 'test-repo-secret';
