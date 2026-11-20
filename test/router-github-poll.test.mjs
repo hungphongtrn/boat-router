@@ -17,7 +17,7 @@ test('a signed repo hook and an overlapping poll start only one Boat box for the
   let entered, resume;
   const polling = new Promise(resolve => { entered = resolve; });
   const paused = new Promise(resolve => { resume = resolve; });
-  let starts = 0, scans = 0;
+  let starts = 0, scans = 0, runLookups = 0;
   t.mock.method(globalThis, 'fetch', async (url, { method = 'GET', headers } = {}) => {
     const u = new URL(url), path = u.pathname;
     if (u.hostname === 'boat.dev') {
@@ -33,7 +33,10 @@ test('a signed repo hook and an overlapping poll start only one Boat box for the
     }
     assert.equal(headers.Authorization, 'Bearer test-poll-token');
     if (path.endsWith('/runners')) return Response.json({ total_count: 0, runners: [] });
-    if (path.endsWith(`/runs/${job.run_id}`)) return Response.json({ display_title: 'CI', path: '.github/workflows/ci.yml' });
+    if (path.endsWith(`/runs/${job.run_id}`)) {
+      runLookups++;
+      return Response.json({ display_title: 'CI', path: '.github/workflows/ci.yml' });
+    }
     if (path.endsWith('/jobs')) {
       scans++;
       entered();
@@ -64,6 +67,7 @@ test('a signed repo hook and an overlapping poll start only one Boat box for the
   await fleet.alarm();
   assert.equal(starts, 1);
   assert.equal(scans, 1);
+  assert.equal(runLookups, 0, 'a non-matrix job does not need a workflow path lookup');
 });
 
 test('pool reconciles with a user token without App credentials or a webhook installation', async () => {

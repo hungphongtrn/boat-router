@@ -239,7 +239,7 @@ export function runNameKey(runId) { return `${RUN_NAME_PREFIX}${runId}`; }
 // A failed lookup leaves the event without a lane; the next snapshot names it.
 export async function attachLane(storage, api, config, event, now) {
   const needsName = laneRules(config).length && !event?.runName;
-  const needsPath = !event?.workflowPath && config.workflowConcurrency?.some(rule => rule.workflowPath);
+  const needsPath = !event?.workflowPath && config.workflowConcurrency?.some(rule => rule.workflowPath && event?.jobName?.startsWith(rule.jobPrefix));
   if ((!needsName && !needsPath) || !Number.isSafeInteger(event?.runId)) return event;
   const key = runNameKey(event.runId);
   let cached = await storage.get(key);
