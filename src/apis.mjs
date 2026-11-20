@@ -172,7 +172,12 @@ export class APIs {
     });
   }
   refresh(job, mode, generation) {
-    return this.request('boat', `/sandboxes/${job.machineId}/commands`, { method: 'POST', body: { command: refreshCommand(mode, generation), detached: true } });
+    const submit = () => this.request('boat', `/sandboxes/${job.machineId}/commands`, { method: 'POST', body: { command: refreshCommand(mode, generation), detached: true } });
+    // A baseline or reset command that never reached Boat is a transport fault, not a fault of the box:
+    // one retry keeps a paid box that would otherwise be retired as baseline_failed (2026-11-20,
+    // bx_jkrtk8m2). The controller holds a lock and writes one result file, so a second submission
+    // converges on the same state.
+    return submit().catch(error => error?.status === 0 ? submit() : Promise.reject(error));
   }
   async refreshResult(job, processId, generation) {
     if (!Number.isSafeInteger(processId) || processId < 1) throw new ApiError('boat', 502);
