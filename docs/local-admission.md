@@ -56,3 +56,23 @@ With the local override and the authenticated reconcile endpoint, the pending
 creates became Boat sandboxes without editing SQLite or refunding claims.
 An existing queue's total wait includes the pre-fix stall; snapshot cloning and
 runner bootstrap add further time and must be measured separately from admission.
+
+## Definite registration rejection and stall detection
+
+A GitHub 400/401/403/404/422 during registration, before any runner id was saved,
+is a definite refusal, not an uncertain start. After two minutes and a later
+complete runner/job snapshot proving absence, the normal quarantine release,
+destroy and purge transitions retire that box. Existing quarantines recover
+from their generation-specific diagnostic evidence. Transport errors, 408/429,
+5xx, saved runners and running jobs retain the original conservative handling.
+Both project and provider slots remain occupied until cleanup finishes.
+
+If enabled demand has no usable live box or recent provider create for 15
+minutes, the router logs `router_stalled` with `level=error`, demand, occupied
+and quarantined box counts. Quarantines are not usable capacity. The timer is
+durable, resets when capacity returns, and repeats at most every 15 minutes.
+Inspect the local alarm with:
+
+```sh
+journalctl --user -u peek-boat-router.service --no-pager | grep router_stalled
+```

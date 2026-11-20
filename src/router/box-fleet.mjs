@@ -1,6 +1,8 @@
 import { runnableDemand, matchesWorkflowRule } from './workflow-demand.mjs';
 import { plan, poolKey, poolSize, supplyCounts, uncovered, localOfferActive } from './pool.mjs';
 import { records } from './pool-records.mjs';
+import { registrationRejected, rejectedRegistrationAbsent } from './registration-recovery.mjs';
+import { observeRouterStall } from './stall-alarm.mjs';
 import { isPlanRefusal, isSizeRefusal } from '../domain.mjs';
 import { prunePool, RETENTION } from './pool-prune.mjs';
 import { waitClaims } from './wait-for-busy.mjs';
@@ -660,6 +662,7 @@ export class BoxFleet {
         if (previous?.reason?.startsWith('ledger:')) status = { ...status, reason: previous.reason };
       }
       await this.storage.put(`pool:status:${pool.label}`, status);
+      await observeRouterStall(this.storage, { project: project.id, pool: pool.key, demand: status.D, boxes, creates, now, enabled: mode === 'on' && env.ENABLED === 'true', logger: this.logger });
       await this.storage.transaction(async tx => {
         const key = `pool:snapshot-hold:${pool.label}`, hold = await tx.get(key);
         if (complete) { if (hold) await tx.delete(key); return; }
@@ -1299,7 +1302,7 @@ export class BoxFleet {
       // whose runs-on names a pool label plus a Boat label can land here and never on a mini runner.
       for (const extra of this.project?.boatLabels ?? []) if (!labels.includes(extra)) labels.push(extra);
       const runnerName = `boat-${project}-${machineId}-g${box.generation}`;
-      box = await this.transition(machineId, 'register', { repo, installation: this.installation, label, labels, runnerName, runnerIdentity: runnerName, boxGeneration: true, routerReusable: box.reusable, ...(box.resetMode ? { routerResetMode: box.resetMode } : {}), runnerId: null });
+      box = await this.transition(machineId, 'register', { repo, installation: this.installation, label, labels, runnerName, runnerIdentity: runnerName, boxGeneration: true, routerReusable: box.reusable, ...(box.resetMode ? { routerResetMode: box.resetMode } : {}), runnerId: null, registrationRejected: false });
       if (!box) return;
       try {
         const configureAt = this.now();
@@ -1328,7 +1331,8 @@ export class BoxFleet {
       } catch (error) {
         const detail = box.generation > 0 ? { step: 're-register runner', exitCode: null, output: '', service: ['boat', 'github'].includes(error?.service) ? error.service : null, status: Number.isInteger(error?.status) && error.status >= 0 && error.status <= 599 ? error.status : null } : undefined;
         await this.verificationOutcome(box, 'registration_uncertain', false, detail);
-        return this.transition(machineId, 'registration_failed', { failureReason: 'registration_uncertain' });
+        const current = await this.storage.get(`box:${machineId}`);
+        return this.transition(machineId, 'registration_failed', { failureReason: 'registration_uncertain', registrationRejected: registrationRejected(error, current) });
       }
     }
     if (box.state === 'finished') {
@@ -1373,6 +1377,10 @@ export class BoxFleet {
       return this.transition(machineId, 'reset_done', { runnerId: null, runnerName: null, runnerIdentity: null, runnerFenced: false, ...(result.summary ? { lastResetSummary: result.summary, ...healthFields(result.summary.health) } : {}) });
     }
     if (box.state === 'quarantined' && snapshot.complete === true) {
+      if (await rejectedRegistrationAbsent(this.storage, box, snapshot, this.now())) {
+        this.logger?.(JSON.stringify({ event: 'registration_rejection_released', project: this.project?.id, machine_id: machineId, generation: box.generation }));
+        return this.transition(machineId, 'quarantine_release', { runnerFenced: true, retirementReason: 'registration_rejected' });
+      }
       const prefix = box.orphan ? `boat-${this.project?.id}-${box.machineId}-g` : null;
       const matching = (snapshot.runners ?? []).filter(item => item.name === box.runnerName || (box.runnerId && item.id === box.runnerId) || (box.orphan && ((box.aliases ?? []).includes(item.name) || item.name?.startsWith(prefix))));
       if (matching.length > 1) return;
