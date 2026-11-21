@@ -297,7 +297,11 @@ export class BoxFleet {
           if (await this.budget.settle(createKey, 'not_created')) { await afterStart?.(record, 'not_created'); await this.discardCreate(createKey); }
           return false;
         }
-        this.logger?.(JSON.stringify({ event: 'create_failed', project: this.project?.id, size: record.size, boot: record.bootPath ?? null, ...failureDetail(error) }));
+        const detail = failureDetail(error);
+        this.logger?.(JSON.stringify({ event: 'create_failed', project: this.project?.id, size: record.size, boot: record.bootPath ?? null, ...detail }));
+        // The pool tick's log does not reach the unit's journal, so the stored last-error is where a
+        // failed create names its cause.
+        await this.storage.put('pool:last-error', { at: this.now(), stage: 'create', createKey, ...detail });
         if (!limited(error)) this.alert?.('create_failures', { value: 1, limit: 1, active: true });
         if (limited(error) || (error?.service === 'boat' && error.status === 503)) {
           const delay = Math.max(30_000, Math.min(900_000, (error.retrySeconds ?? 0) * 1000));
