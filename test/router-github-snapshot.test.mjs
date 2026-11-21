@@ -72,3 +72,34 @@ test('old cached run pages without paths are refreshed even with an etag', async
   assert.equal(seen.find(x => x.path === key).etag, null);
   assert.equal(result.jobs[0].workflow_path, '.github/workflows/full-suite.yml');
 });
+
+test('a failed scan records the call and status that broke it', async () => {
+  const api = async (_repo, path) => path.includes('/runners?')
+    ? { status: 502, data: { message: 'bad gateway' } }
+    : { status: 200, data: { total_count: 0, workflow_runs: [] } };
+  const result = await snapshot(api, 'owner/repo');
+  assert.equal(result.complete, false);
+  assert.deepEqual(result.failure, { message: 'snapshot_page', call: '/actions/runners?per_page=100&page=1', status: 502 });
+});
+
+test('a transport failure records the adapter status and code', async () => {
+  const api = async () => { throw Object.assign(Error('github HTTP 0'), { status: 0, code: 'transport_or_response' }); };
+  const result = await snapshot(api, 'owner/repo');
+  assert.equal(result.complete, false);
+  assert.equal(result.failure.status, 0);
+  assert.equal(result.failure.code, 'transport_or_response');
+  assert.match(result.failure.call, /^\/actions\/runs\?status=queued/);
+});
+
+test('a budget-limited scan reports no failure', async () => {
+  const runs = Array.from({ length: 49 }, (_, i) => ({ id: i + 1 }));
+  const api = async (_repo, path) => {
+    const field = path.includes('/jobs?') ? 'jobs' : path.includes('/runners?') ? 'runners' : 'workflow_runs';
+    const rows = field === 'workflow_runs' && path.includes('status=queued') ? runs : field === 'jobs' ? [{ id: Number(path.match(/runs\/(\d+)/)[1]) }] : [];
+    return { status: 200, data: { total_count: rows.length, [field]: rows } };
+  };
+  const first = await snapshot(api, 'owner/repo', { budget: 40 });
+  assert.equal(first.complete, false);
+  assert.ok(first.partial);
+  assert.equal(first.failure.message, 'snapshot_budget');
+});

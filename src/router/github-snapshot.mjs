@@ -12,12 +12,15 @@ function compact(row, keys) {
 
 export async function snapshot(api, repo, { etags = {}, pages: cached = {}, partial = null, budget = 40 } = {}) {
   const pages = {}, nextEtags = {}, jobs = [], runners = [], runs = new Map();
-  let calls = 0, rateRemaining = null, progress = null;
+  let calls = 0, rateRemaining = null, progress = null, call = null;
   async function get(path, field) {
     if (calls >= budget) throw new Error('snapshot_budget');
     calls++;
+    // The scan remembers the page it is on, so a failure names the call that broke.
+    call = { path, status: null };
     const missingRunPaths = field === 'workflow_runs' && cached[path]?.workflow_runs?.some(run => typeof run.path !== 'string' || typeof run.display_title !== 'string');
     const response = await api(repo, path, missingRunPaths ? null : etags[path] ?? null);
+    call.status = Number.isFinite(response?.status) ? response.status : null;
     if (Number.isFinite(response.rateRemaining)) rateRemaining = response.rateRemaining;
     const data = response.status === 304 ? cached[path] : response.data;
     if ((response.status !== 200 && response.status !== 304) || !data || typeof data !== 'object') throw new Error('snapshot_page');
@@ -58,6 +61,12 @@ export async function snapshot(api, repo, { etags = {}, pages: cached = {}, part
     runners.push(...await list('/actions/runners', 'runners'));
     return { complete: true, jobs, runners, etags: nextEtags, pages, rateRemaining, calls };
   } catch (error) {
-    return { complete: false, jobs: [], runners: [], etags, pages: cached, rateRemaining, calls, ...(error.message === 'snapshot_budget' && progress ? { partial: progress } : {}) };
+    const failure = {
+      message: typeof error?.message === 'string' && error.message ? error.message : 'snapshot_failed',
+      call: call?.path ?? null,
+      status: Number.isFinite(error?.status) ? error.status : call?.status ?? null,
+      ...(typeof error?.code === 'string' ? { code: error.code } : {}),
+    };
+    return { complete: false, jobs: [], runners: [], etags, pages: cached, rateRemaining, calls, failure, ...(error.message === 'snapshot_budget' && progress ? { partial: progress } : {}) };
   }
 }

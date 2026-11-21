@@ -276,14 +276,22 @@ export function installRouter(storage, getEnv, { api, now = Date.now, logger = c
       controller.boxFleet.installation = installation;
       if (installation && !pollRepo) await ctx.storage.put('pool:installation', installation);
       const last = await ctx.storage.get('pool:snapshot'), due = await ctx.storage.get('pool:snapshot-due'), first = !await ctx.storage.get('pool:first-snapshot');
+      let snapshotDue = null;
       if (installation && (!last || now() - last.at >= snapshotInterval || due && due <= now() || first && !repoWebhook)) {
-        if (await reconcile(ctx.storage, scopedApi, config, installation, now)) await ctx.storage.put('pool:first-snapshot', true);
+        const wasFailed = last?.complete === false && Boolean(last.failure);
+        const complete = await reconcile(ctx.storage, scopedApi, config, installation, now);
+        if (complete) await ctx.storage.put('pool:first-snapshot', true);
         await ctx.storage.delete('pool:snapshot-due');
         const current = await ctx.storage.get('pool:snapshot');
+        if (!complete && current?.failure) logger(JSON.stringify({ event: 'snapshot_failed', project: config.id, repo: config.repo,
+          message: current.failure.message, call: current.failure.call ?? null, status: current.failure.status ?? null,
+          ...(current.failure.code ? { code: current.failure.code } : {}), failures: current.failures ?? 1, calls: current.calls ?? null,
+          retry_in_ms: Math.max(0, (snapshotResumeAt(current, now()) ?? now() + snapshotInterval) - now()) }));
+        else if (complete && wasFailed) logger(JSON.stringify({ event: 'snapshot_recovered', project: config.id, repo: config.repo }));
         const resumeAt = snapshotResumeAt(current, now());
         if (resumeAt !== null) {
+          snapshotDue = resumeAt;
           await ctx.storage.put('pool:snapshot-due', resumeAt);
-          await ctx.storage.setAlarm(resumeAt);
         }
       }
       if (!await ctx.storage.get('pool:first-snapshot')) await ctx.storage.transaction(async tx => {
@@ -291,7 +299,8 @@ export function installRouter(storage, getEnv, { api, now = Date.now, logger = c
         await tx.put('pool:snapshot', { ...snapshot, at: snapshot?.at ?? now(), complete: false });
         await tx.put('pool:snapshot-complete', false);
       });
-      await ctx.storage.setAlarm(now() + 60000);
+      // A scheduled retry may be sooner than the regular minute tick; never lose it.
+      await ctx.storage.setAlarm(snapshotDue === null ? now() + 60000 : Math.min(now() + 60000, snapshotDue));
     };
     const ingestPool = async (event, ctx, source = 'webhook') => {
       const controller = poolFor(ctx);

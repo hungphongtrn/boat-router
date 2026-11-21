@@ -4,8 +4,16 @@ import { selectWorkflowJob } from './select.mjs';
 import { recordDuration } from './wait-for-busy.mjs';
 import { records } from './pool-records.mjs';
 
+// A failed scan retries soon: 15 s, then doubling to a 2 min ceiling. Waiting the full
+// snapshotInterval after a transport failure froze admission for 15 minutes while the host
+// was loaded enough to time out a scan that a quiet replay completed.
 export function snapshotResumeAt(snapshot, now) {
-  return snapshot?.partialScan && Number.isFinite(snapshot.rateRemaining) && snapshot.rateRemaining > 2500 ? now + 5000 : null;
+  if (snapshot?.partialScan && Number.isFinite(snapshot.rateRemaining) && snapshot.rateRemaining > 2500) return now + 5000;
+  if (snapshot?.complete === false && snapshot.failure) {
+    const failures = Math.max(1, Number(snapshot.failures) || 1);
+    return now + Math.min(15_000 * 2 ** (failures - 1), 120_000);
+  }
+  return null;
 }
 
 export async function observe(storage, event, at, source = 'webhook') {
@@ -32,7 +40,8 @@ async function saveSnapshot(storage, value) {
   const chunks = serialized.match(/[\s\S]{1,100000}/g) ?? [];
   let snapshot = { ...metadata, partialScan: Boolean(partial), format: 2, cacheChunks: chunks.length };
   if (new TextEncoder().encode(JSON.stringify(snapshot)).length > 1_000_000) {
-    snapshot = { at: value.at, complete: false, rateRemaining: value.rateRemaining, format: 2, cacheChunks: 0 };
+    snapshot = { at: value.at, complete: false, rateRemaining: value.rateRemaining, format: 2, cacheChunks: 0,
+      ...(value.failure ? { failures: value.failures, failure: value.failure } : {}) };
     chunks.length = 0;
   }
   await storage.transaction(async tx => {
@@ -65,7 +74,11 @@ export async function reconcile(storage, api, config, installation, now = Date.n
   const start = previous.partial?.startedAt ?? tickStart;
   const view = await snapshot((_repo, path, etag) => api.snapshotPage({ repo: config.repo, installation }, path, etag), config.repo, previous);
   if (!view.complete) {
-    await saveSnapshot(storage, { ...previous, at: tickStart, complete: false, rateRemaining: view.rateRemaining, partial: view.partial ? { ...view.partial, startedAt: start } : null });
+    const partial = view.partial ? { ...view.partial, startedAt: start } : null;
+    // A budget-limited partial scan is progress, not a failure: it keeps the failure count it had.
+    const failures = partial ? Number(previous.failures) || 0 : (Number(previous.failures) || 0) + 1;
+    await saveSnapshot(storage, { ...previous, at: tickStart, complete: false, rateRemaining: view.rateRemaining, partial, failures,
+      failure: partial ? null : view.failure ?? { message: 'snapshot_incomplete', call: null, status: null } });
     return false;
   }
   const observedAt = start;
@@ -93,5 +106,5 @@ export async function reconcile(storage, api, config, installation, now = Date.n
       if (event) await observe(storage, event, start, 'snapshot');
     } catch { /* Keep the missing record until a later confirmation. */ }
   }
-  return saveSnapshot(storage, { ...view, at: tickStart });
+  return saveSnapshot(storage, { ...view, at: tickStart, failures: 0, failure: null });
 }

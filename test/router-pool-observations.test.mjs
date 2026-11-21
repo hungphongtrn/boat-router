@@ -79,6 +79,49 @@ test('partial snapshot resumes quickly only with sufficient GitHub quota', async
   assert.equal(snapshotResumeAt({ complete: true, rateRemaining: 4000 }, 1000), null);
 });
 
+test('a failed scan retries from 15 s, doubling to a 2 min ceiling, and recovers', async () => {
+  const { snapshotResumeAt } = await import('../src/router/pool-observations.mjs');
+  const storage = new Storage();
+  const failing = { snapshotPage: async () => { throw Object.assign(Error('github HTTP 502'), { status: 502, code: 'transport_or_response' }); } };
+  const delays = [];
+  for (let attempt = 1; attempt <= 5; attempt++) {
+    assert.equal(await reconcile(storage, failing, config, 1, () => 1000), false);
+    const snapshot = await storage.get('pool:snapshot');
+    assert.equal(snapshot.complete, false);
+    assert.equal(snapshot.failures, attempt);
+    assert.equal(snapshot.failure.status, 502);
+    assert.equal(snapshot.failure.code, 'transport_or_response');
+    delays.push(snapshotResumeAt(snapshot, 1000) - 1000);
+  }
+  assert.deepEqual(delays, [15_000, 30_000, 60_000, 120_000, 120_000]);
+  const healthy = { snapshotPage: async (_job, path) => path.includes('/runners?')
+    ? { status: 200, data: { total_count: 0, runners: [] } }
+    : { status: 200, data: { total_count: 0, workflow_runs: [] } } };
+  assert.equal(await reconcile(storage, healthy, config, 1, () => 1000), true);
+  const snapshot = await storage.get('pool:snapshot');
+  assert.equal(snapshot.failures, 0);
+  assert.equal(snapshot.failure, null);
+  assert.equal(snapshotResumeAt(snapshot, 1000), null);
+});
+
+test('a budget-limited partial scan keeps its failure count and its 5 s resume', async () => {
+  const { snapshotResumeAt } = await import('../src/router/pool-observations.mjs');
+  const storage = new Storage();
+  const runs = Array.from({ length: 49 }, (_, i) => ({ id: i + 1 }));
+  const api = { snapshotPage: async (_job, path) => {
+    const field = path.includes('/jobs?') ? 'jobs' : path.includes('/runners?') ? 'runners' : 'workflow_runs';
+    const rows = field === 'workflow_runs' && path.includes('status=queued') ? runs : field === 'jobs' ? [{ id: Number(path.match(/runs\/(\d+)/)[1]) }] : [];
+    return { status: 200, rateRemaining: 4000, data: { total_count: rows.length, [field]: rows } };
+  } };
+  await reconcile(storage, { snapshotPage: async () => { throw Object.assign(Error('github HTTP 502'), { status: 502 }); } }, config, 1, () => 1000);
+  assert.equal(await reconcile(storage, api, config, 1, () => 1000), false);
+  const snapshot = await storage.get('pool:snapshot');
+  assert.equal(snapshot.partialScan, true);
+  assert.equal(snapshot.failures, 1);
+  assert.equal(snapshot.failure, null);
+  assert.equal(snapshotResumeAt(snapshot, 1000), 6000);
+});
+
 test('a later webhook retains the workflow path learned from the snapshot', async () => {
   const storage = new Storage();
   await observe(storage, { ...event, workflowPath: '.github/workflows/full-suite.yml' }, 10, 'snapshot');

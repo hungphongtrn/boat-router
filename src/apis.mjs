@@ -96,8 +96,10 @@ export class APIs {
       throw error;
     }
   }
+  // A snapshot scan makes up to 40 calls on a loaded host; a 10 s per-call timeout failed the
+  // whole scan on a box that answers in 20 s, so only the scan gets the longer budget.
   snapshotPage(job, path, etag) {
-    return this.github(job, path, { metadata: true, headers: etag ? { 'If-None-Match': etag } : {} });
+    return this.github(job, path, { metadata: true, timeoutMs: 30_000, headers: etag ? { 'If-None-Match': etag } : {} });
   }
   getJob(job, id = job.assignedJobId ?? job.id) { return this.github(job, `/actions/jobs/${id}`); }
   getRun(job, id) { return this.github(job, `/actions/runs/${id}`); }
