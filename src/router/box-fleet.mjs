@@ -96,6 +96,9 @@ export function largerDemandExpected(jobs, project, size, now) {
 }
 
 const limited = error => error?.service === 'boat' && (error.status === 429 || ['trial_compute_limit_reached', 'quota_exceeded', 'limit_exceeded', 'rate_limited'].includes(String(error.code?.code ?? error.code?.type ?? error.code ?? '').toLowerCase()));
+// What a provider failure says, for the log and the stored last-error: a create that fails here is
+// otherwise only visible as "a create did not happen", which names no cause.
+const failureDetail = error => ({ status: error?.status ?? null, code: String(error?.code?.code ?? error?.code?.type ?? error?.code ?? '') || null, retry_s: Number.isFinite(error?.retrySeconds) ? error.retrySeconds : null });
 
 export function placementEvidence(capacity, now, enabled = true) {
   if (!enabled) return { reason: 'project_disabled', categories: [], capacity: null };
@@ -294,6 +297,7 @@ export class BoxFleet {
           if (await this.budget.settle(createKey, 'not_created')) { await afterStart?.(record, 'not_created'); await this.discardCreate(createKey); }
           return false;
         }
+        this.logger?.(JSON.stringify({ event: 'create_failed', project: this.project?.id, size: record.size, boot: record.bootPath ?? null, ...failureDetail(error) }));
         if (!limited(error)) this.alert?.('create_failures', { value: 1, limit: 1, active: true });
         if (limited(error) || (error?.service === 'boat' && error.status === 503)) {
           const delay = Math.max(30_000, Math.min(900_000, (error.retrySeconds ?? 0) * 1000));
@@ -390,7 +394,7 @@ export class BoxFleet {
       const limits = uncertain ? {} : await selectedApi.limits();
       if (!uncertain && (!limits.canStart || !limits.machineTypes?.some(type => type.type === item.size && type.available === true))) { this.logger?.(JSON.stringify({ event: 'admission_refused', project: this.project?.id, reason: 'provider_limits', size: item.size })); return; }
       await this.admit(key, limits, Number(project.machineTtlSeconds ?? env.MACHINE_TTL_SECONDS ?? 7200), epoch, beforeStart, afterStart);
-    } catch { await this.storage.put('pool:last-error', { at: this.now(), stage: 'create', createKey: key }); }
+    } catch (error) { await this.storage.put('pool:last-error', { at: this.now(), stage: 'create', createKey: key, ...failureDetail(error) }); }
   }
 
   // which queued jobs still need a box. Supply that was created or reserved for a lane covers that
@@ -851,7 +855,7 @@ export class BoxFleet {
         continue;
       }
       try { await this.admit(item.createKey, limits ?? {}, Number(project.machineTtlSeconds ?? env.MACHINE_TTL_SECONDS ?? 7200), epoch); }
-      catch { await this.storage.put('pool:last-error', { at: now, stage: 'create', createKey: item.createKey }); }
+      catch (error) { await this.storage.put('pool:last-error', { at: now, stage: 'create', createKey: item.createKey, ...failureDetail(error) }); }
     }
     // Release no more warm runners than aged demand can use. Otherwise a
     // younger GitHub job could take an extra runner before its offer expires.
@@ -988,6 +992,21 @@ export class BoxFleet {
         await tx.put(`box:${sandbox.id}`, applyBoxEvent(null, 'adopt_orphan', { machineId: sandbox.id, ...(this.createAccount ? { account: this.createAccount } : {}), pool: null, drainOnly: true, orphan: true, aliases, noRunnerKnown: !running && runners.length === 0, runnerId: runner?.id ?? null, runnerName: runner?.name ?? null, repo: project.repo, installation: this.installation, reusable: false }, this.now()));
         await tx.put(`pool:drain-only:${sandbox.id}`, { at: this.now(), reason: 'orphan' });
       });
+    }
+    // A create whose provider call ended without a definite answer keeps its record but loses its
+    // claim, and no admission path ever revisits a record that is not pending: the record would hold
+    // one of the project's concurrency slots for good. Once the account lists no sandbox under the
+    // create's name and the five-minute grace an uncertain claim gets has passed, the create is gone,
+    // so the record goes too and the slot returns to the pool.
+    const liveClaims = new Set(entries.filter(([, claim]) => claim.project === project.id).map(([key]) => `boat-router-${key.slice(0, 32)}`));
+    const listed = new Set(sandboxes.map(box => box.name));
+    for (const create of creates) {
+      if (create.state === 'pending' || create.state === 'snapshot_missing') continue;
+      if (listed.has(create.routerCreateName) || liveClaims.has(create.routerCreateName)) continue;
+      const since = create.callingAt ?? create.at;
+      if (!Number.isFinite(since) || this.now() - since < 300_000) continue;
+      await this.discardCreate(create.createKey);
+      this.logger?.(JSON.stringify({ event: 'discard_orphan_create', project: project.id, createKey: create.createKey, state: create.state, age_ms: this.now() - since }));
     }
     await this.storage.put('pool:orphan-sweep', this.now());
   }

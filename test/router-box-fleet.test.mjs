@@ -345,6 +345,31 @@ test('orphan sweep adopts only project ledger sandboxes and fences a busy runner
   assert.equal((await storage.get(`box:${id}`)).state, 'busy');
 });
 
+test('orphan sweep releases a create whose provider call never answered', async () => {
+  const storage = new Storage(), accountStorage = new Storage(), hash = 'b'.repeat(64), name = `boat-router-${hash.slice(0, 32)}`;
+  await accountStorage.put('account:ledger', { claims: {} });
+  await storage.put('create:gone', { createKey: 'gone', routerCreateName: name, state: 'unknown', at: 0, callingAt: 0 });
+  const api = { listSandboxes: async () => [] };
+  const project = { id: 'demo', repo: 'owner/repo', labels: ['boat-large'] };
+  const fleet = new BoxFleet(storage, api, () => 300_000, { project, budget: { ledger: { storage: accountStorage, key: 'account:ledger' } } });
+  await fleet.sweepOrphans({ complete: true, runners: [] }, project);
+  assert.equal(await storage.get('create:gone'), undefined);
+});
+
+test('orphan sweep keeps a create its sandbox answers for, one still claimed, and one inside the grace', async () => {
+  const storage = new Storage(), accountStorage = new Storage(), hash = 'c'.repeat(64), name = `boat-router-${hash.slice(0, 32)}`;
+  await accountStorage.put('account:ledger', { claims: { [hash]: { project: 'demo', status: 'unknown' } } });
+  await storage.put('create:listed', { createKey: 'listed', routerCreateName: 'boat-router-listed', state: 'unknown', at: 0, callingAt: 0 });
+  await storage.put('create:claimed', { createKey: 'claimed', routerCreateName: name, state: 'unknown', at: 0, callingAt: 0 });
+  await storage.put('create:young', { createKey: 'young', routerCreateName: 'boat-router-young', state: 'unknown', at: 299_000, callingAt: 299_000 });
+  await storage.put('create:pending', { createKey: 'pending', routerCreateName: 'boat-router-pending', state: 'pending', at: 0 });
+  const api = { listSandboxes: async () => [{ id: 'bx_23456789', name: 'boat-router-listed' }] };
+  const project = { id: 'demo', repo: 'owner/repo', labels: ['boat-large'] };
+  const fleet = new BoxFleet(storage, api, () => 300_000, { project, budget: { ledger: { storage: accountStorage, key: 'account:ledger' } } });
+  await fleet.sweepOrphans({ complete: true, runners: [] }, project);
+  for (const key of ['listed', 'claimed', 'young', 'pending']) assert.notEqual(await storage.get(`create:${key}`), undefined, key);
+});
+
 test('orphan waits for a named running job before cleanup', async () => {
   const storage = new Storage(), id = 'bx_23456789', name = `boat-demo-${id}-g0`;
   await storage.put(`box:${id}`, { machineId: id, state: 'quarantined', drainOnly: true, orphan: true, aliases: [name], noRunnerKnown: false });
