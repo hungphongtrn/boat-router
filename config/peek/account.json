@@ -7,7 +7,7 @@
     "maxJobs": 30,
     "maxAgeSeconds": 14400,
     "idleHoldSeconds": 420,
-    "healthCheck": "auto",
+    "healthCheck": "observe",
     "healthEnforceMinStarts": 20
   },
   "starts": {
