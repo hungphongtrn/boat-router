@@ -119,7 +119,7 @@ exec 9>/home/user/.boat-ci/bootstrap.lock
 flock 9
 if test -f /home/user/.boat-ci/ready; then exit 0; fi
 phase apt_update
-sudo -n apt-get -o Acquire::Retries=3 -o APT::Update::Error-Mode=any update
+sudo -n apt-get -o Acquire::Retries=3 -o Acquire::AllowReleaseinfoChange=true -o APT::Update::Error-Mode=any update
 phase apt_install
 sudo -n env DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 install -y --no-install-recommends libgstreamer-plugins-bad1.0-0 git-lfs
 fetch_checked() {
