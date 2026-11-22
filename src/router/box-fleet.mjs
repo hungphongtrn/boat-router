@@ -1216,7 +1216,11 @@ export class BoxFleet {
       } else if (box.state === 'idle') {
         const online = runner?.status === 'online';
         if (online && !box.everOnline) await this.verificationOutcome(box, 'online', true);
-        box = await this.transition(machineId, 'observe', { online, onlineAt: online ? box.onlineAt ?? this.now() : box.onlineAt, everOnline: box.everOnline || online, offlineSince: online ? null : box.offlineSince ?? (box.everOnline ? this.now() : box.startedAt ?? box.since) });
+        // A snapshot taken before this generation's runner registered cannot say it is offline:
+        // the runner list is up to 15 minutes old, so a freshly reset box would be retired 120 s
+        // after every job and the idle hold would never apply.
+        const runnerUnseen = !runner && Number.isFinite(snapshot.at) && snapshot.at < (box.startedAt ?? box.since);
+        box = await this.transition(machineId, 'observe', { online, runnerUnseen, onlineAt: online ? box.onlineAt ?? this.now() : box.onlineAt, everOnline: box.everOnline || online, offlineSince: online || runnerUnseen ? null : box.offlineSince ?? (box.everOnline ? this.now() : box.startedAt ?? box.since) });
       } else if (!runner && !inProgress) {
         box = await this.transition(machineId, 'runner_gone', { runnerFenced: true, jobs: (box.jobs ?? 0) + 1 });
       } else if (!inProgress && (completed || (!runner?.busy && snapshot.at !== box.lastIdleSnapshotAt))) {

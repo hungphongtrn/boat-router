@@ -108,6 +108,22 @@ test('hard deadlines trigger at their boundaries and offline removal needs a com
   assert.equal(calls, 1);
 });
 
+test('an idle box is not counted offline by a snapshot older than its runner start', async () => {
+  const { boxDeadline } = await import('../src/router/box-fleet.mjs');
+  const storage = new Storage(); let now = 500_000;
+  await storage.put(`box:${box.machineId}`, { ...box, runnerName: 'boat-demo-g3', since: 400_000, startedAt: 400_000, everOnline: false });
+  const fleet = new BoxFleet(storage, {}, () => now);
+  await fleet.stepBox(box.machineId, { complete: true, at: 300_000, runners: [], jobs: [] });
+  let record = await storage.get(`box:${box.machineId}`);
+  assert.equal(record.runnerUnseen, true);
+  assert.equal(record.offlineSince, null);
+  assert.equal(boxDeadline(record, 900_000), null);
+  await fleet.stepBox(box.machineId, { complete: true, at: 450_000, runners: [], jobs: [] });
+  record = await storage.get(`box:${box.machineId}`);
+  assert.equal(record.runnerUnseen, false);
+  assert.equal(boxDeadline(record, 900_000), 'offline_timeout');
+});
+
 test('booted reusable box baselines and registers the machine generation', async () => {
   const storage = new Storage(); let now = 0, started;
   const machine = { machineId: box.machineId, pool: JSON.stringify(['owner/repo', 'boat-large']), state: 'booting', since: 0, generation: 0, reusable: true };

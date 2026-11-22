@@ -202,7 +202,7 @@ export function boxDeadline(box, now, { reuseEnabled = true } = {}) {
   let start = box.since;
   if (rule.clock === 'boot') start = box.since + (box.bootPausedMs ?? 0);
   if (rule.clock === 'offline') {
-    if (box.busy || box.online) return null;
+    if (box.busy || box.online || box.runnerUnseen) return null;
     start = box.offlineSince ?? box.startedAt ?? box.since;
   }
   return Number.isFinite(start) && now - start >= rule.afterMs ? rule.event : null;
