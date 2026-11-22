@@ -263,7 +263,8 @@ export class AccountLedger {
           if (!Number.isFinite(marginPct) || marginPct < 0 || marginPct >= 100 || !validCount(burst) || burst < 1 || !validCount(reserve)) throw new TypeError('invalid pool pacing');
           const previous = state.poolPacing;
           const tokens = previous ? Math.min(burst, previous.tokens + Math.max(0, now - previous.at) * limit * (1 - marginPct / 100) / WINDOWS.day) : burst;
-          if (day.used + unobserved + count + reserve > limit || tokens < count) continue;
+          // A group wider than the burst would wait forever; it needs a full bucket, not more tokens than the bucket holds.
+          if (day.used + unobserved + count + reserve > limit || tokens < Math.min(count, burst)) continue;
         }
         if (cap == null || claims.filter(c => c.project === item.project && ((c.settledAt ?? c.at) > now - WINDOWS.day || c.status !== 'created')).length + count <= cap) eligible.push(item);
       }
