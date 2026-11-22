@@ -229,6 +229,8 @@ export class AccountLedger {
       const pacingActive = pacing?.enabled === true && !dynamicEnabled && Math.max(snapshot.windows.day.used / snapshot.windows.day.limit, snapshot.windows.hour.used / snapshot.windows.hour.limit) >= fromPct;
       const eligible = [], poolComplete = new Map(), poolStatuses = new Map();
       for (const item of state.waiting) {
+        // A pool request older than twice the 15 min retry ceiling is orphaned; it must not hold every newer request behind it.
+        if (item.pool && !keys.includes(item.key) && now - item.at > 30 * 60 * 1000) continue;
         if (item.pool) {
           if (!poolComplete.has(item.project)) {
             let complete = await tx.get(`project:${item.project}:pool:snapshot-complete`);
