@@ -4,7 +4,7 @@
   "account": "peek",
   "reuse": {
     "mode": "on",
-    "idleHoldSecondsWhenStartsPaid": 1200
+    "idleHoldSecondsWhenStartsPaid": 3600
   },
   "labels": [
     "peek-router"

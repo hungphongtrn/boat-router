@@ -4,9 +4,9 @@
   "reuse": {
     "enabled": true,
     "floor": 0,
-    "maxJobs": 30,
+    "maxJobs": 60,
     "maxAgeSeconds": 14400,
-    "idleHoldSeconds": 420,
+    "idleHoldSeconds": 3600,
     "healthCheck": "observe",
     "healthEnforceMinStarts": 20
   },
@@ -15,7 +15,7 @@
     "hour": 60,
     "day": 260,
     "allowPaidExtra": true,
-    "paidExtraMaxDollarsPerMonth": 2
+    "paidExtraMaxDollarsPerMonth": 5
   },
   "poolPacing": {
     "enabled": true,
