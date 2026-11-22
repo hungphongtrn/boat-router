@@ -18,8 +18,9 @@ test('local slot budget preserves FIFO and starts immediately after a slot frees
   assert.equal(router.account.poolPacing.slotBudget, true);
   assert.equal(router.account.liveSandboxCap, 1);
   assert.equal(router.projects.get('peek').config.caps.concurrent, 1);
-  assert.equal(router.projects.get('peek').config.reuse.idleHoldSeconds, 0);
-  assert.equal(router.projects.get('peek').config.reuse.idleHoldSecondsWhenStartsPaid, 0);
+  assert.equal(router.projects.get('peek').config.reuse.idleHoldSeconds, undefined);
+  assert.equal(router.account.reuse.idleHoldSeconds, 3600);
+  assert.equal(router.projects.get('peek').config.reuse.idleHoldSecondsWhenStartsPaid, 3600);
   await storage.put(router.ledger.key, { claims: {}, waiting: [], dynamicPacing: { at: now(), credit: 0, ratePerMs: 0, floorStarts: [{ key: 'spent1', at: now() }, { key: 'spent2', at: now() }], floorOverflow: [] } });
   const limits = active => snapshotLimits({ canStart: true, activeSandboxes: active, maxActiveSandboxes: 100, nextStartDollars: 0, starts: { minute: { limit: 12, used: 0 }, hour: { limit: 60, used: 9 }, day: { limit: 200, used: 138 } } }, now());
   await router.ledger.enqueue('peek', 'first', now()-2000);

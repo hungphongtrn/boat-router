@@ -168,7 +168,9 @@ export function installRouter(storage, getEnv, { api, now = Date.now, logger = c
     });
   if (liveCap !== undefined) {
     for (const definition of configurations) {
-      definition.config = { ...definition.config, caps: { ...definition.config.caps, concurrent: Number(liveCap) }, reuse: { ...definition.config.reuse, idleHoldSeconds: 0, idleHoldSecondsWhenStartsPaid: 0 } };
+      // The live cap bounds VM time; the configured idle hold still applies so a
+      // finished box stays warm for the next job instead of costing a start.
+      definition.config = { ...definition.config, caps: { ...definition.config.caps, concurrent: Number(liveCap) } };
     }
   }
   if (projects && (configurations.length !== projects.length)) throw new TypeError('unknown router project');
