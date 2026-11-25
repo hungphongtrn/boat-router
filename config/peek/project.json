@@ -8,7 +8,7 @@
     "idleHoldSecondsWhenStartsPaid": 1200
   },
   "caps": {
-    "concurrent": 2
+    "concurrent": 3
   },
   "labels": [
     "peek-router"
