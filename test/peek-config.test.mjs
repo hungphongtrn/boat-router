@@ -53,6 +53,12 @@ test('reuse holds a box long enough for Peek jobs', () => {
   assert.ok(project.machineTtlSeconds - headroom >= 4 * 3600, 'the reuse window stays positive and useful');
 });
 
+test('the pool stays at two boxes and retires an idle one within 90 minutes', () => {
+  assert.equal(project.caps.concurrent, 2);
+  assert.equal(project.reuse.idleHoldSeconds, 5400);
+  assert.ok(project.reuse.idleHoldSeconds <= 2 * 3600, 'an idle box never holds a slot for more than two hours');
+});
+
 test('the label Peek jobs ask for is routed at the default size', () => {
   assert.deepEqual(project.labels, ['peek-router']);
   assert.deepEqual(project.sizes['peek-router'], { machine: 'default' });
