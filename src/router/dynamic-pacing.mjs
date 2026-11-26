@@ -95,6 +95,9 @@ export function dynamicPacing({ snapshot, policy, claims, previous, now }) {
     return count(seconds) ? [[id, seconds]] : [];
   }));
   const status = { sampledAt: snapshot.at, snapshotAgeMs: now - snapshot.at, baseStartsPerHour: ratePerMs * SPANS.hour,
+    // Observed starts in the rolling hour: the rate a start is actually spent
+    // at, which box reuse makes far lower than the job arrival rate.
+    hourUsed: snapshot.windows.hour.used, dayUsed: snapshot.windows.day.used,
     effectiveStartsPerHour: effectiveRate(ratePerMs * SPANS.hour, hardRemaining.day), hardLimitBlocked,
     burstCredit: credit, burstCapacity: capacity, burstLimit: burst, remaining, nextRollOff: null,
     basis: tracked.length ? 'tracked_settlement_estimate' : 'provider_aggregate_24h_fallback', fallbackHorizonHours: 24,

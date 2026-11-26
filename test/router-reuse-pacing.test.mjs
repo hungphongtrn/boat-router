@@ -43,7 +43,7 @@ test('fresh shared ledger pacing status is used without an extra provider reques
   const state = { pacingStatus: { sampledAt: now - 1000, effectiveStartsPerHour: 4.99 } };
   const budget = { ledger: { key: 'ledger', storage: { get: async () => state } } };
   const got = await reusePacing({ account, budget, api: { limits: async () => { reads++; throw Error(); } }, now: () => now });
-  assert.deepEqual(got, { sampledAt: now - 1000, startsPerHour: 4.99, dayRemaining: null, hourRemaining: null, dayRoomEmpty: false, paidExtraRoom: false });
+  assert.deepEqual(got, { sampledAt: now - 1000, startsPerHour: 4.99, dayRemaining: null, hourRemaining: null, hourUsed: null, dayUsed: null, dayRoomEmpty: false, paidExtraRoom: false });
   assert.equal(reads, 0);
 });
 
@@ -87,10 +87,12 @@ test('paid idle hold extends only while the free day window is empty and the pai
 });
 
 test('a fresh pacing status carries the remaining day and hour start budget', async () => {
-  const status = { sampledAt: now - 1000, effectiveStartsPerHour: 6, remaining: { day: 9, hour: 4 }, hardRemaining: { day: 7, hour: 3 } };
+  const status = { sampledAt: now - 1000, effectiveStartsPerHour: 6, remaining: { day: 9, hour: 4 }, hardRemaining: { day: 7, hour: 3 }, hourUsed: 2, dayUsed: 41 };
   const got = await reusePacing({ account, budget: { ledger: { key: 'ledger', storage: { get: async () => ({ pacingStatus: status }) } } }, api: { limits: async () => { throw Error(); } }, now: () => now });
   assert.equal(got.dayRemaining, 7);
   assert.equal(got.hourRemaining, 3);
+  assert.equal(got.hourUsed, 2);
+  assert.equal(got.dayUsed, 41);
 });
 
 test('a fresh pacing status reports the empty day window and the paid budget room', async () => {

@@ -626,7 +626,10 @@ export class BoxFleet {
     const holdPolicy = holdPolicyConfig(account, project);
     const arrivalPerHour = recentArrivalPerHour(jobs, now, holdPolicy.arrivalLookbackSeconds);
     const startBudget = { dayRemaining: pacing?.dayRemaining ?? null, hourRemaining: pacing?.hourRemaining ?? null };
-    const plentiful = startsPlentiful({ ...startBudget, arrivalPerHour, margin: holdPolicy.plentifulMargin });
+    // Scarcity is judged by the starts the account actually spent, not by jobs
+    // queued: reuse serves many jobs per start.
+    const startRatePerHour = pacing?.hourUsed ?? null;
+    const plentiful = startsPlentiful({ ...startBudget, arrivalPerHour: startRatePerHour, margin: holdPolicy.plentifulMargin });
     const queuedByPool = new Map();
     for (const job of jobs) if (job.status === 'queued' && !job.missing) queuedByPool.set(job.pool, (queuedByPool.get(job.pool) ?? 0) + 1);
     const holdFor = box => {
@@ -635,7 +638,7 @@ export class BoxFleet {
       if (!Number.isFinite(idleSince)) return baseHold;
       const idleSeconds = Math.max(0, (now - idleSince) / 1000);
       const boxAgeSeconds = Number.isFinite(box.createdAt) ? Math.max(0, (now - box.createdAt) / 1000) : null;
-      const decision = holdDecision({ boxAgeSeconds, idleSeconds, queued: queuedByPool.get(box.pool) ?? 0, arrivalPerHour, starts: startBudget, config: holdPolicy });
+      const decision = holdDecision({ boxAgeSeconds, idleSeconds, queued: queuedByPool.get(box.pool) ?? 0, arrivalPerHour, startRatePerHour, starts: startBudget, config: holdPolicy });
       return Math.max(0, Math.floor(idleSeconds + decision.holdSeconds));
     };
     const reuseStatus = { reuseIdleHoldSeconds: nominalHold,
@@ -643,7 +646,7 @@ export class BoxFleet {
       reuseDayRoomEmpty: pacing?.dayRoomEmpty ?? null, reusePaidExtraRoom: pacing?.paidExtraRoom ?? null,
       reuseHoldPolicy: holdPolicy.enabled ? { paidWindowSeconds: holdPolicy.paidWindowSeconds, plentifulMargin: holdPolicy.plentifulMargin,
         arrivalLookbackSeconds: holdPolicy.arrivalLookbackSeconds, scarceWindows: holdPolicy.scarceWindows,
-        arrivalPerHour, dayRemaining: startBudget.dayRemaining, hourRemaining: startBudget.hourRemaining, plentiful } : null,
+        arrivalPerHour, startRatePerHour, dayRemaining: startBudget.dayRemaining, hourRemaining: startBudget.hourRemaining, plentiful } : null,
       reuseHoldBasis: paidHold != null ? 'paid_starts' : !pacing ? 'unknown' : pacing.startsPerHour <= 5 ? 'low_rate' : pacing.startsPerHour >= 15 ? 'normal_rate' : 'transition' };
     const waitPools = pools.map(pool => pool.reason === 'breaker' ? { ...pool, reason: null } : pool);
     const waitUnits = account.paidOverflow?.enabled === true ? units.filter(unit => unit.kind !== 'create' || unit.state !== 'pending') : units;

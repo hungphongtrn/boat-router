@@ -5,7 +5,7 @@ import { HOLD_POLICY_DEFAULTS, holdDecision, holdPolicyConfig, recentArrivalPerH
 const starts = { dayRemaining: 150, hourRemaining: 40 };
 
 test('a box inside its already-paid window is kept even when it has been idle a while', () => {
-  const decision = holdDecision({ boxAgeSeconds: 600, idleSeconds: 300, starts, arrivalPerHour: 0 });
+  const decision = holdDecision({ boxAgeSeconds: 600, idleSeconds: 300, starts, arrivalPerHour: 0, startRatePerHour: 0 });
   assert.equal(decision.keep, true);
   assert.equal(decision.reason, 'paid_window');
   assert.equal(decision.holdSeconds, 3000);
@@ -13,7 +13,7 @@ test('a box inside its already-paid window is kept even when it has been idle a 
 });
 
 test('a box at the end of its paid window retires when starts are plentiful', () => {
-  const decision = holdDecision({ boxAgeSeconds: 3600, idleSeconds: 120, starts, arrivalPerHour: 2 });
+  const decision = holdDecision({ boxAgeSeconds: 3600, idleSeconds: 120, starts, arrivalPerHour: 2, startRatePerHour: 2 });
   assert.equal(decision.keep, false);
   assert.equal(decision.reason, 'starts_plentiful');
   assert.equal(decision.holdSeconds, 0);
@@ -22,7 +22,7 @@ test('a box at the end of its paid window retires when starts are plentiful', ()
 
 test('with scarce starts an idle box is kept one paid window while work is queued', () => {
   const scarce = { dayRemaining: 10, hourRemaining: 40 };
-  const decision = holdDecision({ boxAgeSeconds: 7200, idleSeconds: 120, queued: 2, starts: scarce, arrivalPerHour: 2 });
+  const decision = holdDecision({ boxAgeSeconds: 7200, idleSeconds: 120, queued: 2, starts: scarce, arrivalPerHour: 2, startRatePerHour: 2 });
   assert.equal(decision.keep, true);
   assert.equal(decision.reason, 'queued');
   assert.equal(decision.holdSeconds, HOLD_POLICY_DEFAULTS.paidWindowSeconds);
@@ -31,7 +31,7 @@ test('with scarce starts an idle box is kept one paid window while work is queue
 
 test('with scarce starts an idle box is kept when the arrival rate predicts a job inside the window', () => {
   const scarce = { dayRemaining: 10, hourRemaining: 40 };
-  const decision = holdDecision({ boxAgeSeconds: 7200, idleSeconds: 120, queued: 0, starts: scarce, arrivalPerHour: 1 });
+  const decision = holdDecision({ boxAgeSeconds: 7200, idleSeconds: 120, queued: 0, starts: scarce, arrivalPerHour: 1, startRatePerHour: 1 });
   assert.equal(decision.keep, true);
   assert.equal(decision.reason, 'arrival_predicted');
   assert.equal(decision.expectedJobs, 1);
@@ -40,9 +40,24 @@ test('with scarce starts an idle box is kept when the arrival rate predicts a jo
 test('with scarce starts and no queued or predicted work the box retires', () => {
   // 2 starts left in the rolling day against 0.2 jobs/h (4.8 a day) is scarce.
   const scarce = { dayRemaining: 2, hourRemaining: 40 };
-  const decision = holdDecision({ boxAgeSeconds: 7200, idleSeconds: 120, queued: 0, starts: scarce, arrivalPerHour: 0.2 });
+  const decision = holdDecision({ boxAgeSeconds: 7200, idleSeconds: 120, queued: 0, starts: scarce, arrivalPerHour: 0.2, startRatePerHour: 0.2 });
   assert.equal(decision.keep, false);
   assert.equal(decision.reason, 'scarce_no_demand');
+});
+
+test('a busy job queue does not make starts scarce when the account spends few starts', () => {
+  // 46 jobs/h arrived, but reuse spent 1 start/h and 56 hour starts remain.
+  const decision = holdDecision({ boxAgeSeconds: 7200, idleSeconds: 120, queued: 3, arrivalPerHour: 46, startRatePerHour: 1, starts: { dayRemaining: 141, hourRemaining: 56 } });
+  assert.equal(decision.plentiful, true);
+  assert.equal(decision.keep, false);
+  assert.equal(decision.reason, 'starts_plentiful');
+});
+
+test('a high observed start rate keeps a box warm while work is queued', () => {
+  const decision = holdDecision({ boxAgeSeconds: 7200, idleSeconds: 120, queued: 3, arrivalPerHour: 46, startRatePerHour: 40, starts: { dayRemaining: 141, hourRemaining: 56 } });
+  assert.equal(decision.plentiful, false);
+  assert.equal(decision.keep, true);
+  assert.equal(decision.reason, 'queued');
 });
 
 test('unknown start budget is never plentiful and unknown arrival does not predict work', () => {

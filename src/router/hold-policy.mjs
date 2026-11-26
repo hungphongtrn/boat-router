@@ -76,7 +76,13 @@ export function startsPlentiful({ dayRemaining, hourRemaining, arrivalPerHour, m
 
 // The one decision. `holdSeconds` is how much longer the box may stay idle,
 // counted from now; 0 means retire on this tick.
-export function holdDecision({ boxAgeSeconds, idleSeconds = 0, queued = 0, arrivalPerHour = null, starts = {}, config = {} }) {
+//
+// Two rates matter. `startRatePerHour` is how many starts the account actually
+// spent in the rolling hour: that is what the remaining start budget has to
+// cover, and box reuse keeps it far below the job rate. `arrivalPerHour` is
+// jobs queued in the lookback: that is what predicts a job needing this box.
+// The scarcity test uses the start rate; the prediction uses the job rate.
+export function holdDecision({ boxAgeSeconds, idleSeconds = 0, queued = 0, arrivalPerHour = null, startRatePerHour = null, starts = {}, config = {} }) {
   const cfg = { ...HOLD_POLICY_DEFAULTS, ...config };
   if (!cfg.enabled) return { keep: true, retire: false, reason: 'policy_disabled', holdSeconds: null, boxAgeSeconds, idleSeconds };
   const age = Number.isFinite(boxAgeSeconds) ? Math.max(0, boxAgeSeconds) : null;
@@ -85,9 +91,10 @@ export function holdDecision({ boxAgeSeconds, idleSeconds = 0, queued = 0, arriv
     dayRemaining: Number.isFinite(starts?.dayRemaining) ? starts.dayRemaining : null,
     hourRemaining: Number.isFinite(starts?.hourRemaining) ? starts.hourRemaining : null,
   };
-  const plentiful = startsPlentiful({ ...budget, arrivalPerHour, margin: cfg.plentifulMargin });
+  const startRate = Number.isFinite(startRatePerHour) && startRatePerHour >= 0 ? startRatePerHour : null;
+  const plentiful = startsPlentiful({ ...budget, arrivalPerHour: startRate, margin: cfg.plentifulMargin });
   const expected = Number.isFinite(arrivalPerHour) ? arrivalPerHour * cfg.paidWindowSeconds / 3600 : null;
-  const detail = { boxAgeSeconds: age, idleSeconds: idle, queued, arrivalPerHour, ...budget, plentiful, expectedJobs: expected };
+  const detail = { boxAgeSeconds: age, idleSeconds: idle, queued, arrivalPerHour, startRatePerHour: startRate, ...budget, plentiful, expectedJobs: expected };
 
   if (age != null && age < cfg.paidWindowSeconds) {
     return { keep: true, retire: false, reason: 'paid_window', holdSeconds: Math.ceil(cfg.paidWindowSeconds - age), ...detail };

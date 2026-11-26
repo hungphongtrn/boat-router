@@ -50,7 +50,8 @@ export async function reusePacing({ account, api, budget, now }) {
     // hard window is what admission actually enforces in slot-budget mode.
     const startsLeft = sample.hardRemaining ?? sample.remaining ?? {};
     const remaining = name => Number.isFinite(startsLeft?.[name]) && startsLeft[name] >= 0 ? startsLeft[name] : null;
-    return { sampledAt: sample.sampledAt, startsPerHour: sample.effectiveStartsPerHour, dayRemaining: remaining('day'), hourRemaining: remaining('hour'), dayRoomEmpty: dayRoomEmpty(sample), paidExtraRoom: paidExtraRoom({ account, state, at }) };
+    const observed = name => Number.isFinite(sample?.[name]) && sample[name] >= 0 ? sample[name] : null;
+    return { sampledAt: sample.sampledAt, startsPerHour: sample.effectiveStartsPerHour, dayRemaining: remaining('day'), hourRemaining: remaining('hour'), hourUsed: observed('hourUsed'), dayUsed: observed('dayUsed'), dayRoomEmpty: dayRoomEmpty(sample), paidExtraRoom: paidExtraRoom({ account, state, at }) };
   } catch { return null; }
 }
 
