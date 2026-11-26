@@ -7,6 +7,7 @@ import { isPlanRefusal, isSizeRefusal } from '../domain.mjs';
 import { prunePool, RETENTION } from './pool-prune.mjs';
 import { waitClaims } from './wait-for-busy.mjs';
 import { reusePacing, reuseHold, nominalReuseHold, paidIdleHold } from './reuse-pacing.mjs';
+import { holdDecision, holdPolicyConfig, recentArrivalPerHour, startsPlentiful } from './hold-policy.mjs';
 import { currentBreaker, breakerCanProbe, breakerForSize, reserveSizedProbe, releaseSizedProbe, releaseSizedProbeInTransaction, recordSizedBreakerOutcome, BREAKER_PROBE_DELAY_MS } from './verification-breaker.mjs';
 import { MACHINE_SIZES } from './sizes.mjs';
 import { SetupWatchdog } from './setup-watchdog.mjs';
@@ -547,7 +548,9 @@ export class BoxFleet {
         if (!Number.isFinite(await tx.get(key))) await tx.put(key, now);
       });
     }
-    if (executor !== 'direct' && !prepareOnly && mode !== 'shadow' && complete && now - (await this.storage.get('pool:orphan-sweep') ?? -Infinity) >= 600_000) {
+    // Every reconcile, not every ten minutes: a leaked provider sandbox holds a
+    // live slot until it is adopted or retired (2026-11-25 and 2026-11-26).
+    if (executor !== 'direct' && !prepareOnly && mode !== 'shadow' && complete) {
       try { await this.sweepOrphans(snapshot, project); }
       catch { await this.storage.put('pool:last-error', { at: now, stage: 'orphan-sweep' }); }
     }
@@ -616,9 +619,31 @@ export class BoxFleet {
     // 20 min) is the whole extension, after which the box retires as normal.
     const paidHold = paidIdleHold({ pacing, baseSeconds: baseHold, configured: project.reuse?.idleHoldSecondsWhenStartsPaid ?? account.reuse?.idleHoldSecondsWhenStartsPaid });
     const nominalHold = paidHold ?? nominalReuseHold(baseHold, pacing?.startsPerHour);
+    // Cost-aware hold (docs/local-admission.md): a box younger than its paid
+    // window stays warm; after it, an idle box retires when the start budget
+    // covers the arrival rate, and otherwise stays one more paid window only
+    // while work is queued or predicted.
+    const holdPolicy = holdPolicyConfig(account, project);
+    const arrivalPerHour = recentArrivalPerHour(jobs, now, holdPolicy.arrivalLookbackSeconds);
+    const startBudget = { dayRemaining: pacing?.dayRemaining ?? null, hourRemaining: pacing?.hourRemaining ?? null };
+    const plentiful = startsPlentiful({ ...startBudget, arrivalPerHour, margin: holdPolicy.plentifulMargin });
+    const queuedByPool = new Map();
+    for (const job of jobs) if (job.status === 'queued' && !job.missing) queuedByPool.set(job.pool, (queuedByPool.get(job.pool) ?? 0) + 1);
+    const holdFor = box => {
+      if (!holdPolicy.enabled) return nominalHold;
+      const idleSince = box.onlineAt ?? box.since;
+      if (!Number.isFinite(idleSince)) return baseHold;
+      const idleSeconds = Math.max(0, (now - idleSince) / 1000);
+      const boxAgeSeconds = Number.isFinite(box.createdAt) ? Math.max(0, (now - box.createdAt) / 1000) : null;
+      const decision = holdDecision({ boxAgeSeconds, idleSeconds, queued: queuedByPool.get(box.pool) ?? 0, arrivalPerHour, starts: startBudget, config: holdPolicy });
+      return Math.max(0, Math.floor(idleSeconds + decision.holdSeconds));
+    };
     const reuseStatus = { reuseIdleHoldSeconds: nominalHold,
       reusePacingStartsPerHour: pacing?.startsPerHour ?? null, reusePacingSampledAt: pacing?.sampledAt ?? null,
       reuseDayRoomEmpty: pacing?.dayRoomEmpty ?? null, reusePaidExtraRoom: pacing?.paidExtraRoom ?? null,
+      reuseHoldPolicy: holdPolicy.enabled ? { paidWindowSeconds: holdPolicy.paidWindowSeconds, plentifulMargin: holdPolicy.plentifulMargin,
+        arrivalLookbackSeconds: holdPolicy.arrivalLookbackSeconds, scarceWindows: holdPolicy.scarceWindows,
+        arrivalPerHour, dayRemaining: startBudget.dayRemaining, hourRemaining: startBudget.hourRemaining, plentiful } : null,
       reuseHoldBasis: paidHold != null ? 'paid_starts' : !pacing ? 'unknown' : pacing.startsPerHour <= 5 ? 'low_rate' : pacing.startsPerHour >= 15 ? 'normal_rate' : 'transition' };
     const waitPools = pools.map(pool => pool.reason === 'breaker' ? { ...pool, reason: null } : pool);
     const waitUnits = account.paidOverflow?.enabled === true ? units.filter(unit => unit.kind !== 'create' || unit.state !== 'pending') : units;
@@ -661,7 +686,7 @@ export class BoxFleet {
       const idle = boxes.filter(box => box.pool === pool.key && ['ready', 'idle', 'local-held'].includes(box.state) && !byName.get(box.runnerName)?.busy);
       const overdue = idle.filter(box => {
         const since = box.state === 'ready' ? box.since : box.onlineAt ?? box.since;
-        const hold = reuseHold({ box: box.state === 'ready' ? { ...box, onlineAt: since } : box, baseSeconds: baseHold, nominalSeconds: nominalHold, now, account, project, env, enabled: waitEnabled });
+        const hold = reuseHold({ box: box.state === 'ready' ? { ...box, onlineAt: since } : box, baseSeconds: baseHold, nominalSeconds: holdFor(box.state === 'ready' ? { ...box, onlineAt: since } : box), now, account, project, env, enabled: waitEnabled });
         return Number.isFinite(since) && now - since > hold * 1000;
       });
       let status = { ...output[pool.key], ...reuseStatus, idleBoxes: idle.length, idleBoxesOverHold: overdue.length, idleBoxSampledAt: now };
@@ -724,7 +749,7 @@ export class BoxFleet {
         const queuedSnapshot = jobs.filter(job => job.pool === pool.key && job.status === 'queued' && !job.missing).length;
         for (const box of boxes.filter(item => item.pool === pool.key && item.state === 'idle').sort((a, b) => a.since - b.since)) {
           if (!surplus) break;
-          const hold = reuseHold({ box, baseSeconds: baseHold, nominalSeconds: nominalHold, now, account, project, env, enabled: waitEnabled });
+          const hold = reuseHold({ box, baseSeconds: baseHold, nominalSeconds: holdFor(box), now, account, project, env, enabled: waitEnabled });
           if (now - (box.onlineAt ?? box.since) < hold * 1000 || byName.get(box.runnerName)?.busy) continue;
           const retired = executor === 'direct'
             ? ((await this.queuedCount(box)) > queuedSnapshot ? false : await this.transition(box.machineId, 'retire_direct', { runnerFenced: true, retirementReason: 'idle_hold_expired' }))
@@ -877,7 +902,7 @@ export class BoxFleet {
     for (const box of boxes) {
       if (typeof box.pool === 'string' && ['idle', 'local-fencing', 'local-held', 'ready'].includes(box.state)) {
         const readySurplus = complete && (output[box.pool]?.surplus ?? 0) > 0;
-        const readyHold = reuseHold({ box: { ...box, onlineAt: box.since }, baseSeconds: baseHold, nominalSeconds: nominalHold, now, account, project, env, enabled: waitEnabled });
+        const readyHold = reuseHold({ box: { ...box, onlineAt: box.since }, baseSeconds: baseHold, nominalSeconds: holdFor({ ...box, onlineAt: box.since }), now, account, project, env, enabled: waitEnabled });
         if (project.dispatchOnly === true && box.state === 'ready' && (readySurplus || !demand.some(job => job.pool === box.pool && job.status === 'queued')) && Number.isFinite(box.since) && now - box.since >= readyHold * 1000) {
           if (await this.transition(box.machineId, 'retire_ready', { retirementReason: 'idle_hold_expired' }) && readySurplus) output[box.pool].surplus--;
           continue;
@@ -911,7 +936,7 @@ export class BoxFleet {
           const ttl = Number(box.machineTtlSeconds);
           const maxAge = Math.min(account.reuse?.maxAgeSeconds ?? 86400, project.reuse?.maxAgeSeconds ?? 86400);
           const expired = !Number.isFinite(box.createdAt) || !Number.isFinite(ttl) || !Number.isFinite(maxAge) || now - box.createdAt >= Math.min(ttl, maxAge) * 1000;
-          const hold = reuseHold({ box, baseSeconds: baseHold, nominalSeconds: nominalHold, now, account, project, env, enabled: waitEnabled });
+          const hold = reuseHold({ box, baseSeconds: baseHold, nominalSeconds: holdFor(box), now, account, project, env, enabled: waitEnabled });
           const idleExpired = !demand.some(job => job.pool === box.pool && job.status === 'queued') && now - (box.onlineAt ?? box.since) >= hold * 1000;
           if (mode === 'drain' || box.drainOnly || override === 'off' || !box.reusable || !box.baselineHash || expired || idleExpired) await this.transition(box.machineId, 'retire_held', { retirementReason: expired ? 'ttl_expired' : idleExpired ? 'idle_hold_expired' : 'reuse_ineligible' });
           else if (releaseBudget.get(box.pool) > 0) {
@@ -980,22 +1005,48 @@ export class BoxFleet {
       cursor = [...page.keys()].at(-1);
     }
     const entries = Object.entries(ledger?.claims ?? {});
-    const claims = new Set(entries.filter(([key, claim]) => claim.project === project.id && ['calling', 'unknown', 'created'].includes(claim.status) && entries.filter(([other]) => other.slice(0, 32) === key.slice(0, 32)).length === 1).map(([key]) => `boat-router-${key.slice(0, 32)}`));
+    const claimed = entries.filter(([key, claim]) => claim.project === project.id && ['calling', 'unknown', 'created'].includes(claim.status) && entries.filter(([other]) => other.slice(0, 32) === key.slice(0, 32)).length === 1);
+    const claims = new Set(claimed.map(([key]) => `boat-router-${key.slice(0, 32)}`));
+    const otherClaims = new Set(entries.filter(([, claim]) => claim.project !== project.id).map(([key]) => `boat-router-${key.slice(0, 32)}`));
     const knownNames = new Set(creates.map(create => create.routerCreateName));
     const knownIds = new Set(boxes.map(box => box.machineId));
     const duplicates = new Set(sandboxes.filter((box, i) => sandboxes.findIndex(other => other.name === box.name) !== i).map(box => box.name));
+    // A router-named box with no create record, no box record and no claim is a
+    // leak: a restart or a lost durable record left it behind, and it still holds
+    // one provider live slot, so admission refuses every create (ledger:concurrency).
+    // It is attributable only when this account holds one project; with several,
+    // leave it for an operator rather than destroy another project's box.
+    const projectCount = Number.isSafeInteger(this.projectCount) && this.projectCount > 0 ? this.projectCount : 1;
+    const routerName = /^boat-router-[0-9a-f]{32}$/;
     for (const sandbox of sandboxes) {
-      if (!claims.has(sandbox.name) || knownNames.has(sandbox.name) || knownIds.has(sandbox.id) || duplicates.has(sandbox.name) || !/^bx_[23456789abcdefghjkmnpqrstuvwxyz]{8}$/.test(sandbox.id ?? '')) continue;
+      if (knownNames.has(sandbox.name) || knownIds.has(sandbox.id) || duplicates.has(sandbox.name) || !/^bx_[23456789abcdefghjkmnpqrstuvwxyz]{8}$/.test(sandbox.id ?? '')) continue;
+      const claimedBox = claims.has(sandbox.name);
+      const leaked = !claimedBox && projectCount === 1 && routerName.test(sandbox.name ?? '') && !otherClaims.has(sandbox.name);
+      if (!claimedBox && !leaked) continue;
       const aliases = [...indexes].filter(([, value]) => value.machineId === sandbox.id).map(([key]) => key.slice(7));
       const prefix = `boat-${project.id}-${sandbox.id}-g`;
       const runners = (snapshot.runners ?? []).filter(runner => aliases.includes(runner.name) || runner.name?.startsWith(prefix));
       const running = jobs.some(job => job.status === 'in_progress' && (aliases.includes(job.runnerName) || job.runnerName?.startsWith(prefix)));
       const runner = runners.length === 1 ? runners[0] : null;
-      await this.storage.transaction(async tx => {
-        if (await tx.get(`box:${sandbox.id}`)) return;
+      const adopted = await this.storage.transaction(async tx => {
+        if (await tx.get(`box:${sandbox.id}`)) return false;
         await tx.put(`box:${sandbox.id}`, applyBoxEvent(null, 'adopt_orphan', { machineId: sandbox.id, ...(this.createAccount ? { account: this.createAccount } : {}), pool: null, drainOnly: true, orphan: true, aliases, noRunnerKnown: !running && runners.length === 0, runnerId: runner?.id ?? null, runnerName: runner?.name ?? null, repo: project.repo, installation: this.installation, reusable: false }, this.now()));
         await tx.put(`pool:drain-only:${sandbox.id}`, { at: this.now(), reason: 'orphan' });
+        return true;
       });
+      if (!adopted) continue;
+      // A leaked box with no runner and no in-progress job serves nothing, so
+      // retire it now through the normal quarantine -> destroy path. One with a
+      // runner or a job is adopted into the normal lifecycle and retires when
+      // that work finishes.
+      if (leaked && !running && runners.length === 0) {
+        const view = { complete: true, at: snapshot.at, runners: snapshot.runners ?? [], jobs };
+        await this.stepBox(sandbox.id, view);
+        await this.stepBox(sandbox.id, view);
+      }
+      this.logger?.(JSON.stringify({ event: 'orphan_sweep', project: project.id, machineId: sandbox.id, name: sandbox.name,
+        decision: leaked && !running && runners.length === 0 ? 'retire' : 'adopt', leaked, claimed: claimedBox,
+        runner: runner?.name ?? null, running }));
     }
     // A create whose provider call ended without a definite answer keeps its record but loses its
     // claim, and no admission path ever revisits a record that is not pending: the record would hold

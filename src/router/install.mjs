@@ -240,7 +240,7 @@ export function installRouter(storage, getEnv, { api, now = Date.now, logger = c
         const budget = cutover ? cutoverBudget(scoped, secondaryLedger, ledger, config.id, now, poolOptions) : new SharedBudget(ledger, config.id, now);
         const poolApi = cutover ? accountApi(scoped, secondaryApi, scopedApi) : scopedApi;
         poolController = new PoolFleet(scoped, env, poolApi, now, logger, { sharedBudget: budget, project: config });
-        poolController.boxFleet = new BoxFleet(scoped, poolApi, now, { budget, project: config, countLeaseStarts: async () => (await records(storage, 'external-lease:')).filter(lease => lease.project === config.id && lease.state === 'starting').length, ...(cutover ? { createAccount: 'primary' } : {}), getEnv, getLocalCapacity: () => router?.localCapacity, emit: poolController.emit.bind(poolController), logger, alert: (event, data) => schedule(alerts.observe(event, { project: config.id, ...data }).catch(() => {})) });
+        poolController.boxFleet = new BoxFleet(scoped, poolApi, now, { budget, project: config, projectCount: configurations.length, countLeaseStarts: async () => (await records(storage, 'external-lease:')).filter(lease => lease.project === config.id && lease.state === 'starting').length, ...(cutover ? { createAccount: 'primary' } : {}), getEnv, getLocalCapacity: () => router?.localCapacity, emit: poolController.emit.bind(poolController), logger, alert: (event, data) => schedule(alerts.observe(event, { project: config.id, ...data }).catch(() => {})) });
       }
       poolController.env = env;
       return poolController;

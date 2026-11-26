@@ -7,6 +7,14 @@
     "maxJobs": 60,
     "maxAgeSeconds": 14400,
     "idleHoldSeconds": 3600,
+    "holdPolicy": {
+      "enabled": true,
+      "paidWindowSeconds": 3600,
+      "plentifulMargin": 0.5,
+      "arrivalLookbackSeconds": 3600,
+      "minExpectedJobs": 1,
+      "scarceWindows": 1
+    },
     "healthCheck": "observe",
     "healthEnforceMinStarts": 20
   },
