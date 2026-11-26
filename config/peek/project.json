@@ -11,17 +11,35 @@
   ],
   "machineTtlSeconds": 28800,
   "jobs": {
-    "ci": {
-      "timeoutMinutes": 40
+    "scope": {
+      "timeoutMinutes": 20
     },
-    "shard": {
-      "timeoutMinutes": 30
+    "desktop": {
+      "timeoutMinutes": 35
+    },
+    "rust": {
+      "timeoutMinutes": 50
+    },
+    "checks": {
+      "timeoutMinutes": 33
+    },
+    "web": {
+      "timeoutMinutes": 22
+    },
+    "ci": {
+      "timeoutMinutes": 50
     },
     "ci-test-run": {
-      "timeoutMinutes": 40
+      "timeoutMinutes": 36
     },
     "promotion": {
-      "timeoutMinutes": 30
+      "timeoutMinutes": 25
+    },
+    "publish": {
+      "timeoutMinutes": 55
+    },
+    "ci-image": {
+      "timeoutMinutes": 60
     }
   },
   "landing": {
@@ -38,12 +56,5 @@
       "executor": "actions-jit"
     }
   ],
-  "snapshotBoot": true,
-  "workflowConcurrency": [
-    {
-      "workflowPath": ".github/workflows/ci.yml",
-      "jobPrefix": "shard (",
-      "maxParallel": 4
-    }
-  ]
+  "snapshotBoot": true
 }
