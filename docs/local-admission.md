@@ -10,10 +10,10 @@ It keeps FIFO and the existing provider windows and paid-start budget, but
 does not consume hourly pacing-floor credit: an available slot can start now.
 `/router/claims` reports `admissionMode=slot_budget` when admission is sampled.
 
-Idle holds (including the paid-start extension) are zero. A completed box can
-reset for queued work inside the cap; surplus boxes close on the normal lifecycle
-tick. When reducing an existing fleet, excess boxes finish their jobs before
-retiring; no busy runner is killed merely to reach the new cap.
+An idle box is held by the cost-aware policy below, not by a fixed zero hold. A
+completed box can reset for queued work inside the cap; surplus boxes close on
+the normal lifecycle tick. When reducing an existing fleet, excess boxes finish
+their jobs before retiring; no busy runner is killed merely to reach the new cap.
 
 Calculate a ceiling from `0.85 * creditBalanceSeconds / 3600 / hoursToRenewal`
 and each machine's billing multiplier. `creditBalanceSeconds` includes prepaid
@@ -27,6 +27,84 @@ minimum, not a claim of sustainable continuous operation; when the sustainable
 rate is below two, the workflow must reduce parent waiting or overall duty cycle.
 No setting can guarantee both immediate admission whenever a slot frees and a
 lower long-run burn rate under an indefinitely nonempty queue.
+
+## Cost-aware idle hold
+
+Boat bills VM time per second while a sandbox runs; a start is billed only when
+a rolling start window is exceeded (verified against `GET /api/v1/limits`,
+2026-11-26: per-second billing, `small` $0.018/h, `default` $0.036/h, `large`
+$0.072/h, `xlarge` $0.20/h, plan $20/month = 555.56 VM-hours, no per-start
+minimum, starts above the limits $0.03/$0.05/$0.07 by bracket, limits 12/min,
+60/h, 200/day). A paid start at $0.03 therefore buys about 50 minutes of a
+default box, which is the "already-paid window" the policy uses.
+
+`src/router/hold-policy.mjs` is the pure decision. Inputs: box age, idle time,
+queued jobs in the box's pool, the recent arrival rate (jobs queued in the last
+lookback, per hour), and the ledger's hard remaining day and hour starts.
+Output: keep or retire, and how much longer the box may stay idle.
+
+- Inside the paid window the box stays warm for the next job.
+- At the window end the box retires when the remaining starts cover the recent
+  arrival rate with a margin in both the rolling day and hour windows. A free
+  start is cheaper than another idle VM-hour.
+- Otherwise the box stays at most `scarceWindows` more paid windows, and only
+  while its pool has queued work or the arrival rate predicts at least
+  `minExpectedJobs` inside the window. Unknown budget or arrival data is never
+  "plentiful".
+
+Config lives in `config/<project>/account.json` under `reuse.holdPolicy` (a
+project config may override it under the same key). Defaults:
+`enabled: true`, `paidWindowSeconds: 3600`, `plentifulMargin: 0.5`,
+`arrivalLookbackSeconds: 3600`, `minExpectedJobs: 1`, `scarceWindows: 1`.
+`enabled: false` restores the legacy `idleHoldSeconds`/paid-start hold.
+`GET /router/pools` reports the decision inputs and the outcome as
+`reuseHoldPolicy` (`arrivalPerHour`, `dayRemaining`, `hourRemaining`,
+`plentiful`). The live cap `GITHUB_POLL_MAX_LIVE` is unchanged.
+
+## Leak sweep
+
+Every complete reconcile sweeps provider sandboxes whose name is
+`boat-router-<32 hex>` but that have no `create:` record, no `box:` record and
+no ledger claim. Those are leaks: a restart or a lost durable record left them
+behind, and each still holds one provider live slot, so admission refuses every
+create with `ledger:concurrency` (the 2026-11-25 and 2026-11-26 incidents).
+The sweep runs on every reconcile, not every ten minutes.
+
+Attribution requires that this account holds exactly one project; with several,
+the box could belong to another project, so it is left for an operator. A leaked
+box with no GitHub runner and no in-progress job is adopted into the normal
+lifecycle as `quarantined` and retired through the router's own
+`quarantine_release -> destroy -> purge` path in the same reconcile. A leaked
+box with a runner or a busy job is adopted and retires when that work finishes;
+no busy runner or job is killed. Every adoption or retirement logs
+`orphan_sweep` with `decision`, `leaked`, `claimed`, `runner` and `running`.
+`test/router-leak-sweep.test.mjs` covers "unknown boxes hold every slot".
+
+## Consumer contract
+
+The router is the only allocator: it creates, holds, reuses, retires and sweeps
+Boat boxes and owns the start budget and hold policy. Consumers ask for work and
+release it; they never call `boat new` or `boat delete` themselves.
+
+- CI's `ci`, `ci-test-run`, `check-run`, `shots-run` and
+  `web-check` jobs run on `vars.PEEK_CI_RUNNER`; it is `peek-router` today,
+  so the router maps the queued job to a sandbox. `ci-fallback.yml` uses
+  `peek-local`.
+- **Not yet router-only:** `promotion` in `ci.yml` and the image job in
+  `ci-image.yml` still use `runs-on: boat`, which Boat's native GitHub
+  integration allocates directly, and `ci-start-guard` may set
+  `PEEK_CI_RUNNER` to `boat/from=ci-base`, also native. Those paths bypass
+  the router's budget and hold policy. Moving them needs a router pool for the
+  promotion size and the `ci-base` snapshot, so it is reported rather than
+  changed here.
+- Agent and external helpers use the router lease API
+  (`POST /router/lease/<claim|renew|execute|status|stream|file-write|file-read|release>`
+  with `Authorization: Bearer <control token>` and `X-Lease-Client`), which
+  creates, renews and releases a sandbox inside the router's budget. See
+  `docs/setup.md`.
+- `scripts/ci/boat-ci.sh` in the Peek repository is a by-hand debugging tool
+  and still calls `boat new`/`boat delete`; it is not called by CI
+  (`docs/runbook.md`). Treat it as an operator tool only.
 
 The local router may set `GITHUB_POLL_UNPACED=true` alongside `GITHUB_POLL_REPO`.
 This opts into the existing ledger's unpaced mode: queued work uses available
