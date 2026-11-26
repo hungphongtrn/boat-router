@@ -28,6 +28,37 @@ rate is below two, the workflow must reduce parent waiting or overall duty cycle
 No setting can guarantee both immediate admission whenever a slot frees and a
 lower long-run burn rate under an indefinitely nonempty queue.
 
+## Pool autoscaling
+
+`GITHUB_POLL_MIN_LIVE=<1..100>` (default 1) and `GITHUB_POLL_MAX_LIVE=<1..100>`
+(default 5 when either variable is set) size the pool to work instead of a fixed
+cap. Either variable engages autoscaling with repository-token routing, is
+refused with `GITHUB_POLL_UNPACED=true`, and the floor must not exceed the
+ceiling. `GITHUB_POLL_MAX_LIVE` stays the ceiling. The target is decided once
+at the start of each tick, before any admission path runs, so the very first
+tick after a restart already enforces the fresh target.
+
+The target is `clamp(queued + running, GITHUB_POLL_MIN_LIVE,
+GITHUB_POLL_MAX_LIVE)`, counted from the GitHub job records on every tick. A
+box beyond the target retires only while idle, through the existing
+`live_budget` path; a busy runner is never killed to reach it.
+
+The ceiling also follows the VM-hours budget, read from the provider limits at
+most every 10 minutes. Hours per day left is `(vmHoursRemaining +
+packBalanceHours) / daysToPeriodEnd`, with `daysToPeriodEnd` floored at 0.25.
+When the last 24 hours of usage exceed that allowance the router logs
+`pool_ceiling` with reason `hours_budget`, and `GITHUB_POLL_HOURS_BUDGET`
+(default `log`) decides what the decision does: in `log` mode the ceiling stays
+`GITHUB_POLL_MAX_LIVE` — the remaining hours are spent fast, and local runners
+take over when the provider refuses — while `enforce` floors the ceiling to
+`GITHUB_POLL_MIN_LIVE`. Otherwise the ceiling is `GITHUB_POLL_MAX_LIVE` with
+reason `work`. Unknown limit data leaves the ceiling at the max
+(`hours_unavailable`).
+
+A bare `GET /router/status`, with neither `project` nor `job_id`, returns the
+latest `autoscale` object: the budget mode, floor, ceiling, target, ceiling
+reason, the budget figures, and the queued and running counts of the last tick.
+
 ## Cost-aware idle hold
 
 Boat bills VM time per second while a sandbox runs; a start is billed only when
@@ -63,7 +94,8 @@ project config may override it under the same key). Defaults:
 `enabled: false` restores the legacy `idleHoldSeconds`/paid-start hold.
 `GET /router/pools` reports the decision inputs and the outcome as
 `reuseHoldPolicy` (`arrivalPerHour`, `startRatePerHour`, `dayRemaining`,
-`hourRemaining`, `plentiful`). The live cap `GITHUB_POLL_MAX_LIVE` is unchanged.
+`hourRemaining`, `plentiful`). `GITHUB_POLL_MAX_LIVE` remains the live ceiling;
+the hold policy does not move it.
 
 ## Leak sweep
 

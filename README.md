@@ -23,3 +23,18 @@ The Worker receives signed GitHub webhooks. The Durable Object keeps admission a
 See [setup](docs/setup.md). The example configuration starts with machine creation disabled (`ENABLED=false`). Run `npm test`, `npm run check`, and `npm run build` with Node 22 or later.
 
 The Durable Object uses the fixed name `production-v1`. Changing it starts a separate state store.
+
+## Pool autoscaling
+
+The live-box pool can size itself to work and to the account's VM-hours budget
+instead of a fixed cap. With repository-token routing, `GITHUB_POLL_MIN_LIVE`
+(default 1) is the floor and `GITHUB_POLL_MAX_LIVE` (default 5 when either is
+set, still the ceiling) is the maximum. The router targets `clamp(queued +
+running, MIN, MAX)` on every tick, and the ceiling drops to the floor when the
+last 24 hours of usage would exhaust the hours left before renewal — but only
+in `enforce` mode: `GITHUB_POLL_HOURS_BUDGET=log|enforce` (default `log`)
+computes and logs the budget decision without ever shrinking the pool, so the
+remaining hours are spent fast and local runners take over when the provider
+refuses. Surplus
+boxes retire only when idle, never mid-job. See
+[local admission](docs/local-admission.md#pool-autoscaling).
