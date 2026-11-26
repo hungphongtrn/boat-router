@@ -857,6 +857,7 @@ export class Fleet {
       }
       if (url.pathname === '/router/status' && request.method === 'GET') {
         if (!await authorizedControl(request, this.env)) return new Response(null, { status: 401 });
+        if (!url.searchParams.has('project') && !url.searchParams.has('job_id')) return Response.json({ autoscale: this.router.autoscale ?? null }, { headers: { 'Cache-Control': 'no-store' } });
         const project = this.router.projects.get(url.searchParams.get('project'));
         const id = Number(url.searchParams.get('job_id'));
         if (!project || !Number.isSafeInteger(id) || id < 1) return new Response(null, { status: 400 });

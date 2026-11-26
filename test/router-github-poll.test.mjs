@@ -43,6 +43,18 @@ test('local slot budget preserves FIFO and starts immediately after a slot frees
   assert.throws(() => installRouter(new Storage(), () => ({ ...localEnv, GITHUB_POLL_UNPACED: 'true' }), { api: new APIs(env), now }), /invalid poll live budget/);
 });
 
+test('pool autoscaling validates its live floor and engages on the floor alone', () => {
+  const now = () => 100_000_000;
+  for (const value of ['0', '1.5', 'NaN']) assert.throws(() => installRouter(new Storage(), () => ({ ...env, GITHUB_POLL_MIN_LIVE: value }), { api: new APIs(env), now }), /invalid poll live floor/);
+  assert.throws(() => installRouter(new Storage(), () => ({ ...env, GITHUB_POLL_MIN_LIVE: '6', GITHUB_POLL_MAX_LIVE: '5' }), { api: new APIs(env), now }), /invalid poll live floor/);
+  assert.throws(() => installRouter(new Storage(), () => ({ BOAT_WALLET: 'peek', BOAT_PROVIDER_WALLET: 'provider', ROUTER_PROJECTS: 'peek', ENABLED: 'false', GITHUB_POLL_MIN_LIVE: '2' }), { api: new APIs(env), now }), /invalid poll live floor/);
+  const router = installRouter(new Storage(), () => ({ ...env, GITHUB_POLL_MIN_LIVE: '2' }), { api: new APIs(env), now, logger: () => {} });
+  assert.equal(router.account.liveSandboxCap, 5);
+  assert.equal(router.projects.get('peek').config.caps.concurrent, 5);
+  assert.equal(router.account.poolPacing.slotBudget, true);
+  assert.equal(router.account.poolPacing.unpaced, false);
+});
+
 test('local unpaced admission drains a spent pacing floor but preserves FIFO, provider limits and paid budget', async () => {
   const now = () => 100_000_000;
   const storage = new Storage();
