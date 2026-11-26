@@ -21,7 +21,11 @@ export function poolTarget({ queued = 0, running = 0, minLive, maxLive } = {}) {
 
 // Decide the ceiling from the provider's hours budget. Unknown or incomplete
 // limit data never shrinks the pool: it leaves the ceiling at maxLive, because
-// a missing read must not retire warm boxes on speculation.
+// a missing read must not retire warm boxes on speculation. The budget is
+// always computed and reported; `enforce` alone decides whether an exceeded
+// budget floors the ceiling to minLive — without it the decision is logged
+// (and shown on /router/status) while the ceiling stays maxLive: spend the
+// remaining hours fast, then fall back to local runners.
 //
 //   hoursPerDayLeft = (vmHoursRemaining + packBalanceHours) / daysToPeriodEnd
 //   last24hHours    = last24hUsageSeconds / 3600
@@ -29,7 +33,7 @@ export function poolTarget({ queued = 0, running = 0, minLive, maxLive } = {}) {
 // The plan and the pack are both spendable hours, so they add. The period-end
 // divisor is floored at a quarter day so a renewal in minutes does not divide
 // a healthy balance into an impossible hourly allowance.
-export function hoursCeiling({ limits = null, now, minLive, maxLive } = {}) {
+export function hoursCeiling({ limits = null, now, minLive, maxLive, enforce = false } = {}) {
   const vmHoursRemaining = finiteOrNull(limits?.planIncluded?.vmHoursRemaining);
   const packBalanceHours = finiteOrNull(limits?.packBalanceHours) ??
     (Number.isFinite(limits?.packBalanceSeconds) ? limits.packBalanceSeconds / 3600 : null);
@@ -51,6 +55,6 @@ export function hoursCeiling({ limits = null, now, minLive, maxLive } = {}) {
   const hoursPerDayLeft = (vmHoursRemaining + packBalanceHours) / daysToPeriodEnd;
   const last24hHours = last24hUsageSeconds / 3600;
   const detail = { hoursPerDayLeft, last24hHours, vmHoursRemaining, packBalanceHours, daysToPeriodEnd };
-  if (last24hHours > hoursPerDayLeft) return { ceiling: minLive, reason: 'hours_budget', ...detail };
+  if (last24hHours > hoursPerDayLeft) return { ceiling: enforce ? minLive : maxLive, reason: 'hours_budget', ...detail };
   return { ceiling: maxLive, reason: 'work', ...detail };
 }

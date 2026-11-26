@@ -34,7 +34,9 @@ lower long-run burn rate under an indefinitely nonempty queue.
 (default 5 when either variable is set) size the pool to work instead of a fixed
 cap. Either variable engages autoscaling with repository-token routing, is
 refused with `GITHUB_POLL_UNPACED=true`, and the floor must not exceed the
-ceiling. `GITHUB_POLL_MAX_LIVE` stays the ceiling.
+ceiling. `GITHUB_POLL_MAX_LIVE` stays the ceiling. The target is decided once
+at the start of each tick, before any admission path runs, so the very first
+tick after a restart already enforces the fresh target.
 
 The target is `clamp(queued + running, GITHUB_POLL_MIN_LIVE,
 GITHUB_POLL_MAX_LIVE)`, counted from the GitHub job records on every tick. A
@@ -44,15 +46,18 @@ box beyond the target retires only while idle, through the existing
 The ceiling also follows the VM-hours budget, read from the provider limits at
 most every 10 minutes. Hours per day left is `(vmHoursRemaining +
 packBalanceHours) / daysToPeriodEnd`, with `daysToPeriodEnd` floored at 0.25.
-When the last 24 hours of usage exceed that allowance the ceiling drops to
-`GITHUB_POLL_MIN_LIVE` and the router logs `pool_ceiling` with reason
-`hours_budget`; otherwise the ceiling is `GITHUB_POLL_MAX_LIVE` with reason
-`work`. Unknown limit data leaves the ceiling at the max
+When the last 24 hours of usage exceed that allowance the router logs
+`pool_ceiling` with reason `hours_budget`, and `GITHUB_POLL_HOURS_BUDGET`
+(default `log`) decides what the decision does: in `log` mode the ceiling stays
+`GITHUB_POLL_MAX_LIVE` — the remaining hours are spent fast, and local runners
+take over when the provider refuses — while `enforce` floors the ceiling to
+`GITHUB_POLL_MIN_LIVE`. Otherwise the ceiling is `GITHUB_POLL_MAX_LIVE` with
+reason `work`. Unknown limit data leaves the ceiling at the max
 (`hours_unavailable`).
 
 A bare `GET /router/status`, with neither `project` nor `job_id`, returns the
-latest `autoscale` object: floor, ceiling, target, ceiling reason, the budget
-figures, and the queued and running counts of the last tick.
+latest `autoscale` object: the budget mode, floor, ceiling, target, ceiling
+reason, the budget figures, and the queued and running counts of the last tick.
 
 ## Cost-aware idle hold
 

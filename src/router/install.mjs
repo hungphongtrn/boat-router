@@ -136,6 +136,11 @@ export function installRouter(storage, getEnv, { api, now = Date.now, logger = c
   if (liveFloor !== undefined) {
     if (!pollRepo || !/^[1-9]\d*$/.test(liveFloor) || !Number.isSafeInteger(Number(liveFloor)) || Number(liveFloor) > 100 || getEnv().GITHUB_POLL_UNPACED === 'true') throw new TypeError('invalid poll live floor');
   }
+  // The hours budget is always computed and logged; only `enforce` lets an
+  // exceeded budget floor the ceiling. The default `log` spends the remaining
+  // hours fast and falls back to local runners when the provider refuses.
+  const hoursBudgetMode = getEnv().GITHUB_POLL_HOURS_BUDGET;
+  if (hoursBudgetMode !== undefined && !['log', 'enforce'].includes(hoursBudgetMode)) throw new TypeError('invalid poll hours budget mode');
   // Either bound engages the slot budget. The cap is then the ceiling and every
   // tick sizes the pool between the floor and that ceiling.
   const autoscaleEngaged = liveCap !== undefined || liveFloor !== undefined;
@@ -238,7 +243,6 @@ export function installRouter(storage, getEnv, { api, now = Date.now, logger = c
     try { const value = await limits(); budgetCache = { at: now(), value }; return value; }
     catch { return budgetCache?.value ?? null; }
   };
-  let lastCeiling = null;
   // The account choice may use a read up to 5 s old; each admission still reads its account's limits fresh.
   if (poolOptions) Object.assign(poolOptions, { workLimits: recentLimits(limits, now), secondaryChoiceLimits: recentLimits(poolOptions.secondaryLimits, now) });
   const scopedApi = Object.assign(Object.create(workApi), { limits });
@@ -255,7 +259,7 @@ export function installRouter(storage, getEnv, { api, now = Date.now, logger = c
   };
   let router;
   const routerProjects = configurations.map(({ config }) => {
-    let poolController, migration;
+    let poolController, migration, lastCeiling = null;
     const poolFor = ({ storage: scoped, ledger }) => {
       const env = projectEnv(getEnv(), config);
       if (!poolController) {
@@ -325,6 +329,36 @@ export function installRouter(storage, getEnv, { api, now = Date.now, logger = c
       });
       // A scheduled retry may be sooner than the regular minute tick; never lose it.
       await ctx.storage.setAlarm(snapshotDue === null ? now() + 60000 : Math.min(now() + 60000, snapshotDue));
+    };
+    // The pool target is decided in prepare, before any admission path runs:
+    // the prepareOnly pass, admissionEntries and admitStart all enforce the
+    // same fresh target from the first tick after a restart, and tick reuses
+    // it for the full admission pass (reuse:override preserved).
+    const applyAutoscale = async (ctx, controller) => {
+      const override = await ctx.storage.get('reuse:override');
+      controller.poolProject = override === 'off' ? { ...config, reuse: { ...config.reuse, mode: 'off' } } : config;
+      if (!(await ctx.storage.get('pool:migrated'))?.done) return false;
+      if (autoscaleEngaged) {
+        const jobs = await records(ctx.storage, 'gh-job:');
+        const queued = jobs.filter(job => job.status === 'queued').length;
+        const running = jobs.filter(job => job.status === 'in_progress').length;
+        const budget = hoursCeiling({ limits: await budgetLimits(), now: now(), minLive, maxLive, enforce: hoursBudgetMode === 'enforce' });
+        const { target } = poolTarget({ queued, running, minLive, maxLive: budget.ceiling });
+        controller.poolProject = { ...controller.poolProject, caps: { ...controller.poolProject.caps, concurrent: target } };
+        controller.boxFleet.project = controller.poolProject;
+        controller.autoscaleProject = controller.poolProject;
+        router.autoscale = { mode: hoursBudgetMode ?? 'log', min_live: minLive, max_live: maxLive, target, ceiling: budget.ceiling, ceiling_reason: budget.reason,
+          hours_per_day_left: budget.hoursPerDayLeft, last_24h_hours: budget.last24hHours, vm_hours_remaining: budget.vmHoursRemaining,
+          pack_balance_hours: budget.packBalanceHours, days_to_period_end: budget.daysToPeriodEnd, queued, running, updated_at: now() };
+        if (!lastCeiling || lastCeiling.ceiling !== budget.ceiling || lastCeiling.reason !== budget.reason) {
+          lastCeiling = { ceiling: budget.ceiling, reason: budget.reason };
+          logger(JSON.stringify({ event: 'pool_ceiling', project: config.id, ceiling: budget.ceiling, reason: budget.reason,
+            mode: hoursBudgetMode ?? 'log', hours_per_day_left: budget.hoursPerDayLeft, last_24h_hours: budget.last24hHours,
+            vm_hours_remaining: budget.vmHoursRemaining, pack_balance_hours: budget.packBalanceHours,
+            days_to_period_end: budget.daysToPeriodEnd, target, queued, running }));
+        }
+      }
+      return true;
     };
     const ingestPool = async (event, ctx, source = 'webhook') => {
       const controller = poolFor(ctx);
@@ -400,7 +434,8 @@ export function installRouter(storage, getEnv, { api, now = Date.now, logger = c
         const mode = await poolMode(ctx);
         const controller = poolFor(ctx);
         await preparePool(ctx, controller);
-        return controller.boxFleet.tick({ mode: mode === 'on' ? 'on' : 'drain', env: controller.env, account, project: config, prepareOnly: true });
+        await applyAutoscale(ctx, controller);
+        return controller.boxFleet.tick({ mode: mode === 'on' ? 'on' : 'drain', env: controller.env, account, project: controller.autoscaleProject ?? config, prepareOnly: true });
       } }),
       admissionEntries: async ctx => {
         const controller = poolFor(ctx);
@@ -412,31 +447,8 @@ export function installRouter(storage, getEnv, { api, now = Date.now, logger = c
       tick: async ctx => {
         const mode = await poolMode(ctx);
         const controller = poolFor(ctx);
-        {
-          const override = await ctx.storage.get('reuse:override');
-          controller.poolProject = override === 'off' ? { ...config, reuse: { ...config.reuse, mode: 'off' } } : config;
-          controller.startPreparationFailed = ctx.startPreparationFailed;
-        }
-        if (!(await ctx.storage.get('pool:migrated'))?.done) return;
-        if (autoscaleEngaged) {
-          const jobs = await records(ctx.storage, 'gh-job:');
-          const queued = jobs.filter(job => job.status === 'queued').length;
-          const running = jobs.filter(job => job.status === 'in_progress').length;
-          const budget = hoursCeiling({ limits: await budgetLimits(), now: now(), minLive, maxLive });
-          const { target } = poolTarget({ queued, running, minLive, maxLive: budget.ceiling });
-          controller.poolProject = { ...controller.poolProject, caps: { ...controller.poolProject.caps, concurrent: target } };
-          controller.boxFleet.project = controller.poolProject;
-          controller.autoscaleProject = controller.poolProject;
-          router.autoscale = { min_live: minLive, max_live: maxLive, target, ceiling: budget.ceiling, ceiling_reason: budget.reason,
-            hours_per_day_left: budget.hoursPerDayLeft, last_24h_hours: budget.last24hHours, vm_hours_remaining: budget.vmHoursRemaining,
-            pack_balance_hours: budget.packBalanceHours, days_to_period_end: budget.daysToPeriodEnd, queued, running, updated_at: now() };
-          if (!lastCeiling || lastCeiling.ceiling !== budget.ceiling || lastCeiling.reason !== budget.reason) {
-            lastCeiling = { ceiling: budget.ceiling, reason: budget.reason };
-            logger(JSON.stringify({ event: 'pool_ceiling', project: config.id, ceiling: budget.ceiling, reason: budget.reason,
-              hours_per_day_left: budget.hoursPerDayLeft, last_24h_hours: budget.last24hHours, vm_hours_remaining: budget.vmHoursRemaining,
-              pack_balance_hours: budget.packBalanceHours, days_to_period_end: budget.daysToPeriodEnd, target, queued, running }));
-          }
-        }
+        controller.startPreparationFailed = ctx.startPreparationFailed;
+        if (!(await applyAutoscale(ctx, controller))) return;
         if (controller.localFleet) await controller.localFleet.sweep();
         const result = await controller.boxFleet.tick({ mode: mode === 'on' ? 'on' : 'drain', env: controller.env, account, project: controller.poolProject, preprepared: true, preparationFailed: ctx.startPreparationFailed, skipAdmission: ctx.globalAdmission === true });
         const boxes = await records(ctx.storage, 'box:');

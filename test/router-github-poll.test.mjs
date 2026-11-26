@@ -48,6 +48,7 @@ test('pool autoscaling validates its live floor and engages on the floor alone',
   for (const value of ['0', '1.5', 'NaN']) assert.throws(() => installRouter(new Storage(), () => ({ ...env, GITHUB_POLL_MIN_LIVE: value }), { api: new APIs(env), now }), /invalid poll live floor/);
   assert.throws(() => installRouter(new Storage(), () => ({ ...env, GITHUB_POLL_MIN_LIVE: '6', GITHUB_POLL_MAX_LIVE: '5' }), { api: new APIs(env), now }), /invalid poll live floor/);
   assert.throws(() => installRouter(new Storage(), () => ({ BOAT_WALLET: 'peek', BOAT_PROVIDER_WALLET: 'provider', ROUTER_PROJECTS: 'peek', ENABLED: 'false', GITHUB_POLL_MIN_LIVE: '2' }), { api: new APIs(env), now }), /invalid poll live floor/);
+  assert.throws(() => installRouter(new Storage(), () => ({ ...env, GITHUB_POLL_HOURS_BUDGET: 'on' }), { api: new APIs(env), now }), /invalid poll hours budget mode/);
   const router = installRouter(new Storage(), () => ({ ...env, GITHUB_POLL_MIN_LIVE: '2' }), { api: new APIs(env), now, logger: () => {} });
   assert.equal(router.account.liveSandboxCap, 5);
   assert.equal(router.projects.get('peek').config.caps.concurrent, 5);
@@ -193,4 +194,72 @@ test('JIT uses the same token; it cannot be used for reruns or a different repo'
   await assert.rejects(api.rerunJob(job, 52), { code: 'poll_auth_denied' });
   await assert.rejects(api.getJob({ ...job, repo: 'other/repo' }), { code: 'poll_auth_denied' });
   assert.equal(calls.length, 3);
+});
+
+// A cold start with a spent budget: the poll scan discovers five queued jobs,
+// the limits read shows 100 pack hours over two days (50 h/day) against an
+// 82 h/day burn, and the hours budget decides the ceiling before any
+// admission path runs on the very first tick.
+const spentBudgetPoll = (t, nowFn) => {
+  let starts = 0;
+  const jobs = [1, 2, 3, 4, 5].map(n => ({ id: 50 + n, run_id: 900 + n, status: 'queued', labels: ['peek-router'], name: 'ci' }));
+  t.mock.method(globalThis, 'fetch', async (url, { method = 'GET', headers } = {}) => {
+    const u = new URL(url), path = u.pathname;
+    if (u.hostname === 'boat.dev') {
+      if (path.endsWith('/limits')) {
+        return Response.json({ canStart: true, nextStartDollars: 0, activeSandboxes: 0, maxActiveSandboxes: 100,
+          starts: { minute: { limit: 20, used: 0 }, hour: { limit: 60, used: 0 }, day: { limit: 200, used: 0 } },
+          machineTypes: [{ type: 'default', available: true }],
+          planIncluded: { vmHoursRemaining: 0, periodEnd: new Date(nowFn() + 2 * 86_400_000).toISOString() },
+          packBalanceHours: 100, last24hUsageSeconds: 296_857 });
+      }
+      if (path.endsWith('/sandboxes') && method === 'POST') { starts++; return Response.json({ sandbox: { id: `bx_2345678${starts}` } }, { status: 202 }); }
+      return Response.json({ sandbox: { state: 'running', setupStatus: 'pending' } });
+    }
+    assert.equal(headers.Authorization, 'Bearer test-poll-token');
+    if (path.endsWith('/runners')) return Response.json({ total_count: 0, runners: [] });
+    const runJobs = /\/actions\/runs\/(\d+)\/jobs$/.exec(path);
+    if (runJobs) return Response.json({ total_count: 1, jobs: jobs.filter(job => job.run_id === Number(runJobs[1])) });
+    if (/\/actions\/runs\/\d+$/.test(path)) return Response.json({ display_title: 'CI', path: '.github/workflows/ci.yml' });
+    const runs = u.searchParams.get('status') === 'queued' ? jobs.map(job => ({ id: job.run_id })) : [];
+    return Response.json({ total_count: runs.length, workflow_runs: runs });
+  });
+  return { get starts() { return starts; }, jobs };
+};
+
+test('the first tick after a restart admits only an enforced hours-budget ceiling, not MAX_LIVE', { timeout: 8000 }, async t => {
+  let now = Date.now();
+  t.mock.method(Date, 'now', () => now);
+  const poll = spentBudgetPoll(t, () => now);
+  const storage = new Storage();
+  const fleet = new Fleet({ storage, waitUntil() {} }, { ...env, ENABLED: 'true', PLUGIN_ROUTER: 'true',
+    GITHUB_POLL_MIN_LIVE: '2', GITHUB_POLL_MAX_LIVE: '5', GITHUB_POLL_HOURS_BUDGET: 'enforce' });
+  await storage.put('project:peek:pool:mode', 'on');
+  await fleet.alarm();
+  assert.equal(poll.starts, 2, 'tick 1 admits only minLive while the enforced budget floors the ceiling');
+  const autoscale = fleet.router.autoscale;
+  assert.equal(autoscale.mode, 'enforce');
+  assert.equal(autoscale.ceiling, 2);
+  assert.equal(autoscale.ceiling_reason, 'hours_budget');
+  assert.equal(autoscale.target, 2);
+  now += 60_000;
+  await fleet.alarm();
+  assert.equal(poll.starts, 2, 'a later tick admits nothing more while the ceiling holds');
+});
+
+test('log mode reports the hours budget but keeps the ceiling at MAX_LIVE on the first tick', { timeout: 8000 }, async t => {
+  let now = Date.now();
+  t.mock.method(Date, 'now', () => now);
+  const poll = spentBudgetPoll(t, () => now);
+  const storage = new Storage();
+  const fleet = new Fleet({ storage, waitUntil() {} }, { ...env, ENABLED: 'true', PLUGIN_ROUTER: 'true',
+    GITHUB_POLL_MIN_LIVE: '2', GITHUB_POLL_MAX_LIVE: '5' });
+  await storage.put('project:peek:pool:mode', 'on');
+  await fleet.alarm();
+  assert.equal(poll.starts, 5, 'log mode computes the budget but never floors the ceiling');
+  const autoscale = fleet.router.autoscale;
+  assert.equal(autoscale.mode, 'log');
+  assert.equal(autoscale.ceiling, 5);
+  assert.equal(autoscale.ceiling_reason, 'hours_budget');
+  assert.equal(autoscale.target, 5);
 });

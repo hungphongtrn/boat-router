@@ -13,14 +13,24 @@ test('poolTarget clamps demand between the live floor and ceiling', () => {
   assert.deepEqual(poolTarget({ running: 1, minLive: 4, maxLive: 5 }), { target: 4 });
 });
 
-test('hoursCeiling floors the ceiling when the last 24h burn exceeds the hours left per day', () => {
-  const budget = hoursCeiling({ limits: { planIncluded: { vmHoursRemaining: 0, periodEnd: days(10) }, packBalanceHours: 199.55, last24hUsageSeconds: 294907 }, now: NOW, minLive: 1, maxLive: 5 });
+test('hoursCeiling floors the ceiling when the last 24h burn exceeds the hours left per day (enforce)', () => {
+  const budget = hoursCeiling({ limits: { planIncluded: { vmHoursRemaining: 0, periodEnd: days(10) }, packBalanceHours: 199.55, last24hUsageSeconds: 294907 }, now: NOW, minLive: 1, maxLive: 5, enforce: true });
   assert.equal(budget.ceiling, 1);
   assert.equal(budget.reason, 'hours_budget');
   assert.ok(Math.abs(budget.hoursPerDayLeft - 19.955) < 1e-9);
   assert.ok(Math.abs(budget.last24hHours - 294907 / 3600) < 1e-9);
   assert.equal(budget.vmHoursRemaining, 0);
   assert.equal(budget.packBalanceHours, 199.55);
+  assert.equal(budget.daysToPeriodEnd, 10);
+});
+
+test('hoursCeiling reports an exceeded budget without flooring the ceiling unless enforcing', () => {
+  const limits = { planIncluded: { vmHoursRemaining: 0, periodEnd: days(10) }, packBalanceHours: 199.55, last24hUsageSeconds: 294907 };
+  const budget = hoursCeiling({ limits, now: NOW, minLive: 1, maxLive: 5 });
+  assert.equal(budget.ceiling, 5);
+  assert.equal(budget.reason, 'hours_budget');
+  assert.ok(Math.abs(budget.hoursPerDayLeft - 19.955) < 1e-9);
+  assert.ok(Math.abs(budget.last24hHours - 294907 / 3600) < 1e-9);
   assert.equal(budget.daysToPeriodEnd, 10);
 });
 
