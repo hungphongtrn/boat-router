@@ -39,17 +39,21 @@ minimum, starts above the limits $0.03/$0.05/$0.07 by bracket, limits 12/min,
 default box, which is the "already-paid window" the policy uses.
 
 `src/router/hold-policy.mjs` is the pure decision. Inputs: box age, idle time,
-queued jobs in the box's pool, the recent arrival rate (jobs queued in the last
-lookback, per hour), and the ledger's hard remaining day and hour starts.
-Output: keep or retire, and how much longer the box may stay idle.
+queued jobs in the box's pool, the recent job arrival rate (jobs queued in the
+lookback, per hour), the observed start rate (starts the account spent in the
+rolling hour), and the ledger's hard remaining day and hour starts. Output:
+keep or retire, and how much longer the box may stay idle.
 
 - Inside the paid window the box stays warm for the next job.
-- At the window end the box retires when the remaining starts cover the recent
-  arrival rate with a margin in both the rolling day and hour windows. A free
-  start is cheaper than another idle VM-hour.
+- At the window end the box retires when the remaining starts cover the
+  **observed start rate** with a margin in both the rolling day and hour
+  windows. Reuse serves many jobs per start, so the job arrival rate is not the
+  start demand: on 2026-11-26 a 46-job/hour queue spent 1 start/hour against 56
+  remaining, and judging scarcity by jobs would have held boxes a free start did
+  not need.
 - Otherwise the box stays at most `scarceWindows` more paid windows, and only
-  while its pool has queued work or the arrival rate predicts at least
-  `minExpectedJobs` inside the window. Unknown budget or arrival data is never
+  while its pool has queued work or the job arrival rate predicts at least
+  `minExpectedJobs` inside the window. Unknown budget or rate data is never
   "plentiful".
 
 Config lives in `config/<project>/account.json` under `reuse.holdPolicy` (a
@@ -58,8 +62,8 @@ project config may override it under the same key). Defaults:
 `arrivalLookbackSeconds: 3600`, `minExpectedJobs: 1`, `scarceWindows: 1`.
 `enabled: false` restores the legacy `idleHoldSeconds`/paid-start hold.
 `GET /router/pools` reports the decision inputs and the outcome as
-`reuseHoldPolicy` (`arrivalPerHour`, `dayRemaining`, `hourRemaining`,
-`plentiful`). The live cap `GITHUB_POLL_MAX_LIVE` is unchanged.
+`reuseHoldPolicy` (`arrivalPerHour`, `startRatePerHour`, `dayRemaining`,
+`hourRemaining`, `plentiful`). The live cap `GITHUB_POLL_MAX_LIVE` is unchanged.
 
 ## Leak sweep
 
