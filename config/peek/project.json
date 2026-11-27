@@ -3,9 +3,7 @@
   "repo": "hungphongtrn/peek",
   "account": "peek",
   "reuse": {
-    "mode": "on",
-    "idleHoldSeconds": 5400,
-    "idleHoldSecondsWhenStartsPaid": 1200
+    "mode": "off"
   },
   "caps": {
     "concurrent": 2
@@ -43,6 +41,7 @@
     }
   ],
   "snapshotBoot": true,
+  "rollingSnapshot": true,
   "workflowConcurrency": [
     {
       "workflowPath": ".github/workflows/ci.yml",
