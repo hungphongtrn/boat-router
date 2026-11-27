@@ -2,6 +2,7 @@ import test from 'node:test';
 import { createHash } from 'node:crypto';
 import assert from 'node:assert/strict';
 import { Storage } from './helpers.mjs';
+import worker from '../src/worker.mjs';
 import { Fleet } from '../src/fleet.mjs';
 import { AccountLedger } from '../src/router/ledger.mjs';
 import { SharedBudget } from '../src/router/shared-budget.mjs';
@@ -175,4 +176,75 @@ test('spend reserve and settle work while start scheduling is paused', async () 
   }));
   assert.equal(settle.status, 200);
   assert.equal((await settle.json()).ok, true);
+});
+
+test('worker.fetch forwards all four /router/spend* paths with control auth enforcement', async () => {
+  const token = 'b'.repeat(32);
+  const fleet = new Fleet({ storage: new Storage(), waitUntil() {} }, {
+    PLUGIN_ROUTER: 'true', ENABLED: 'false', BOAT_WALLET: 'peek', BOAT_PROVIDER_WALLET: 'team_test', ROUTER_PROJECTS: 'peek',
+    SETUP_BOOTSTRAP: JSON.stringify({ controlHash: createHash('sha256').update(token).digest('hex') }),
+  });
+  const workerEnv = { ENABLED: 'false', FLEET: { idFromName: () => 'id', get: () => fleet } };
+
+  for (const [method, path] of [
+    ['GET', '/router/spend'],
+    ['POST', '/router/spend/reserve'],
+    ['POST', '/router/spend/settle'],
+    ['POST', '/router/spend/storage-deleted'],
+  ]) {
+    const unauth = await worker.fetch(new Request(`https://worker${path}`, { method }), workerEnv);
+    assert.equal(unauth.status, 401, `${method} ${path} should enforce control auth, not 404`);
+  }
+
+  const headers = { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' };
+  const reserve = await worker.fetch(new Request('https://worker/router/spend/reserve', {
+    method: 'POST', headers, body: JSON.stringify({ project: 'peek', key: 'worker-machine', cost: { kind: 'machine', size: 'default', ttlSeconds: 5400 } }),
+  }), workerEnv);
+  assert.equal(reserve.status, 200);
+  assert.equal((await reserve.json()).ok, true);
+
+  const status = await worker.fetch(new Request('https://worker/router/spend', { headers }), workerEnv);
+  assert.equal(status.status, 200);
+  assert.equal((await status.json()).reservedUsd, 0.054);
+
+  const settle = await worker.fetch(new Request('https://worker/router/spend/settle', {
+    method: 'POST', headers, body: JSON.stringify({ key: 'worker-machine', status: 'not_created' }),
+  }), workerEnv);
+  assert.equal(settle.status, 200);
+  assert.equal((await settle.json()).ok, true);
+
+  const reserveStorage = await worker.fetch(new Request('https://worker/router/spend/reserve', {
+    method: 'POST', headers, body: JSON.stringify({ project: 'peek', key: 'snapshot:worker-test', cost: { kind: 'storage', days: 30 } }),
+  }), workerEnv);
+  assert.equal(reserveStorage.status, 200);
+  assert.equal((await reserveStorage.json()).ok, true);
+
+  const storageDeleted = await worker.fetch(new Request('https://worker/router/spend/storage-deleted', {
+    method: 'POST', headers, body: JSON.stringify({ key: 'snapshot:worker-test', elapsedSeconds: 86_400 }),
+  }), workerEnv);
+  assert.equal(storageDeleted.status, 200);
+  assert.equal((await storageDeleted.json()).ok, true);
+});
+
+test('worker.fetch forwards /health query string so size=default reports exhausted when only small fits', async () => {
+  const fleet = new Fleet({ storage: new Storage(), waitUntil() {} }, {
+    PLUGIN_ROUTER: 'true', ENABLED: 'true', BOAT_WALLET: 'example-account', BOAT_PROVIDER_WALLET: 'team_test', ROUTER_PROJECTS: 'project-a',
+  });
+  fleet.router.accountLimits = async () => ({ canStart: true });
+  fleet.router.ledger.spend = { machineHourUsd: { small: 0.018, default: 0.036 } };
+  const lifetime = Math.max(7200, ...[...fleet.router.projects.values()].map(project => Number(project.config?.machineTtlSeconds ?? 0)).filter(Number.isSafeInteger));
+  const smallCost = spendAmount(fleet.router.ledger.spend, { kind: 'machine', size: 'small', ttlSeconds: lifetime });
+  const defaultCost = spendAmount(fleet.router.ledger.spend, { kind: 'machine', size: 'default', ttlSeconds: lifetime });
+  fleet.router.ledger.spendStatus = async () => ({ enabled: true, remainingUsd: (smallCost + defaultCost) / 2 });
+  const workerEnv = { ENABLED: 'true', FLEET: { idFromName: () => 'id', get: () => fleet } };
+
+  const smallRes = await worker.fetch(new Request('https://worker/health'), workerEnv);
+  assert.equal(smallRes.status, 200);
+  const smallBody = await smallRes.json();
+  assert.deepEqual({ ready: smallBody.ready, admission: smallBody.admission }, { ready: true, admission: 'ready' });
+
+  const defaultRes = await worker.fetch(new Request('https://worker/health?size=default'), workerEnv);
+  assert.equal(defaultRes.status, 200);
+  const defaultBody = await defaultRes.json();
+  assert.deepEqual({ ready: defaultBody.ready, admission: defaultBody.admission }, { ready: false, admission: 'exhausted' });
 });
