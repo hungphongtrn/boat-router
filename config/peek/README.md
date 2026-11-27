@@ -31,12 +31,16 @@ with a green `ci` check. Its private refresh box primes the workspace and
 toolchains and runs `src/snapshot-build.mjs`. The workflow keeps the newest
 two ready rolling generations so the last good disk survives a failed refresh.
 
-With `rollingSnapshot: true`, a single-job create (reuse off or overridden) discovers
-the latest ready generation from the same Boat identity and reserves that exact
-snapshot for the box before creating it. A reusable box keeps the fixed project base
-snapshot instead: its baseline must not move between jobs. The immutable `peek-ci-…` name encodes the full SHA-256
-of `/home/user/.boat-ci/toolchain.sha256` in base32. The box verifies the digest
-and the manifest's files before registering a runner. Boot does not depend on
-manually redeploying `PROJECT_SNAPSHOT_NAME` or
-`PROJECT_SNAPSHOT_MANIFEST_SHA256`. If no ready generation exists, the job
-waits; it does not silently cold-boot.
+With `rollingSnapshot: true`, every create that can take a snapshot (reusable or
+single-job) discovers the latest ready generation from the same Boat identity and
+reserves that exact snapshot before creating the box. A reusable box baselines the
+disk it booted and resets to that same baseline between jobs, so its baseline never
+moves under a running box. Set `PROJECT_ROLLING_SNAPSHOT_NAME` (and
+`PROJECT_ROLLING_SNAPSHOT_NAME_SECONDARY` for the secondary account) to an exact
+retained ready name to roll back; a name that is not ready in that account fails
+closed instead of booting plain or falling back to the fixed pin. The immutable
+`peek-ci-…` name encodes the full SHA-256 of
+`/home/user/.boat-ci/toolchain.sha256` in base32. The box verifies the digest and
+the manifest's files before registering a runner. Boot does not depend on manually
+redeploying `PROJECT_SNAPSHOT_NAME` or `PROJECT_SNAPSHOT_MANIFEST_SHA256`. If no
+ready generation exists, the job waits; it does not silently cold-boot.
