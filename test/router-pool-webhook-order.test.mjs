@@ -70,9 +70,10 @@ test('a busy box whose job finished is released even if the completed webhook wa
   assert.notEqual((await storage.get(`box:${id}`)).state, 'busy', 'box still busy 30 min after its runner vanished; held until TTL');
 });
 
-test('webhook reorder (completed delivered before in_progress) leaves the job in_progress', async () => {
+test('neither a late webhook nor a stale poll reopens a completed job', async () => {
   const storage = new Storage();
   await observe(storage, { id: 9, repo: 'r/r', label: 'work-large', status: 'completed', runnerName: 'x' }, 100);
   await observe(storage, { id: 9, repo: 'r/r', label: 'work-large', status: 'in_progress', runnerName: 'x' }, 101);
-  assert.equal((await storage.get('gh-job:9')).status, 'completed', 'arrival-time ordering lets a late in_progress overwrite completed');
+  await observe(storage, { id: 9, repo: 'r/r', label: 'work-large', status: 'queued' }, 102, 'snapshot');
+  assert.equal((await storage.get('gh-job:9')).status, 'completed');
 });

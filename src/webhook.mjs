@@ -8,6 +8,7 @@ export async function verifySignature(secret, body, signature) {
 }
 
 export async function webhook(request, env, secret, ingest, select = null) {
+  const receivedAt = Date.now();
   if (Number(request.headers.get('Content-Length')) > 1_048_576) return new Response(null, { status: 413 });
   const reader = request.body?.getReader();
   if (!reader) return new Response(null, { status: 400 });
@@ -26,6 +27,7 @@ export async function webhook(request, env, secret, ingest, select = null) {
   if (!await verifySignature(secret, bytes, request.headers.get('X-Hub-Signature-256'))) {
     return new Response(null, { status: 401 });
   }
+  const verifiedAt = Date.now();
   if (request.headers.get('X-GitHub-Event') === 'ping') return new Response(null, { status: 204 });
   const name = request.headers.get('X-GitHub-Event');
   if (!select && name !== 'workflow_job') return new Response(null, { status: 204 });
@@ -35,6 +37,6 @@ export async function webhook(request, env, secret, ingest, select = null) {
   try { event = select ? select(name, payload) : selectJob(payload, env.ALLOW_SMOKE === 'true'); }
   catch (error) { if (error instanceof TypeError && /^(Unknown Boat size|Use one Boat runner label)/.test(error.message)) return new Response(error.message, { status: 400 }); throw error; }
   if (!event) return new Response(null, { status: 204 });
-  await ingest(event);
+  await ingest(event, { receivedAt, verifiedAt });
   return new Response(null, { status: 202 });
 }

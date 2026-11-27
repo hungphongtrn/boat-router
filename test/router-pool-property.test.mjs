@@ -22,7 +22,7 @@ test('500 seeded assignments converge without destroying a busy runner', async (
     const assignmentDelay = seed % 12 === 8 ? 3 : 0;
     let remainingFault = fault, resetFault = seed % 40 === 29, destroy404 = seed % 20 === 17;
     let time = 1000000, serial = 0, runnerSerial = 0, created = 0, failures = 0, bootFailure = null, failNext = reusable ? null : seed % 10 === 0 ? 'rate' : seed % 10 === 1 ? 'timeout' : seed % 10 === 2 ? 'absent' : seed % 10 === 3 ? 'boot' : seed % 10 === 4 ? 'unavailable' : null, snapshotGap = false;
-    const project = { id: 'sample', repo: 'example/project', labels: ['work'], sizes: { work: { machine: 'large' } }, triggers: [{ on: 'workflow_job', executor: 'actions-jit' }], caps: { concurrent: 8 }, ...(reusable ? { reuse: { mode: 'on', idleHoldSeconds: 240 } } : {}) };
+    const project = { id: 'sample', repo: 'example/project', labels: ['work'], sizes: { work: { machine: 'large' } }, triggers: [{ on: 'workflow_job', executor: 'actions-jit' }], caps: { concurrent: 8 }, ...(reusable ? { reuse: { mode: 'on', idleHoldSeconds: 240, holdPolicy: { enabled: false } } } : {}) };
     const account = { reuse: { enabled: reusable } };
     const baselineHash = 'a'.repeat(64);
     const ledger = new AccountLedger(ledgerStorage, { starts: { minute: 100, hour: 100, day: 100 }, requireConcurrency: true }, () => time);

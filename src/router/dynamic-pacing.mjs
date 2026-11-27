@@ -95,6 +95,9 @@ export function dynamicPacing({ snapshot, policy, claims, previous, now }) {
     return count(seconds) ? [[id, seconds]] : [];
   }));
   const status = { sampledAt: snapshot.at, snapshotAgeMs: now - snapshot.at, baseStartsPerHour: ratePerMs * SPANS.hour,
+    // Observed starts in the rolling hour: the rate a start is actually spent
+    // at, which box reuse makes far lower than the job arrival rate.
+    hourUsed: snapshot.windows.hour.used, dayUsed: snapshot.windows.day.used,
     effectiveStartsPerHour: effectiveRate(ratePerMs * SPANS.hour, hardRemaining.day), hardLimitBlocked,
     burstCredit: credit, burstCapacity: capacity, burstLimit: burst, remaining, nextRollOff: null,
     basis: tracked.length ? 'tracked_settlement_estimate' : 'provider_aggregate_24h_fallback', fallbackHorizonHours: 24,
@@ -105,11 +108,11 @@ export function dynamicPacing({ snapshot, policy, claims, previous, now }) {
     floorLimitPerHour: floorLimit, floorUsedLastHour: floorStarts.length, floorRemainingLastHour: Math.max(0, floorLimit - floorStarts.length),
     floorOverflowLimitPerHour: overflowLimit, floorOverflowUsedLastHour: floorOverflow.length, floorOverflowRemainingLastHour: Math.max(0, overflowLimit - floorOverflow.length),
     softRemaining: { ...remaining }, hardRemaining, idleHoldSecondsByProject };
-  if (cfg.unpaced === true) {
+  if (cfg.unpaced === true || cfg.slotBudget === true) {
     status.remaining = { ...hardRemaining };
     status.burstCredit = Math.min(...Object.values(hardRemaining));
     status.effectiveStartsPerHour = hardLimitBlocked ? 0 : Math.min(snapshot.windows.hour.limit, policy.starts?.hour ?? Infinity);
-    status.admissionMode = 'unpaced';
+    status.admissionMode = cfg.slotBudget === true ? 'slot_budget' : 'unpaced';
   }
   return { state, status };
 }

@@ -4,17 +4,26 @@
   "reuse": {
     "enabled": true,
     "floor": 0,
-    "maxJobs": 30,
+    "maxJobs": 60,
     "maxAgeSeconds": 14400,
-    "idleHoldSeconds": 420,
-    "healthCheck": "auto",
+    "idleHoldSeconds": 3600,
+    "holdPolicy": {
+      "enabled": true,
+      "paidWindowSeconds": 3600,
+      "plentifulMargin": 0.5,
+      "arrivalLookbackSeconds": 3600,
+      "minExpectedJobs": 1,
+      "scarceWindows": 1
+    },
+    "healthCheck": "observe",
     "healthEnforceMinStarts": 20
   },
   "starts": {
     "minute": 12,
     "hour": 60,
     "day": 260,
-    "allowPaidExtra": true
+    "allowPaidExtra": true,
+    "paidExtraMaxDollarsPerMonth": 15
   },
   "spend": {
     "monthlyUsd": 20,

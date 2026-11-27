@@ -1,3 +1,5 @@
+import { recordEntries } from './pool-records.mjs';
+
 const PROJECT_ID = /^[a-z0-9][a-z0-9-]{0,62}$/;
 
 export class TenantStorage {
@@ -31,6 +33,10 @@ export class TenantStorage {
     for (const bound of ['start', 'startAfter', 'end']) if (options[bound] !== undefined) query[bound] = this.key(options[bound]);
     const result = await this.storage.list(query);
     return new Map([...result].map(([k, v]) => [k.slice(this.prefix.length), v]));
+  }
+  async records(prefix) {
+    if (this.storage.records) return this.storage.records(this.key(prefix));
+    return [...(await recordEntries(this, prefix)).values()];
   }
   transaction(fn) { return this.storage.transaction(tx => fn(new TenantStorage(tx, this.prefix.slice(8, -1)))); }
   getAlarm(options) { return this.storage.getAlarm(options); }

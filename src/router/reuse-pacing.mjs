@@ -45,8 +45,13 @@ export async function reusePacing({ account, api, budget, now }) {
       at = now();
       sample = entry.sample;
     }
-    return sample && Number.isFinite(sample.sampledAt) && sample.sampledAt <= at && at - sample.sampledAt <= 30_000 && Number.isFinite(sample.effectiveStartsPerHour) && sample.effectiveStartsPerHour >= 0
-      ? { sampledAt: sample.sampledAt, startsPerHour: sample.effectiveStartsPerHour, dayRoomEmpty: dayRoomEmpty(sample), paidExtraRoom: paidExtraRoom({ account, state, at }) } : null;
+    if (!(sample && Number.isFinite(sample.sampledAt) && sample.sampledAt <= at && at - sample.sampledAt <= 30_000 && Number.isFinite(sample.effectiveStartsPerHour) && sample.effectiveStartsPerHour >= 0)) return null;
+    // The hold policy needs the remaining start budget, not only the rate. The
+    // hard window is what admission actually enforces in slot-budget mode.
+    const startsLeft = sample.hardRemaining ?? sample.remaining ?? {};
+    const remaining = name => Number.isFinite(startsLeft?.[name]) && startsLeft[name] >= 0 ? startsLeft[name] : null;
+    const observed = name => Number.isFinite(sample?.[name]) && sample[name] >= 0 ? sample[name] : null;
+    return { sampledAt: sample.sampledAt, startsPerHour: sample.effectiveStartsPerHour, dayRemaining: remaining('day'), hourRemaining: remaining('hour'), hourUsed: observed('hourUsed'), dayUsed: observed('dayUsed'), dayRoomEmpty: dayRoomEmpty(sample), paidExtraRoom: paidExtraRoom({ account, state, at }) };
   } catch { return null; }
 }
 
@@ -75,7 +80,9 @@ export function nominalReuseHold(baseSeconds, startsPerHour) {
 
 export function reuseHold({ box, baseSeconds, nominalSeconds, now, account, project, env, enabled }) {
   if (!box.reusable) return 120;
-  if (nominalSeconds <= baseSeconds || !enabled || box.drainOnly || !box.baselineHash) return baseSeconds;
+  // A policy decision may be 0 (retire now), so the nominal hold is not floored
+  // at the legacy base hold. The legacy callers still pass a value >= base.
+  if (!enabled || box.drainOnly || !box.baselineHash) return baseSeconds;
   const ttl = Number(box.machineTtlSeconds ?? project.machineTtlSeconds ?? env.MACHINE_TTL_SECONDS ?? 7200);
   const durations = Object.values(project.jobs ?? {}).map(job => job.timeoutMinutes ?? 0);
   const maxAge = Math.min(account.reuse?.maxAgeSeconds ?? 86400, project.reuse?.maxAgeSeconds ?? 86400);

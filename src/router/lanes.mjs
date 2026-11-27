@@ -238,7 +238,9 @@ export function runNameKey(runId) { return `${RUN_NAME_PREFIX}${runId}`; }
 // Resolves the run name for a webhook event through the per-run cache, then attaches the lane.
 // A failed lookup leaves the event without a lane; the next snapshot names it.
 export async function attachLane(storage, api, config, event, now) {
-  if (!laneRules(config).length || typeof event?.runName === 'string' || !Number.isSafeInteger(event?.runId)) return event;
+  const needsName = laneRules(config).length && !event?.runName;
+  const needsPath = !event?.workflowPath && config.workflowConcurrency?.some(rule => rule.workflowPath && event?.jobName?.startsWith(rule.jobPrefix));
+  if ((!needsName && !needsPath) || !Number.isSafeInteger(event?.runId)) return event;
   const key = runNameKey(event.runId);
   let cached = await storage.get(key);
   if (!cached || typeof cached.name !== 'string') {
@@ -256,5 +258,7 @@ export async function attachLane(storage, api, config, event, now) {
     cached = { name, at: now, ...(path ? { path } : {}) };
     await storage.put(key, cached);
   }
-  return { ...event, runName: cached.name, ...laneFor(config, { runName: cached.name, workflowPath: event.workflowPath ?? cached.path }) };
+  const workflowPath = event.workflowPath ?? cached.path;
+  const runName = event.runName ?? cached.name;
+  return { ...event, runName, ...(workflowPath ? { workflowPath } : {}), ...laneFor(config, { runName, workflowPath }) };
 }

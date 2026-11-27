@@ -3,10 +3,8 @@
   "repo": "hungphongtrn/peek",
   "account": "peek",
   "reuse": {
-    "mode": "off"
-  },
-  "caps": {
-    "concurrent": 2
+    "mode": "on",
+    "idleHoldSecondsWhenStartsPaid": 3600
   },
   "labels": [
     "peek-router",
@@ -14,17 +12,38 @@
   ],
   "machineTtlSeconds": 28800,
   "jobs": {
+    "scope": {
+      "timeoutMinutes": 20
+    },
+    "desktop": {
+      "timeoutMinutes": 35
+    },
+    "rust": {
+      "timeoutMinutes": 50
+    },
+    "checks": {
+      "timeoutMinutes": 33
+    },
+    "web": {
+      "timeoutMinutes": 22
+    },
     "ci": {
-      "timeoutMinutes": 40
+      "timeoutMinutes": 50
+    },
+    "ci-test-run": {
+      "timeoutMinutes": 36
     },
     "shard": {
       "timeoutMinutes": 30
     },
-    "ci-test-run": {
-      "timeoutMinutes": 40
-    },
     "promotion": {
-      "timeoutMinutes": 30
+      "timeoutMinutes": 25
+    },
+    "publish": {
+      "timeoutMinutes": 55
+    },
+    "ci-image": {
+      "timeoutMinutes": 60
     }
   },
   "landing": {

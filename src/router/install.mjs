@@ -12,6 +12,7 @@ import { BoxFleet, placementEvidence } from './box-fleet.mjs';
 import { migrateProject } from './pool-migrate.mjs';
 import { observe, reconcile, snapshotResumeAt } from './pool-observations.mjs';
 import { records } from './pool-records.mjs';
+import { hoursCeiling, poolTarget } from './pool-autoscale.mjs';
 import { BUILD_COMMIT } from '../build.mjs';
 import { AlertHooks, queueWaitMinutes } from './alert-hooks.mjs';
 import { APIs } from '../apis.mjs';
@@ -124,6 +125,47 @@ export function installRouter(storage, getEnv, { api, now = Date.now, logger = c
   const account = { ...selected, ...cutoverPolicy, requireConcurrency: true, externalClients: accountClients };
   if (selected.starts?.allowPaidExtra !== undefined && typeof selected.starts.allowPaidExtra !== 'boolean') throw new TypeError('invalid paid extra starts');
   if (selected.starts?.paidExtraMaxDollarsPerMonth !== undefined && (!Number.isFinite(selected.starts.paidExtraMaxDollarsPerMonth) || selected.starts.paidExtraMaxDollarsPerMonth < 0)) throw new TypeError('invalid paid extra budget');
+  const pollRepo = getEnv().GITHUB_POLL_REPO;
+  // Slot admission budgets VM time, not starts. It is local-only and retains
+  // the existing FIFO and paid-start ledger without its hourly pacing floor.
+  const liveCap = getEnv().GITHUB_POLL_MAX_LIVE;
+  const liveFloor = getEnv().GITHUB_POLL_MIN_LIVE;
+  if (liveCap !== undefined) {
+    if (!pollRepo || !/^[1-9]\d*$/.test(liveCap) || !Number.isSafeInteger(Number(liveCap)) || Number(liveCap) > 100 || getEnv().GITHUB_POLL_UNPACED === 'true') throw new TypeError('invalid poll live budget');
+  }
+  if (liveFloor !== undefined) {
+    if (!pollRepo || !/^[1-9]\d*$/.test(liveFloor) || !Number.isSafeInteger(Number(liveFloor)) || Number(liveFloor) > 100 || getEnv().GITHUB_POLL_UNPACED === 'true') throw new TypeError('invalid poll live floor');
+  }
+  // The hours budget is always computed and logged; only `enforce` lets an
+  // exceeded budget floor the ceiling. The default `log` spends the remaining
+  // hours fast and falls back to local runners when the provider refuses.
+  const hoursBudgetMode = getEnv().GITHUB_POLL_HOURS_BUDGET;
+  if (hoursBudgetMode !== undefined && !['log', 'enforce'].includes(hoursBudgetMode)) throw new TypeError('invalid poll hours budget mode');
+  // Either bound engages the slot budget. The cap is then the ceiling and every
+  // tick sizes the pool between the floor and that ceiling.
+  const autoscaleEngaged = liveCap !== undefined || liveFloor !== undefined;
+  const minLive = Number(liveFloor ?? 1), maxLive = Number(liveCap ?? 5);
+  if (autoscaleEngaged) {
+    if (minLive > maxLive) throw new TypeError('invalid poll live floor');
+    account.liveSandboxCap = maxLive;
+    account.poolPacing = { ...account.poolPacing, slotBudget: true, unpaced: false };
+  }
+  // Local repository routing can drain demand immediately rather than spread
+  // starts across 24 hours. The ledger still enforces provider windows,
+  // concurrency, FIFO and the rolling paid-extra budget. Deployed App routing
+  // keeps its existing policy unless this local-only override is supplied.
+  const pollUnpaced = getEnv().GITHUB_POLL_UNPACED;
+  if (pollUnpaced !== undefined) {
+    if (!pollRepo || !['true', 'false'].includes(pollUnpaced)) throw new TypeError('invalid poll unpaced mode');
+    account.poolPacing = { ...account.poolPacing, unpaced: pollUnpaced === 'true' };
+  }
+  const repoWebhook = Boolean(pollRepo && getEnv().GITHUB_WEBHOOK_SECRET);
+  const snapshotInterval = repoWebhook ? 15 * 60_000 : 60_000;
+  const paidCap = getEnv().GITHUB_POLL_PAID_CAP_USD;
+  if (paidCap !== undefined) {
+    if (!pollRepo || !/^\d+(?:\.\d{1,2})?$/.test(paidCap) || !Number.isFinite(Number(paidCap)) || Number(paidCap) > (account.starts?.paidExtraMaxDollarsPerMonth ?? 0)) throw new TypeError('invalid poll paid extra cap');
+    account.starts = { ...account.starts, paidExtraMaxDollarsPerMonth: Number(paidCap) };
+  }
   const provisionerFingerprint = createHash('sha256').update(reuseBootstrap()).update('\0').update(getEnv().TOOLCHAIN_REVISION ?? 'default').digest('hex');
   const snapshotName = getEnv().PROJECT_SNAPSHOT_NAME, snapshotManifest = getEnv().PROJECT_SNAPSHOT_MANIFEST_SHA256;
   if ((snapshotName || snapshotManifest) && (!/^[a-z][a-z0-9-]{0,40}-\d{8}-[a-f0-9]{8,64}$/.test(snapshotName ?? '') || !/^[a-f0-9]{64}$/.test(snapshotManifest ?? ''))) throw new TypeError('invalid project snapshot configuration');
@@ -141,7 +183,16 @@ export function installRouter(storage, getEnv, { api, now = Date.now, logger = c
       // GitHub's own max-parallel hold, so a held matrix shard does not get a box of its own.
       return { ...definition, config: { ...definition.config, caps, lanes: [] } };
     });
+  if (autoscaleEngaged) {
+    for (const definition of configurations) {
+      // The live ceiling bounds VM time; the configured idle hold still applies so a
+      // finished box stays warm for the next job instead of costing a start. The
+      // tick hook lowers this per-project cap to the target for each tick.
+      definition.config = { ...definition.config, caps: { ...definition.config.caps, concurrent: maxLive } };
+    }
+  }
   if (projects && (configurations.length !== projects.length)) throw new TypeError('unknown router project');
+  if (pollRepo && (!getEnv().GITHUB_POLL_TOKEN || configurations.length !== 1 || configurations[0].config.repo !== pollRepo)) throw new TypeError('invalid GitHub polling configuration');
   const cutover = cutoverEnabled;
   const workApi = cutover ? new APIs({ ...getEnv(), BOAT_CI_API_KEY: getEnv().BOAT_WORK_API_KEY }, api.fetch, now, api.credentials) : api;
   const secondaryApi = cutover ? new APIs({ ...getEnv(), BOAT_PROVIDER_WALLET: getEnv().BOAT_SECONDARY_PROVIDER_WALLET }, api.fetch, now, api.credentials) : api;
@@ -184,6 +235,14 @@ export function installRouter(storage, getEnv, { api, now = Date.now, logger = c
     if (Number.isFinite(day?.used) && Number.isFinite(day?.limit)) schedule(alerts.observe('day_cap_hit', { value: day.used, limit: day.limit, active: day.used >= day.limit }));
   };
   const limits = cachedLimits(async () => { const value = await accountLimitsApi.limits(); if (configuredAlerts?.length) { try { observeLimits(value); } catch {} } return value; }, now);
+  // The hours budget moves slowly. Read it at most every ten minutes, and keep
+  // the last good value when a read fails so a blip does not retire the pool.
+  let budgetCache = null;
+  const budgetLimits = async () => {
+    if (budgetCache && now() - budgetCache.at < 600_000) return budgetCache.value;
+    try { const value = await limits(); budgetCache = { at: now(), value }; return value; }
+    catch { return budgetCache?.value ?? null; }
+  };
   // The account choice may use a read up to 5 s old; each admission still reads its account's limits fresh.
   if (poolOptions) Object.assign(poolOptions, { workLimits: recentLimits(limits, now), secondaryChoiceLimits: recentLimits(poolOptions.secondaryLimits, now) });
   const scopedApi = Object.assign(Object.create(workApi), { limits });
@@ -200,14 +259,14 @@ export function installRouter(storage, getEnv, { api, now = Date.now, logger = c
   };
   let router;
   const routerProjects = configurations.map(({ config }) => {
-    let poolController, migration;
+    let poolController, migration, lastCeiling = null;
     const poolFor = ({ storage: scoped, ledger }) => {
       const env = projectEnv(getEnv(), config);
       if (!poolController) {
         const budget = cutover ? cutoverBudget(scoped, secondaryLedger, ledger, config.id, now, poolOptions) : new SharedBudget(ledger, config.id, now);
         const poolApi = cutover ? accountApi(scoped, secondaryApi, scopedApi) : scopedApi;
         poolController = new PoolFleet(scoped, env, poolApi, now, logger, { sharedBudget: budget, project: config });
-        poolController.boxFleet = new BoxFleet(scoped, poolApi, now, { budget, project: config, countLeaseStarts: async () => (await records(storage, 'external-lease:')).filter(lease => lease.project === config.id && lease.state === 'starting').length, ...(cutover ? { createAccount: 'primary' } : {}), getEnv, getLocalCapacity: () => router?.localCapacity, emit: poolController.emit.bind(poolController), logger, alert: (event, data) => schedule(alerts.observe(event, { project: config.id, ...data }).catch(() => {})) });
+        poolController.boxFleet = new BoxFleet(scoped, poolApi, now, { budget, project: config, projectCount: configurations.length, countLeaseStarts: async () => (await records(storage, 'external-lease:')).filter(lease => lease.project === config.id && lease.state === 'starting').length, ...(cutover ? { createAccount: 'primary' } : {}), getEnv, getLocalCapacity: () => router?.localCapacity, emit: poolController.emit.bind(poolController), logger, alert: (event, data) => schedule(alerts.observe(event, { project: config.id, ...data }).catch(() => {})) });
       }
       poolController.env = env;
       return poolController;
@@ -239,25 +298,67 @@ export function installRouter(storage, getEnv, { api, now = Date.now, logger = c
         const secondaryHashes = await Promise.all(creates.filter(item => item.account === 'secondary' && eligible.has(item.createKey)).map(item => controller.sharedBudget.claimKey(item.createKey)));
         await secondaryLedger.clearOrphanPoolWaiters(config.id, createKeys, secondaryHashes);
       }
-      const installation = await ctx.storage.get('pool:installation') ?? config.installation ?? (await records(ctx.storage, 'job:')).find(job => job.repo === config.repo && Number.isSafeInteger(job.installation))?.installation ?? (await records(ctx.storage, 'webhook-pending:')).find(event => event.repo === config.repo && Number.isSafeInteger(event.installation))?.installation;
+      // Snapshot and runner records use a positive installation ID internally. Repo-token mode
+      // uses a placeholder only; never persist it as discovered App configuration.
+      const installation = pollRepo ? 1 : await ctx.storage.get('pool:installation') ?? config.installation ?? (await records(ctx.storage, 'job:')).find(job => job.repo === config.repo && Number.isSafeInteger(job.installation))?.installation ?? (await records(ctx.storage, 'webhook-pending:')).find(event => event.repo === config.repo && Number.isSafeInteger(event.installation))?.installation;
       controller.boxFleet.installation = installation;
-      if (installation) await ctx.storage.put('pool:installation', installation);
+      if (installation && !pollRepo) await ctx.storage.put('pool:installation', installation);
       const last = await ctx.storage.get('pool:snapshot'), due = await ctx.storage.get('pool:snapshot-due'), first = !await ctx.storage.get('pool:first-snapshot');
-      if (installation && (first || !last || now() - last.at >= 60000 || due && due <= now())) {
-        if (await reconcile(ctx.storage, scopedApi, config, installation, now)) await ctx.storage.put('pool:first-snapshot', true);
+      let snapshotDue = null;
+      if (installation && (!last || now() - last.at >= snapshotInterval || due && due <= now() || first && !repoWebhook)) {
+        const wasFailed = last?.complete === false && Boolean(last.failure);
+        const complete = await reconcile(ctx.storage, scopedApi, config, installation, now);
+        if (complete) await ctx.storage.put('pool:first-snapshot', true);
         await ctx.storage.delete('pool:snapshot-due');
         const current = await ctx.storage.get('pool:snapshot');
+        if (!complete && current?.failure) logger(JSON.stringify({ event: 'snapshot_failed', project: config.id, repo: config.repo,
+          message: current.failure.message, call: current.failure.call ?? null, status: current.failure.status ?? null,
+          ...(current.failure.code ? { code: current.failure.code } : {}), failures: current.failures ?? 1, calls: current.calls ?? null,
+          retry_in_ms: Math.max(0, (snapshotResumeAt(current, now()) ?? now() + snapshotInterval) - now()) }));
+        else if (complete && wasFailed) logger(JSON.stringify({ event: 'snapshot_recovered', project: config.id, repo: config.repo }));
         const resumeAt = snapshotResumeAt(current, now());
         if (resumeAt !== null) {
+          snapshotDue = resumeAt;
           await ctx.storage.put('pool:snapshot-due', resumeAt);
-          await ctx.storage.setAlarm(resumeAt);
         }
       }
       if (!await ctx.storage.get('pool:first-snapshot')) await ctx.storage.transaction(async tx => {
-        await tx.put('pool:snapshot', { ...(await tx.get('pool:snapshot')), at: now(), complete: false });
+        const snapshot = await tx.get('pool:snapshot');
+        await tx.put('pool:snapshot', { ...snapshot, at: snapshot?.at ?? now(), complete: false });
         await tx.put('pool:snapshot-complete', false);
       });
-      await ctx.storage.setAlarm(now() + 60000);
+      // A scheduled retry may be sooner than the regular minute tick; never lose it.
+      await ctx.storage.setAlarm(snapshotDue === null ? now() + 60000 : Math.min(now() + 60000, snapshotDue));
+    };
+    // The pool target is decided in prepare, before any admission path runs:
+    // the prepareOnly pass, admissionEntries and admitStart all enforce the
+    // same fresh target from the first tick after a restart, and tick reuses
+    // it for the full admission pass (reuse:override preserved).
+    const applyAutoscale = async (ctx, controller) => {
+      const override = await ctx.storage.get('reuse:override');
+      controller.poolProject = override === 'off' ? { ...config, reuse: { ...config.reuse, mode: 'off' } } : config;
+      if (!(await ctx.storage.get('pool:migrated'))?.done) return false;
+      if (autoscaleEngaged) {
+        const jobs = await records(ctx.storage, 'gh-job:');
+        const queued = jobs.filter(job => job.status === 'queued').length;
+        const running = jobs.filter(job => job.status === 'in_progress').length;
+        const budget = hoursCeiling({ limits: await budgetLimits(), now: now(), minLive, maxLive, enforce: hoursBudgetMode === 'enforce' });
+        const { target } = poolTarget({ queued, running, minLive, maxLive: budget.ceiling });
+        controller.poolProject = { ...controller.poolProject, caps: { ...controller.poolProject.caps, concurrent: target } };
+        controller.boxFleet.project = controller.poolProject;
+        controller.autoscaleProject = controller.poolProject;
+        router.autoscale = { mode: hoursBudgetMode ?? 'log', min_live: minLive, max_live: maxLive, target, ceiling: budget.ceiling, ceiling_reason: budget.reason,
+          hours_per_day_left: budget.hoursPerDayLeft, last_24h_hours: budget.last24hHours, vm_hours_remaining: budget.vmHoursRemaining,
+          pack_balance_hours: budget.packBalanceHours, days_to_period_end: budget.daysToPeriodEnd, queued, running, updated_at: now() };
+        if (!lastCeiling || lastCeiling.ceiling !== budget.ceiling || lastCeiling.reason !== budget.reason) {
+          lastCeiling = { ceiling: budget.ceiling, reason: budget.reason };
+          logger(JSON.stringify({ event: 'pool_ceiling', project: config.id, ceiling: budget.ceiling, reason: budget.reason,
+            mode: hoursBudgetMode ?? 'log', hours_per_day_left: budget.hoursPerDayLeft, last_24h_hours: budget.last24hHours,
+            vm_hours_remaining: budget.vmHoursRemaining, pack_balance_hours: budget.packBalanceHours,
+            days_to_period_end: budget.daysToPeriodEnd, target, queued, running }));
+        }
+      }
+      return true;
     };
     const ingestPool = async (event, ctx, source = 'webhook') => {
       const controller = poolFor(ctx);
@@ -269,10 +370,10 @@ export function installRouter(storage, getEnv, { api, now = Date.now, logger = c
       const hashes = await Promise.all(createKeys.map(key => controller.sharedBudget.claimKey(key)));
       await ctx.ledger.clearOrphanPoolWaiters(config.id, createKeys, hashes);
       }
-      await ctx.storage.put('pool:installation', event.installation);
+      if (!pollRepo) await ctx.storage.put('pool:installation', event.installation);
       // a webhook event carries no run name; look the run up once per run so the job's lane is known at once.
       if (source === 'webhook' && event.status === 'queued') event = await attachLane(ctx.storage, scopedApi, config, event, now());
-      await observe(ctx.storage, event, now(), source);
+      await observe(ctx.storage, event, ctx.receivedAt ?? now(), source);
       if (event.status === 'queued' && !await ctx.storage.get(`placement-queue:${event.id}`)) {
         const evidence = placementEvidence(router?.localCapacity, now(), getEnv().CI_TO_MINIS !== 'false');
         await ctx.storage.put(`placement-queue:${event.id}`, { at: now(), ...evidence, ...(evidence.reason === 'no_claim_in_time' ? { reason: 'queue_observation' } : {}) });
@@ -288,8 +389,10 @@ export function installRouter(storage, getEnv, { api, now = Date.now, logger = c
         }
       }
       if (controller.localFleet) await controller.localFleet.ingest(event);
-      if (event.status === 'queued') await ctx.storage.put('pool:snapshot-due', now() + 5000);
-      await controller.wake(1000);
+      // In repo-hook mode the observation wakes admission directly. Don't turn busy webhook traffic
+      // into repeated full snapshots; the fallback scan still repairs missed events and runner state.
+      if (event.status === 'queued' && !repoWebhook) await ctx.storage.put('pool:snapshot-due', now() + 5000);
+      if (ctx.receivedAt === undefined) await controller.wake(1000);
     };
     return { config, hooks, ingest: async (event, ctx) => {
       return ingestPool(event, ctx);
@@ -331,24 +434,21 @@ export function installRouter(storage, getEnv, { api, now = Date.now, logger = c
         const mode = await poolMode(ctx);
         const controller = poolFor(ctx);
         await preparePool(ctx, controller);
-        return controller.boxFleet.tick({ mode: mode === 'on' ? 'on' : 'drain', env: controller.env, account, project: config, prepareOnly: true });
+        await applyAutoscale(ctx, controller);
+        return controller.boxFleet.tick({ mode: mode === 'on' ? 'on' : 'drain', env: controller.env, account, project: controller.autoscaleProject ?? config, prepareOnly: true });
       } }),
       admissionEntries: async ctx => {
         const controller = poolFor(ctx);
         return controller.boxFleet.admissionEntries();
       }, admitStart: async (key, ctx) => {
         const controller = poolFor(ctx), mode = await poolMode(ctx);
-        await controller.boxFleet.admitQueued(key, { mode: mode === 'on' ? 'on' : 'drain', env: controller.env, project: config, preparationFailed: ctx.startPreparationFailed });
+        await controller.boxFleet.admitQueued(key, { mode: mode === 'on' ? 'on' : 'drain', env: controller.env, project: controller.autoscaleProject ?? config, preparationFailed: ctx.startPreparationFailed });
       },
       tick: async ctx => {
         const mode = await poolMode(ctx);
         const controller = poolFor(ctx);
-        {
-          const override = await ctx.storage.get('reuse:override');
-          controller.poolProject = override === 'off' ? { ...config, reuse: { ...config.reuse, mode: 'off' } } : config;
-          controller.startPreparationFailed = ctx.startPreparationFailed;
-        }
-        if (!(await ctx.storage.get('pool:migrated'))?.done) return;
+        controller.startPreparationFailed = ctx.startPreparationFailed;
+        if (!(await applyAutoscale(ctx, controller))) return;
         if (controller.localFleet) await controller.localFleet.sweep();
         const result = await controller.boxFleet.tick({ mode: mode === 'on' ? 'on' : 'drain', env: controller.env, account, project: controller.poolProject, preprepared: true, preparationFailed: ctx.startPreparationFailed, skipAdmission: ctx.globalAdmission === true });
         const boxes = await records(ctx.storage, 'box:');

@@ -1,10 +1,14 @@
 import { runnableDemand, matchesWorkflowRule } from './workflow-demand.mjs';
 import { plan, poolKey, poolSize, supplyCounts, uncovered, localOfferActive } from './pool.mjs';
 import { records } from './pool-records.mjs';
+import { registrationRejected, rejectedRegistrationAbsent } from './registration-recovery.mjs';
+import { observeRouterStall } from './stall-alarm.mjs';
+import { rollingSnapshotManifest } from './rolling-snapshot.mjs';
 import { isPlanRefusal, isSizeRefusal } from '../domain.mjs';
-import { prunePool } from './pool-prune.mjs';
+import { prunePool, RETENTION } from './pool-prune.mjs';
 import { waitClaims } from './wait-for-busy.mjs';
 import { reusePacing, reuseHold, nominalReuseHold, paidIdleHold } from './reuse-pacing.mjs';
+import { holdDecision, holdPolicyConfig, recentArrivalPerHour, startsPlentiful } from './hold-policy.mjs';
 import { currentBreaker, breakerCanProbe, breakerForSize, reserveSizedProbe, releaseSizedProbe, releaseSizedProbeInTransaction, recordSizedBreakerOutcome, BREAKER_PROBE_DELAY_MS } from './verification-breaker.mjs';
 import { MACHINE_SIZES } from './sizes.mjs';
 import { SetupWatchdog } from './setup-watchdog.mjs';
@@ -94,6 +98,9 @@ export function largerDemandExpected(jobs, project, size, now) {
 }
 
 const limited = error => error?.service === 'boat' && (error.status === 429 || ['trial_compute_limit_reached', 'quota_exceeded', 'limit_exceeded', 'rate_limited'].includes(String(error.code?.code ?? error.code?.type ?? error.code ?? '').toLowerCase()));
+// What a provider failure says, for the log and the stored last-error: a create that fails here is
+// otherwise only visible as "a create did not happen", which names no cause.
+const failureDetail = error => ({ status: error?.status ?? null, code: String(error?.code?.code ?? error?.code?.type ?? error?.code ?? '') || null, retry_s: Number.isFinite(error?.retrySeconds) ? error.retrySeconds : null });
 
 export function placementEvidence(capacity, now, enabled = true) {
   if (!enabled) return { reason: 'project_disabled', categories: [], capacity: null };
@@ -170,7 +177,7 @@ export class BoxFleet {
   }
 
   async prepare(pool, size, count, queuedAt, reusable = false, options = {}) {
-    const laneFields = { ...(options.lane ? { lane: options.lane, lanePriority: options.lanePriority ?? null } : {}), ...(options.orderJobId !== undefined ? { orderJobId: options.orderJobId } : {}), ...(Number.isSafeInteger(options.orderRunId) ? { orderRunId: options.orderRunId } : {}) };
+    const laneFields = { ...(options.lane ? { lane: options.lane, lanePriority: options.lanePriority ?? null } : {}), ...(options.orderJobId !== undefined ? { orderJobId: options.orderJobId } : {}), ...(Number.isSafeInteger(options.orderRunId) ? { orderRunId: options.orderRunId } : {}), ...(options.orderSource === 'webhook' ? { orderSource: 'webhook' } : {}) };
     if (!this.budget || !Number.isSafeInteger(count) || count < 0) throw new TypeError('invalid admission');
     if (options.executor && (options.executor !== 'direct' || options.prefix !== 'direct-' || typeof options.golden !== 'string' || !options.golden)) throw new TypeError('invalid direct executor');
     if (options.resetMode !== undefined && (options.resetMode !== 'docker' || !reusable)) throw new TypeError('invalid reset mode');
@@ -230,7 +237,7 @@ export class BoxFleet {
       claim = await this.budget.claim(createKey);
       this.logger?.(JSON.stringify({ event: 'create_claim', project: this.project?.id, size: record.size, status: claim?.status ?? 'missing' }));
     }
-    let sandbox;
+    let sandbox, createMs;
     if (claim?.status !== 'pending') {
       sandbox = await this.api.findCreated(record);
       if (!sandbox) {
@@ -257,8 +264,12 @@ export class BoxFleet {
         const account = record.account ?? this.createAccount ?? env.BOAT_WALLET;
         const eligible = this.project?.snapshotBoot === true && (account === 'primary' || account === 'secondary' || account === env.BOAT_WALLET) && !record.executor && record.resetMode !== 'docker' && this.project?.dockerAccess !== true;
         const suffix = account === 'secondary' ? '_SECONDARY' : '';
+        // A rolling snapshot pins one commit's toolchain and every reusable box must
+        // verify the same baseline, so only a single-job create takes it; with reuse
+        // on, the reusable create keeps the project's fixed base snapshot.
+        const rolling = this.project?.rollingSnapshot === true && record.reusable !== true;
         let routerSnapshot;
-        if (eligible && this.project.rollingSnapshot === true) {
+        if (eligible && rolling) {
           const api = this.api.forIdentity ? await this.api.forIdentity(record) : this.api;
           try {
             routerSnapshot = await api.rollingSnapshot();
@@ -273,7 +284,7 @@ export class BoxFleet {
           if ((name || manifestSha256) && (!/^[a-z][a-z0-9-]{0,40}-\d{8}-[a-f0-9]{8,64}$/.test(name ?? '') || !/^[a-f0-9]{64}$/.test(manifestSha256 ?? ''))) throw new TypeError('invalid project snapshot configuration');
           if (name) routerSnapshot = { name, manifestSha256 };
         }
-        if (eligible && this.project.rollingSnapshot === true && !routerSnapshot) {
+        if (eligible && rolling && !routerSnapshot) {
           await releaseSizedProbe(this.storage, record.size, record.createKey);
           await this.budget.cancelPending(createKey);
           this.logger?.(JSON.stringify({ event: 'snapshot_not_ready', project: this.project.id }));
@@ -287,11 +298,15 @@ export class BoxFleet {
       record = { ...record, state: 'calling', callingAt: this.now(), machineTtlSeconds: ttl, ...(fingerprint ? { provisionerFingerprint: fingerprint } : {}) };
       await this.storage.put(key, record);
       try {
+        const started = this.now();
         const result = await this.api.create({ ...record, machineSize: record.size, routerReusable: record.reusable, ...(record.resetMode ? { routerResetMode: record.resetMode } : {}), ...(record.executor !== 'direct' && this.project?.dockerAccess === true ? { routerDockerAccess: true } : {}) }, ttl);
+        createMs = this.now() - started;
         sandbox = result?.sandbox;
         if (!/^bx_[23456789abcdefghjkmnpqrstuvwxyz]{8}$/.test(sandbox?.id ?? '')) throw new Error('invalid sandbox');
       } catch (error) {
-        if (record.bootPath === 'snapshot' && this.project?.rollingSnapshot !== true && error?.service === 'boat' && error.status === 404 && error.code === 'snapshot_not_found') {
+        // A discovered rolling generation has no plain fallback to take; a project's fixed
+        // base snapshot still falls back so a retired name cannot stop every create.
+        if (record.bootPath === 'snapshot' && !rollingSnapshotManifest(record.routerSnapshot?.name) && error?.service === 'boat' && error.status === 404 && error.code === 'snapshot_not_found') {
           const fallbackKey = crypto.randomUUID();
           const fallbackName = `boat-router-${(await this.budget.claimKey(fallbackKey)).slice(0, 32)}`;
           record = { ...record, state: 'snapshot_missing', fallbackKey, fallbackName };
@@ -309,6 +324,11 @@ export class BoxFleet {
           if (await this.budget.settle(createKey, 'not_created')) { await afterStart?.(record, 'not_created'); await this.discardCreate(createKey); }
           return false;
         }
+        const detail = failureDetail(error);
+        this.logger?.(JSON.stringify({ event: 'create_failed', project: this.project?.id, size: record.size, boot: record.bootPath ?? null, ...detail }));
+        // The pool tick's log does not reach the unit's journal, so the stored last-error is where a
+        // failed create names its cause.
+        await this.storage.put('pool:last-error', { at: this.now(), stage: 'create', createKey, ...detail });
         if (!limited(error)) this.alert?.('create_failures', { value: 1, limit: 1, active: true });
         if (limited(error) || (error?.service === 'boat' && error.status === 503)) {
           const delay = Math.max(30_000, Math.min(900_000, (error.retrySeconds ?? 0) * 1000));
@@ -326,7 +346,7 @@ export class BoxFleet {
     await afterStart?.(record, 'created');
     this.alert?.('create_failures', { value: 0, limit: 1, active: false });
     if (!await this.budget.settle(createKey, 'created')) return false;
-    this.logger?.(JSON.stringify({ event: 'create', project: this.project?.id, machine_id: sandbox.id, size: record.size, snapshot: record.routerSnapshot?.name }));
+    this.logger?.(JSON.stringify({ event: 'create', project: this.project?.id, machine_id: sandbox.id, size: record.size, job_id: record.orderJobId, run_id: record.orderRunId, source: record.orderSource, snapshot: record.routerSnapshot?.name, create_ms: createMs }));
     return this.storage.transaction(async tx => {
       const current = await tx.get(key);
       if (!current) return false;
@@ -405,7 +425,7 @@ export class BoxFleet {
       const limits = uncertain ? {} : await selectedApi.limits();
       if (!uncertain && (!limits.canStart || !limits.machineTypes?.some(type => type.type === item.size && type.available === true))) { this.logger?.(JSON.stringify({ event: 'admission_refused', project: this.project?.id, reason: 'provider_limits', size: item.size })); return; }
       await this.admit(key, limits, Number(project.machineTtlSeconds ?? env.MACHINE_TTL_SECONDS ?? 7200), epoch, beforeStart, afterStart);
-    } catch { await this.storage.put('pool:last-error', { at: this.now(), stage: 'create', createKey: key }); }
+    } catch (error) { await this.storage.put('pool:last-error', { at: this.now(), stage: 'create', createKey: key, ...failureDetail(error) }); }
   }
 
   // which queued jobs still need a box. Supply that was created or reserved for a lane covers that
@@ -554,7 +574,9 @@ export class BoxFleet {
         if (!Number.isFinite(await tx.get(key))) await tx.put(key, now);
       });
     }
-    if (executor !== 'direct' && !prepareOnly && mode !== 'shadow' && complete && now - (await this.storage.get('pool:orphan-sweep') ?? -Infinity) >= 600_000) {
+    // Every reconcile, not every ten minutes: a leaked provider sandbox holds a
+    // live slot until it is adopted or retired (2026-11-25 and 2026-11-26).
+    if (executor !== 'direct' && !prepareOnly && mode !== 'shadow' && complete) {
       try { await this.sweepOrphans(snapshot, project); }
       catch { await this.storage.put('pool:last-error', { at: now, stage: 'orphan-sweep' }); }
     }
@@ -623,9 +645,34 @@ export class BoxFleet {
     // 20 min) is the whole extension, after which the box retires as normal.
     const paidHold = paidIdleHold({ pacing, baseSeconds: baseHold, configured: project.reuse?.idleHoldSecondsWhenStartsPaid ?? account.reuse?.idleHoldSecondsWhenStartsPaid });
     const nominalHold = paidHold ?? nominalReuseHold(baseHold, pacing?.startsPerHour);
+    // Cost-aware hold (docs/local-admission.md): a box younger than its paid
+    // window stays warm; after it, an idle box retires when the start budget
+    // covers the arrival rate, and otherwise stays one more paid window only
+    // while work is queued or predicted.
+    const holdPolicy = holdPolicyConfig(account, project);
+    const arrivalPerHour = recentArrivalPerHour(jobs, now, holdPolicy.arrivalLookbackSeconds);
+    const startBudget = { dayRemaining: pacing?.dayRemaining ?? null, hourRemaining: pacing?.hourRemaining ?? null };
+    // Scarcity is judged by the starts the account actually spent, not by jobs
+    // queued: reuse serves many jobs per start.
+    const startRatePerHour = pacing?.hourUsed ?? null;
+    const plentiful = startsPlentiful({ ...startBudget, arrivalPerHour: startRatePerHour, margin: holdPolicy.plentifulMargin });
+    const queuedByPool = new Map();
+    for (const job of jobs) if (job.status === 'queued' && !job.missing) queuedByPool.set(job.pool, (queuedByPool.get(job.pool) ?? 0) + 1);
+    const holdFor = box => {
+      if (!holdPolicy.enabled) return nominalHold;
+      const idleSince = box.onlineAt ?? box.since;
+      if (!Number.isFinite(idleSince)) return baseHold;
+      const idleSeconds = Math.max(0, (now - idleSince) / 1000);
+      const boxAgeSeconds = Number.isFinite(box.createdAt) ? Math.max(0, (now - box.createdAt) / 1000) : null;
+      const decision = holdDecision({ boxAgeSeconds, idleSeconds, queued: queuedByPool.get(box.pool) ?? 0, arrivalPerHour, startRatePerHour, starts: startBudget, config: holdPolicy });
+      return Math.max(0, Math.floor(idleSeconds + decision.holdSeconds));
+    };
     const reuseStatus = { reuseIdleHoldSeconds: nominalHold,
       reusePacingStartsPerHour: pacing?.startsPerHour ?? null, reusePacingSampledAt: pacing?.sampledAt ?? null,
       reuseDayRoomEmpty: pacing?.dayRoomEmpty ?? null, reusePaidExtraRoom: pacing?.paidExtraRoom ?? null,
+      reuseHoldPolicy: holdPolicy.enabled ? { paidWindowSeconds: holdPolicy.paidWindowSeconds, plentifulMargin: holdPolicy.plentifulMargin,
+        arrivalLookbackSeconds: holdPolicy.arrivalLookbackSeconds, scarceWindows: holdPolicy.scarceWindows,
+        arrivalPerHour, startRatePerHour, dayRemaining: startBudget.dayRemaining, hourRemaining: startBudget.hourRemaining, plentiful } : null,
       reuseHoldBasis: paidHold != null ? 'paid_starts' : !pacing ? 'unknown' : pacing.startsPerHour <= 5 ? 'low_rate' : pacing.startsPerHour >= 15 ? 'normal_rate' : 'transition' };
     const waitPools = pools.map(pool => pool.reason === 'breaker' ? { ...pool, reason: null } : pool);
     const waitUnits = account.paidOverflow?.enabled === true ? units.filter(unit => unit.kind !== 'create' || unit.state !== 'pending') : units;
@@ -668,7 +715,7 @@ export class BoxFleet {
       const idle = boxes.filter(box => box.pool === pool.key && ['ready', 'idle', 'local-held'].includes(box.state) && !byName.get(box.runnerName)?.busy);
       const overdue = idle.filter(box => {
         const since = box.state === 'ready' ? box.since : box.onlineAt ?? box.since;
-        const hold = reuseHold({ box: box.state === 'ready' ? { ...box, onlineAt: since } : box, baseSeconds: baseHold, nominalSeconds: nominalHold, now, account, project, env, enabled: waitEnabled });
+        const hold = reuseHold({ box: box.state === 'ready' ? { ...box, onlineAt: since } : box, baseSeconds: baseHold, nominalSeconds: holdFor(box.state === 'ready' ? { ...box, onlineAt: since } : box), now, account, project, env, enabled: waitEnabled });
         return Number.isFinite(since) && now - since > hold * 1000;
       });
       let status = { ...output[pool.key], ...reuseStatus, idleBoxes: idle.length, idleBoxesOverHold: overdue.length, idleBoxSampledAt: now };
@@ -677,6 +724,7 @@ export class BoxFleet {
         if (previous?.reason?.startsWith('ledger:')) status = { ...status, reason: previous.reason };
       }
       await this.storage.put(`pool:status:${pool.label}`, status);
+      await observeRouterStall(this.storage, { project: project.id, pool: pool.key, demand: status.D, boxes, creates, now, enabled: mode === 'on' && env.ENABLED === 'true', logger: this.logger });
       await this.storage.transaction(async tx => {
         const key = `pool:snapshot-hold:${pool.label}`, hold = await tx.get(key);
         if (complete) { if (hold) await tx.delete(key); return; }
@@ -730,7 +778,7 @@ export class BoxFleet {
         const queuedSnapshot = jobs.filter(job => job.pool === pool.key && job.status === 'queued' && !job.missing).length;
         for (const box of boxes.filter(item => item.pool === pool.key && item.state === 'idle').sort((a, b) => a.since - b.since)) {
           if (!surplus) break;
-          const hold = reuseHold({ box, baseSeconds: baseHold, nominalSeconds: nominalHold, now, account, project, env, enabled: waitEnabled });
+          const hold = reuseHold({ box, baseSeconds: baseHold, nominalSeconds: holdFor(box), now, account, project, env, enabled: waitEnabled });
           if (now - (box.onlineAt ?? box.since) < hold * 1000 || byName.get(box.runnerName)?.busy) continue;
           const retired = executor === 'direct'
             ? ((await this.queuedCount(box)) > queuedSnapshot ? false : await this.transition(box.machineId, 'retire_direct', { runnerFenced: true, retirementReason: 'idle_hold_expired' }))
@@ -804,7 +852,7 @@ export class BoxFleet {
         this.logger?.(JSON.stringify({ event: 'lane_borrow', project: project.id, job_id: job.id, lane: job.lane ?? null, used: laneUsed, reserved, lend, borrowed: borrowedSlots({ used: laneUsed, cap, reserved }) + 1 }));
       }
       const resetMode = reuseFor(pool.label);
-      const laneOptions = { orderJobId: job.id, orderRunId: job.runId, ...(lanesOn && job.lane ? { lane: job.lane, lanePriority: lanePriorityOf(job) } : {}) };
+      const laneOptions = { orderJobId: job.id, orderRunId: job.runId, orderSource: job.source, ...(lanesOn && job.lane ? { lane: job.lane, lanePriority: lanePriorityOf(job) } : {}) };
       await this.prepare(pool.key, pool.size, 1, job.queuedAt, resetMode !== null, executor === 'direct' ? { executor, prefix: 'direct-', golden: job.golden, ...laneOptions } : resetMode === 'docker' ? { resetMode, ...laneOptions } : laneOptions);
       if (scopedBreaker?.tripped) preparedProbes.add(pool.size);
       if (lanesOn) { const key = job.lane ?? 'none'; laneUsed[key] = (laneUsed[key] ?? 0) + 1; }
@@ -865,7 +913,7 @@ export class BoxFleet {
         continue;
       }
       try { await this.admit(item.createKey, limits ?? {}, Number(project.machineTtlSeconds ?? env.MACHINE_TTL_SECONDS ?? 7200), epoch); }
-      catch { await this.storage.put('pool:last-error', { at: now, stage: 'create', createKey: item.createKey }); }
+      catch (error) { await this.storage.put('pool:last-error', { at: now, stage: 'create', createKey: item.createKey, ...failureDetail(error) }); }
     }
     // Release no more warm runners than aged demand can use. Otherwise a
     // younger GitHub job could take an extra runner before its offer expires.
@@ -883,7 +931,7 @@ export class BoxFleet {
     for (const box of boxes) {
       if (typeof box.pool === 'string' && ['idle', 'local-fencing', 'local-held', 'ready'].includes(box.state)) {
         const readySurplus = complete && (output[box.pool]?.surplus ?? 0) > 0;
-        const readyHold = reuseHold({ box: { ...box, onlineAt: box.since }, baseSeconds: baseHold, nominalSeconds: nominalHold, now, account, project, env, enabled: waitEnabled });
+        const readyHold = reuseHold({ box: { ...box, onlineAt: box.since }, baseSeconds: baseHold, nominalSeconds: holdFor({ ...box, onlineAt: box.since }), now, account, project, env, enabled: waitEnabled });
         if (project.dispatchOnly === true && box.state === 'ready' && (readySurplus || !demand.some(job => job.pool === box.pool && job.status === 'queued')) && Number.isFinite(box.since) && now - box.since >= readyHold * 1000) {
           if (await this.transition(box.machineId, 'retire_ready', { retirementReason: 'idle_hold_expired' }) && readySurplus) output[box.pool].surplus--;
           continue;
@@ -917,7 +965,7 @@ export class BoxFleet {
           const ttl = Number(box.machineTtlSeconds);
           const maxAge = Math.min(account.reuse?.maxAgeSeconds ?? 86400, project.reuse?.maxAgeSeconds ?? 86400);
           const expired = !Number.isFinite(box.createdAt) || !Number.isFinite(ttl) || !Number.isFinite(maxAge) || now - box.createdAt >= Math.min(ttl, maxAge) * 1000;
-          const hold = reuseHold({ box, baseSeconds: baseHold, nominalSeconds: nominalHold, now, account, project, env, enabled: waitEnabled });
+          const hold = reuseHold({ box, baseSeconds: baseHold, nominalSeconds: holdFor(box), now, account, project, env, enabled: waitEnabled });
           const idleExpired = !demand.some(job => job.pool === box.pool && job.status === 'queued') && now - (box.onlineAt ?? box.since) >= hold * 1000;
           if (mode === 'drain' || box.drainOnly || override === 'off' || !box.reusable || !box.baselineHash || expired || idleExpired) await this.transition(box.machineId, 'retire_held', { retirementReason: expired ? 'ttl_expired' : idleExpired ? 'idle_hold_expired' : 'reuse_ineligible' });
           else if (releaseBudget.get(box.pool) > 0) {
@@ -934,7 +982,12 @@ export class BoxFleet {
       if (complete && (mode === 'drain' || box.drainOnly) && box.state === 'idle' && !byName.get(box.runnerName)?.busy) { if (executor === 'direct') await this.transition(box.machineId, 'retire_direct', { runnerFenced: true, retirementReason: 'pool_drain' }); else await this.retire(box.machineId, 'pool_drain'); continue; }
       if (complete && override === 'off' && box.state === 'idle' && (box.jobs ?? 0) > 0) { if (executor === 'direct') await this.transition(box.machineId, 'retire_direct', { runnerFenced: true, retirementReason: 'reuse_disabled' }); else await this.retire(box.machineId, 'reuse_disabled'); continue; }
       const ttl = ttlFor(box);
-      const reuseEnabled = !box.drainOnly && mode !== 'drain' && reuseFor(poolLabel(box.pool)) === (box.resetMode ?? 'light') && !generationCapped(box) && ageAllows(box);
+      // Drain an over-budget fleet only after jobs finish, never kill a busy
+      // runner. Keep the oldest boxes for warm reuse inside the new slot cap.
+      const budgetKeepers = account.poolPacing?.slotBudget === true ? boxes.filter(item => item.state !== 'deleted').sort((a, b) => (a.createdAt ?? a.since) - (b.createdAt ?? b.since) || a.machineId.localeCompare(b.machineId)).slice(0, project.caps.concurrent) : null;
+      const withinBudget = !budgetKeepers || budgetKeepers.some(item => item.machineId === box.machineId);
+      if (complete && !withinBudget && box.state === 'idle' && !byName.get(box.runnerName)?.busy) { await this.retire(box.machineId, 'live_budget'); continue; }
+      const reuseEnabled = withinBudget && !box.drainOnly && mode !== 'drain' && reuseFor(poolLabel(box.pool)) === (box.resetMode ?? 'light') && !generationCapped(box) && ageAllows(box);
       try {
         const { associated, last, guarded, missingResult } = jobGuard(box);
         if (executor === 'jit') {
@@ -942,6 +995,9 @@ export class BoxFleet {
           await this.verificationOutcome(box, 'job_completed', true, null, { jobId: job.id, completedAt: job.completedAt });
         }
         }
+        // Tombstones may still provide late job-success evidence, but have no
+        // next lifecycle step. Don't point-read each deleted box twice per tick.
+        if (box.state === 'deleted') continue;
         const retirementReason = !box.reusable ? 'created_without_reuse' : !box.baselineHash ? 'baseline_missing' : guarded ? (last?.slowBox || last?.conclusion === 'timed_out' ? 'slow_job' : 'missing_job_result') : override === 'off' || (box.resetMode === 'docker' && reuseFor(poolLabel(box.pool)) !== 'docker') ? 'reuse_disabled' : generationCapped(box) ? 'generation_limit' : !reuseEnabled ? 'reuse_ineligible' : null;
         // Jobs still offered to the minis are not reserved by a ready box.
         const offered = new Set(demand.filter(job => job.status === 'queued' && !offerAged(job)).map(job => job.id));
@@ -978,22 +1034,63 @@ export class BoxFleet {
       cursor = [...page.keys()].at(-1);
     }
     const entries = Object.entries(ledger?.claims ?? {});
-    const claims = new Set(entries.filter(([key, claim]) => claim.project === project.id && ['calling', 'unknown', 'created'].includes(claim.status) && entries.filter(([other]) => other.slice(0, 32) === key.slice(0, 32)).length === 1).map(([key]) => `boat-router-${key.slice(0, 32)}`));
+    const claimed = entries.filter(([key, claim]) => claim.project === project.id && ['calling', 'unknown', 'created'].includes(claim.status) && entries.filter(([other]) => other.slice(0, 32) === key.slice(0, 32)).length === 1);
+    const claims = new Set(claimed.map(([key]) => `boat-router-${key.slice(0, 32)}`));
+    const otherClaims = new Set(entries.filter(([, claim]) => claim.project !== project.id).map(([key]) => `boat-router-${key.slice(0, 32)}`));
     const knownNames = new Set(creates.map(create => create.routerCreateName));
     const knownIds = new Set(boxes.map(box => box.machineId));
     const duplicates = new Set(sandboxes.filter((box, i) => sandboxes.findIndex(other => other.name === box.name) !== i).map(box => box.name));
+    // A router-named box with no create record, no box record and no claim is a
+    // leak: a restart or a lost durable record left it behind, and it still holds
+    // one provider live slot, so admission refuses every create (ledger:concurrency).
+    // It is attributable only when this account holds one project; with several,
+    // leave it for an operator rather than destroy another project's box.
+    const projectCount = Number.isSafeInteger(this.projectCount) && this.projectCount > 0 ? this.projectCount : 1;
+    const routerName = /^boat-router-[0-9a-f]{32}$/;
     for (const sandbox of sandboxes) {
-      if (!claims.has(sandbox.name) || knownNames.has(sandbox.name) || knownIds.has(sandbox.id) || duplicates.has(sandbox.name) || !/^bx_[23456789abcdefghjkmnpqrstuvwxyz]{8}$/.test(sandbox.id ?? '')) continue;
+      if (knownNames.has(sandbox.name) || knownIds.has(sandbox.id) || duplicates.has(sandbox.name) || !/^bx_[23456789abcdefghjkmnpqrstuvwxyz]{8}$/.test(sandbox.id ?? '')) continue;
+      const claimedBox = claims.has(sandbox.name);
+      const leaked = !claimedBox && projectCount === 1 && routerName.test(sandbox.name ?? '') && !otherClaims.has(sandbox.name);
+      if (!claimedBox && !leaked) continue;
       const aliases = [...indexes].filter(([, value]) => value.machineId === sandbox.id).map(([key]) => key.slice(7));
       const prefix = `boat-${project.id}-${sandbox.id}-g`;
       const runners = (snapshot.runners ?? []).filter(runner => aliases.includes(runner.name) || runner.name?.startsWith(prefix));
       const running = jobs.some(job => job.status === 'in_progress' && (aliases.includes(job.runnerName) || job.runnerName?.startsWith(prefix)));
       const runner = runners.length === 1 ? runners[0] : null;
-      await this.storage.transaction(async tx => {
-        if (await tx.get(`box:${sandbox.id}`)) return;
+      const adopted = await this.storage.transaction(async tx => {
+        if (await tx.get(`box:${sandbox.id}`)) return false;
         await tx.put(`box:${sandbox.id}`, applyBoxEvent(null, 'adopt_orphan', { machineId: sandbox.id, ...(this.createAccount ? { account: this.createAccount } : {}), pool: null, drainOnly: true, orphan: true, aliases, noRunnerKnown: !running && runners.length === 0, runnerId: runner?.id ?? null, runnerName: runner?.name ?? null, repo: project.repo, installation: this.installation, reusable: false }, this.now()));
         await tx.put(`pool:drain-only:${sandbox.id}`, { at: this.now(), reason: 'orphan' });
+        return true;
       });
+      if (!adopted) continue;
+      // A leaked box with no runner and no in-progress job serves nothing, so
+      // retire it now through the normal quarantine -> destroy path. One with a
+      // runner or a job is adopted into the normal lifecycle and retires when
+      // that work finishes.
+      if (leaked && !running && runners.length === 0) {
+        const view = { complete: true, at: snapshot.at, runners: snapshot.runners ?? [], jobs };
+        await this.stepBox(sandbox.id, view);
+        await this.stepBox(sandbox.id, view);
+      }
+      this.logger?.(JSON.stringify({ event: 'orphan_sweep', project: project.id, machineId: sandbox.id, name: sandbox.name,
+        decision: leaked && !running && runners.length === 0 ? 'retire' : 'adopt', leaked, claimed: claimedBox,
+        runner: runner?.name ?? null, running }));
+    }
+    // A create whose provider call ended without a definite answer keeps its record but loses its
+    // claim, and no admission path ever revisits a record that is not pending: the record would hold
+    // one of the project's concurrency slots for good. Once the account lists no sandbox under the
+    // create's name and the five-minute grace an uncertain claim gets has passed, the create is gone,
+    // so the record goes too and the slot returns to the pool.
+    const liveClaims = new Set(entries.filter(([, claim]) => claim.project === project.id).map(([key]) => `boat-router-${key.slice(0, 32)}`));
+    const listed = new Set(sandboxes.map(box => box.name));
+    for (const create of creates) {
+      if (create.state === 'pending' || create.state === 'snapshot_missing') continue;
+      if (listed.has(create.routerCreateName) || liveClaims.has(create.routerCreateName)) continue;
+      const since = create.callingAt ?? create.at;
+      if (!Number.isFinite(since) || this.now() - since < 300_000) continue;
+      await this.discardCreate(create.createKey);
+      this.logger?.(JSON.stringify({ event: 'discard_orphan_create', project: project.id, createKey: create.createKey, state: create.state, age_ms: this.now() - since }));
     }
     await this.storage.put('pool:orphan-sweep', this.now());
   }
@@ -1011,9 +1108,16 @@ export class BoxFleet {
 
   async verificationOutcome(box, kind, ok, detail, evidence = {}) {
     const key = evidence.jobId ? `verification:attempt:job-success:${evidence.jobId}` : `verification:attempt:${ok ? 'online-success' : 'failure'}:${box.machineId}:${box.generation ?? 0}`;
+    // Only memoize confirmed job-success markers, never the breaker state.
+    // Expire no later than prunePool can delete a marker.
+    const seen = evidence.jobId ? this.jobSuccessSeen ??= new Map() : null;
+    if (seen?.get(key) > this.now()) return;
+    let recordedAt;
     const change = await this.storage.transaction(async tx => {
-      if (await tx.get(key)) return;
-      await tx.put(key, { at: this.now(), kind, ...(box.size ? { size: box.size } : {}), ...(Number.isFinite(box.createdAt) ? { createdAt: box.createdAt } : {}), ...(detail ? { phase: box.state, message: JSON.stringify(detail) } : {}) });
+      const existing = await tx.get(key);
+      recordedAt = existing ? existing.at : this.now();
+      if (existing) return;
+      await tx.put(key, { at: recordedAt, kind, ...(box.size ? { size: box.size } : {}), ...(Number.isFinite(box.createdAt) ? { createdAt: box.createdAt } : {}), ...(detail ? { phase: box.state, message: JSON.stringify(detail) } : {}) });
       this.logger?.(JSON.stringify({ event: 'verification_result', project: this.project?.id, machine_id: box.machineId, kind, phase: box.state, ok, ...(detail ? { detail } : {}) }));
       if ((box.generation ?? 0) > 0 && !evidence.jobId) return;
       if (evidence.jobId && (!Number.isFinite(evidence.completedAt) || evidence.completedAt > this.now())) return;
@@ -1022,6 +1126,10 @@ export class BoxFleet {
       if (change.opened) { const count = change.breaker.counts[box.size]; this.logger?.(JSON.stringify({ event: 'verification_breaker_trip', project: this.project?.id, size: box.size, failures: count })); await this.emit?.('alert_verification_breaker', null, { size: box.size, failures: count }, tx); }
       return change;
     });
+    if (seen && Number.isFinite(recordedAt)) {
+      if (seen.size >= 4096) seen.delete(seen.keys().next().value);
+      seen.set(key, recordedAt + RETENTION);
+    }
     if (change?.opened) this.alert?.('breaker_open', { value: 1, limit: 1, active: true });
     if (change?.cleared && !(await this.storage.get('verification:breaker'))?.tripped) this.alert?.('breaker_open', { value: 0, limit: 1, active: false });
   }
@@ -1101,7 +1209,7 @@ export class BoxFleet {
         .sort(reserveOrder)[0];
       if (!job) return null;
       if (box.slowHost === true && slowBoxYields(box, job, boxes, this.now())) return null;
-      const reserved = applyBoxEvent(box, 'reserve', { dispatchJobId: job.id, dispatchAt: this.now(), ...(job.lane ? { lane: job.lane } : {}) }, this.now());
+      const reserved = applyBoxEvent(box, 'reserve', { dispatchJobId: job.id, dispatchAt: this.now(), dispatchSource: job.source ?? null, dispatchRunId: job.runId ?? null, ...(job.lane ? { lane: job.lane } : {}) }, this.now());
       await tx.put(key, reserved);
       const queuedEvidence = await tx.get(`placement-queue:${job.id}`) ?? null;
       const placement = { at: this.now(), jobId: job.id, machineId, generation: box.generation ?? 0, boxCreatedAt: box.createdAt ?? null, bootDoneObservedAt: box.bootDoneObservedAt ?? null, boxReadyAt: box.timing?.ready ?? null, ...evidence, queuedEvidence };
@@ -1109,7 +1217,7 @@ export class BoxFleet {
       if (!snapshot?.complete) await tx.put('dispatch:snapshot-recovery-last', this.now());
       return reserved;
     });
-    if (result) this.logger?.(JSON.stringify({ event: 'boat_job_reserved', project: this.project?.id, job_id: result.dispatchJobId, machine_id: machineId, ...(result.lane ? { lane: result.lane } : {}), ...evidence }));
+    if (result) this.logger?.(JSON.stringify({ event: 'boat_job_reserved', project: this.project?.id, job_id: result.dispatchJobId, run_id: result.dispatchRunId, source: result.dispatchSource, machine_id: machineId, ...(result.lane ? { lane: result.lane } : {}), ...evidence }));
     return result;
   }
 
@@ -1161,7 +1269,7 @@ export class BoxFleet {
     if (providerLimited) await this.storage.put('startBackoffUntil', this.now() + 60_000);
     else await this.verificationOutcome(box, reason, false, diagnostic);
     let retry = null;
-    if ((box.bootPath === 'snapshot' ? this.project?.rollingSnapshot !== true : !box.setupRetry && !providerLimited && diagnostic.retryEligible === true) && box.createKey && this.budget && box.pool && box.size) {
+    if ((box.bootPath === 'snapshot' ? !rollingSnapshotManifest(box.routerSnapshot?.name) : !box.setupRetry && !providerLimited && diagnostic.retryEligible === true) && box.createKey && this.budget && box.pool && box.size) {
       const createKey = crypto.randomUUID();
       const routerCreateName = `boat-router-${(await this.budget.claimKey(createKey)).slice(0, 32)}`;
       retry = { pool: box.pool, size: box.size, createKey, routerCreateName, state: 'pending', at: this.now(), queuedAt: box.queuedAt ?? box.createdAt ?? this.now(), reusable: box.reusable === true, setupRetry: true, ...(box.bootPath === 'snapshot' ? { bootPath: 'plain_fallback', fallbackOf: box.createKey, fallbackAfterMachineId: box.machineId } : {}), ...(box.account ? { account: box.account } : this.createAccount ? { account: this.createAccount } : {}) };
@@ -1200,7 +1308,11 @@ export class BoxFleet {
       } else if (box.state === 'idle') {
         const online = runner?.status === 'online';
         if (online && !box.everOnline) await this.verificationOutcome(box, 'online', true);
-        box = await this.transition(machineId, 'observe', { online, onlineAt: online ? box.onlineAt ?? this.now() : box.onlineAt, everOnline: box.everOnline || online, offlineSince: online ? null : box.offlineSince ?? (box.everOnline ? this.now() : box.startedAt ?? box.since) });
+        // A snapshot taken before this generation's runner registered cannot say it is offline:
+        // the runner list is up to 15 minutes old, so a freshly reset box would be retired 120 s
+        // after every job and the idle hold would never apply.
+        const runnerUnseen = !runner && Number.isFinite(snapshot.at) && snapshot.at < (box.startedAt ?? box.since);
+        box = await this.transition(machineId, 'observe', { online, runnerUnseen, onlineAt: online ? box.onlineAt ?? this.now() : box.onlineAt, everOnline: box.everOnline || online, offlineSince: online || runnerUnseen ? null : box.offlineSince ?? (box.everOnline ? this.now() : box.startedAt ?? box.since) });
       } else if (!runner && !inProgress) {
         box = await this.transition(machineId, 'runner_gone', { runnerFenced: true, jobs: (box.jobs ?? 0) + 1 });
       } else if (!inProgress && (completed || (!runner?.busy && snapshot.at !== box.lastIdleSnapshotAt))) {
@@ -1317,9 +1429,10 @@ export class BoxFleet {
       // whose runs-on names a pool label plus a Boat label can land here and never on a mini runner.
       for (const extra of this.project?.boatLabels ?? []) if (!labels.includes(extra)) labels.push(extra);
       const runnerName = `boat-${project}-${machineId}-g${box.generation}`;
-      box = await this.transition(machineId, 'register', { repo, installation: this.installation, label, labels, runnerName, runnerIdentity: runnerName, boxGeneration: true, routerReusable: box.reusable, ...(box.resetMode ? { routerResetMode: box.resetMode } : {}), runnerId: null });
+      box = await this.transition(machineId, 'register', { repo, installation: this.installation, label, labels, runnerName, runnerIdentity: runnerName, boxGeneration: true, routerReusable: box.reusable, ...(box.resetMode ? { routerResetMode: box.resetMode } : {}), runnerId: null, registrationRejected: false });
       if (!box) return;
       try {
+        const configureAt = this.now();
         await this.api.configure(box, async runnerId => {
           await this.storage.transaction(async tx => {
             const current = await tx.get(`box:${machineId}`);
@@ -1328,6 +1441,7 @@ export class BoxFleet {
             await tx.put(`runner:${runnerName}`, { kind: 'boat', machineId, generation: box.generation });
           });
         });
+        const configureMs = this.now() - configureAt;
         box = await this.storage.get(`box:${machineId}`);
         if (!box?.runnerId) throw new Error('runner missing');
         if (this.project?.dispatchOnly === true) {
@@ -1336,13 +1450,16 @@ export class BoxFleet {
           // a matrix shard reservation moves to another queued shard of its run; the runner still starts.
           if (lost && !await this.retargetMatrixReservation(machineId, 'registering')) return this.transition(machineId, lost, lost === 'reservation_timeout' ? { reservationExpiredJobId: box.dispatchJobId } : {});
         }
+        const startAt = this.now();
         const result = await this.api.start(box);
         if (result?.success === false) throw new Error('start failed');
+        this.logger?.(JSON.stringify({ event: 'boat_runner_started', project, machine_id: machineId, job_id: box.dispatchJobId, run_id: box.dispatchRunId, source: box.dispatchSource, configure_ms: configureMs, start_ms: this.now() - startAt }));
         return this.transition(machineId, 'start', { startedAt: this.now(), online: false, everOnline: false, onlineAt: null, offlineSince: null });
       } catch (error) {
         const detail = box.generation > 0 ? { step: 're-register runner', exitCode: null, output: '', service: ['boat', 'github'].includes(error?.service) ? error.service : null, status: Number.isInteger(error?.status) && error.status >= 0 && error.status <= 599 ? error.status : null } : undefined;
         await this.verificationOutcome(box, 'registration_uncertain', false, detail);
-        return this.transition(machineId, 'registration_failed', { failureReason: 'registration_uncertain' });
+        const current = await this.storage.get(`box:${machineId}`);
+        return this.transition(machineId, 'registration_failed', { failureReason: 'registration_uncertain', registrationRejected: registrationRejected(error, current) });
       }
     }
     if (box.state === 'finished') {
@@ -1387,6 +1504,10 @@ export class BoxFleet {
       return this.transition(machineId, 'reset_done', { runnerId: null, runnerName: null, runnerIdentity: null, runnerFenced: false, ...(result.summary ? { lastResetSummary: result.summary, ...healthFields(result.summary.health) } : {}) });
     }
     if (box.state === 'quarantined' && snapshot.complete === true) {
+      if (await rejectedRegistrationAbsent(this.storage, box, snapshot, this.now())) {
+        this.logger?.(JSON.stringify({ event: 'registration_rejection_released', project: this.project?.id, machine_id: machineId, generation: box.generation }));
+        return this.transition(machineId, 'quarantine_release', { runnerFenced: true, retirementReason: 'registration_rejected' });
+      }
       const prefix = box.orphan ? `boat-${this.project?.id}-${box.machineId}-g` : null;
       const matching = (snapshot.runners ?? []).filter(item => item.name === box.runnerName || (box.runnerId && item.id === box.runnerId) || (box.orphan && ((box.aliases ?? []).includes(item.name) || item.name?.startsWith(prefix))));
       if (matching.length > 1) return;

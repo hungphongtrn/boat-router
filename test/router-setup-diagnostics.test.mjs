@@ -125,7 +125,7 @@ test('available log data is sanitized and malformed data is marked', async () =>
 
 test('apt retry is bounded to fetches and both update and install carry retry settings', () => {
   const script = bootstrap();
-  assert.match(script, /apt-get -o Acquire::Retries=3 -o APT::Update::Error-Mode=any update/);
+  assert.match(script, /apt-get -o Acquire::Retries=3 -o Acquire::AllowReleaseinfoChange=true -o APT::Update::Error-Mode=any update/);
   assert.match(script, /apt-get -o Acquire::Retries=3 install/);
   assert.match(script, /BOAT_SETUP_PHASE %s/);
   assert.match(script, /^phase apt_update$/m);

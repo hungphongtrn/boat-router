@@ -108,6 +108,22 @@ test('hard deadlines trigger at their boundaries and offline removal needs a com
   assert.equal(calls, 1);
 });
 
+test('an idle box is not counted offline by a snapshot older than its runner start', async () => {
+  const { boxDeadline } = await import('../src/router/box-fleet.mjs');
+  const storage = new Storage(); let now = 500_000;
+  await storage.put(`box:${box.machineId}`, { ...box, runnerName: 'boat-demo-g3', since: 400_000, startedAt: 400_000, everOnline: false });
+  const fleet = new BoxFleet(storage, {}, () => now);
+  await fleet.stepBox(box.machineId, { complete: true, at: 300_000, runners: [], jobs: [] });
+  let record = await storage.get(`box:${box.machineId}`);
+  assert.equal(record.runnerUnseen, true);
+  assert.equal(record.offlineSince, null);
+  assert.equal(boxDeadline(record, 900_000), null);
+  await fleet.stepBox(box.machineId, { complete: true, at: 450_000, runners: [], jobs: [] });
+  record = await storage.get(`box:${box.machineId}`);
+  assert.equal(record.runnerUnseen, false);
+  assert.equal(boxDeadline(record, 900_000), 'offline_timeout');
+});
+
 test('booted reusable box baselines and registers the machine generation', async () => {
   const storage = new Storage(); let now = 0, started;
   const machine = { machineId: box.machineId, pool: JSON.stringify(['owner/repo', 'boat-large']), state: 'booting', since: 0, generation: 0, reusable: true };
@@ -343,6 +359,31 @@ test('orphan sweep adopts only project ledger sandboxes and fences a busy runner
   assert.equal(await storage.get('box:bx_2345678a'), undefined);
   await fleet.stepBox(id, snapshot);
   assert.equal((await storage.get(`box:${id}`)).state, 'busy');
+});
+
+test('orphan sweep releases a create whose provider call never answered', async () => {
+  const storage = new Storage(), accountStorage = new Storage(), hash = 'b'.repeat(64), name = `boat-router-${hash.slice(0, 32)}`;
+  await accountStorage.put('account:ledger', { claims: {} });
+  await storage.put('create:gone', { createKey: 'gone', routerCreateName: name, state: 'unknown', at: 0, callingAt: 0 });
+  const api = { listSandboxes: async () => [] };
+  const project = { id: 'demo', repo: 'owner/repo', labels: ['boat-large'] };
+  const fleet = new BoxFleet(storage, api, () => 300_000, { project, budget: { ledger: { storage: accountStorage, key: 'account:ledger' } } });
+  await fleet.sweepOrphans({ complete: true, runners: [] }, project);
+  assert.equal(await storage.get('create:gone'), undefined);
+});
+
+test('orphan sweep keeps a create its sandbox answers for, one still claimed, and one inside the grace', async () => {
+  const storage = new Storage(), accountStorage = new Storage(), hash = 'c'.repeat(64), name = `boat-router-${hash.slice(0, 32)}`;
+  await accountStorage.put('account:ledger', { claims: { [hash]: { project: 'demo', status: 'unknown' } } });
+  await storage.put('create:listed', { createKey: 'listed', routerCreateName: 'boat-router-listed', state: 'unknown', at: 0, callingAt: 0 });
+  await storage.put('create:claimed', { createKey: 'claimed', routerCreateName: name, state: 'unknown', at: 0, callingAt: 0 });
+  await storage.put('create:young', { createKey: 'young', routerCreateName: 'boat-router-young', state: 'unknown', at: 299_000, callingAt: 299_000 });
+  await storage.put('create:pending', { createKey: 'pending', routerCreateName: 'boat-router-pending', state: 'pending', at: 0 });
+  const api = { listSandboxes: async () => [{ id: 'bx_23456789', name: 'boat-router-listed' }] };
+  const project = { id: 'demo', repo: 'owner/repo', labels: ['boat-large'] };
+  const fleet = new BoxFleet(storage, api, () => 300_000, { project, budget: { ledger: { storage: accountStorage, key: 'account:ledger' } } });
+  await fleet.sweepOrphans({ complete: true, runners: [] }, project);
+  for (const key of ['listed', 'claimed', 'young', 'pending']) assert.notEqual(await storage.get(`create:${key}`), undefined, key);
 });
 
 test('orphan waits for a named running job before cleanup', async () => {

@@ -1182,7 +1182,12 @@ def settle_docker(allowlist, keep=(), attempts=6):
         run(['docker', 'builder', 'prune', '-af'])
         volumes = set(run(['docker', 'volume', 'ls', '-q']).split()) - volumes_of(keep)
         if volumes:
-            run_settling(['docker', 'volume', 'rm', '-f', *sorted(volumes)])
+            try:
+                run_settling(['docker', 'volume', 'rm', '-f', *sorted(volumes)])
+            except RuntimeError:
+                # A container the store restored after ps holds the volume; the next pass removes it first.
+                time.sleep(2)
+                continue
         run(['docker', 'volume', 'prune', '-f'])
         networks = set(run(['docker', 'network', 'ls', '--format', '{{.Name}}']).split()) - {'bridge', 'host', 'none'}
         if networks:

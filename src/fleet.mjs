@@ -14,6 +14,7 @@ import { providerWallet } from './apis.mjs';
 import { BUILD_COMMIT, BUILD_DEPLOYMENT } from './build.mjs';
 import { installRouter } from './router/install.mjs';
 import { records } from './router/pool-records.mjs';
+import { ReadCache } from './router/read-cache.mjs';
 import { DOCKER_REUSE_KEY, localRoom } from './router/box-fleet.mjs';
 import { LOCAL_MODE_KEY, labelLocal } from './router/local-fleet.mjs';
 import { SETUP_WATCHDOG_SWITCH_KEY, SETUP_WATCHDOG_PREFIX, SETUP_WATCHDOG_CHECK_PREFIX, SETUP_WATCHDOG_RUN_PREFIX, listRecords } from './router/setup-watchdog.mjs';
@@ -24,6 +25,7 @@ import { SetupController, authorizedControl, authorizedLocal, hash } from './set
 import { appCredentials, moveAppSecrets } from './app-secrets.mjs';
 import { exportResponse } from './export.mjs';
 import { webhook } from './webhook.mjs';
+import { RepoWebhookInbox } from './router/repo-webhook-inbox.mjs';
 import { APIs } from './apis.mjs';
 import { ApiError, backoff, isPlanRefusal, isSizeRefusal, reservationId, runnerName, jobRunnerName, REPOSITORIES } from './domain.mjs';
 
@@ -544,12 +546,13 @@ export class Fleet {
   constructor(ctx, env, deployment = BUILD_DEPLOYMENT) {
     this.ctx = ctx;
     this.env = env;
-    this.storage = ctx.storage;
-    const api = new APIs(env, fetch, Date.now, () => ctx.storage.get('github-app'));
-    this.controller = new FleetController(ctx.storage, env, api);
-    this.setup = new SetupController(ctx.storage, env, api, Date.now, event => this.controller.emit(event, null));
-    this.router = env.PLUGIN_ROUTER === 'true' ? installRouter(ctx.storage, () => this.env, { api, waitUntil: promise => ctx.waitUntil(promise), deployment }) : null;
-    this.external = this.router ? new ExternalService(this.router, ctx.storage, this.router.externalApi ?? api, this.router.account.externalClients) : null;
+    this.storage = env.PLUGIN_ROUTER === 'true' ? new ReadCache().wrap(ctx.storage) : ctx.storage;
+    const api = new APIs(env, fetch, Date.now, () => this.storage.get('github-app'));
+    this.controller = new FleetController(this.storage, env, api);
+    this.setup = new SetupController(this.storage, env, api, Date.now, event => this.controller.emit(event, null));
+    this.router = env.PLUGIN_ROUTER === 'true' ? installRouter(this.storage, () => this.env, { api, waitUntil: promise => ctx.waitUntil(promise), deployment }) : null;
+    this.repoWebhookInbox = this.router && env.GITHUB_POLL_REPO && env.GITHUB_WEBHOOK_SECRET ? new RepoWebhookInbox(this.storage, this.router) : null;
+    this.external = this.router ? new ExternalService(this.router, this.storage, this.router.externalApi ?? api, this.router.account.externalClients) : null;
     if (this.external) {
       this.router.externalSweep = () => this.external.sweep();
       this.router.externalAdmissionEntries = () => this.external.admissionEntries();
@@ -560,8 +563,23 @@ export class Fleet {
     this.env = { ...this.env, ENABLED: request.headers.get('X-Boat-CI-Enabled') === 'true' ? 'true' : 'false' };
     this.controller.env = this.setup.env = this.env;
     const url = new URL(request.url);
+    const pollRepo = this.env.GITHUB_POLL_REPO;
+    if (pollRepo && (url.pathname.startsWith('/setup') || url.pathname === '/router/resync')) return new Response(null, { status: 404 });
     if (url.pathname.startsWith('/setup')) return this.setup.fetch(request);
     if (url.pathname === '/webhook' && request.method === 'POST') {
+      if (pollRepo) {
+        const secret = this.env.GITHUB_WEBHOOK_SECRET;
+        if (!this.router || !secret) return new Response(null, { status: 404 });
+        return webhook(request, this.env, secret, async (selection, { receivedAt, verifiedAt }) => {
+          const selectedAt = Date.now(), { event } = selection;
+          await this.repoWebhookInbox.enqueue(selection, receivedAt);
+          if (event.status === 'queued') console.info(JSON.stringify({ event: 'repo_webhook_ack', job_id: event.id, run_id: event.runId, verify_ms: verifiedAt - receivedAt, select_ms: selectedAt - verifiedAt, persist_ms: Date.now() - selectedAt }));
+        }, (name, payload) => {
+          if (name !== 'workflow_job' || payload?.repository?.full_name !== pollRepo) return null;
+          // Use the same internal placeholder as the repo-token snapshot. No App installation is consulted.
+          return this.router.select(name, { ...payload, installation: { id: 1 } });
+        });
+      }
       const { webhookSecret } = appCredentials(this.env, await this.storage.get('github-app'));
       if (this.router) return webhook(request, this.env, webhookSecret, selection => this.router.ingest(selection), (n, p) => this.router.select(n, p));
       return webhook(request, this.env, webhookSecret, event => this.controller.ingest(event));
@@ -725,13 +743,7 @@ export class Fleet {
             const mode = await project.storage.get('pool:mode');
             const snapshot = await project.storage.get('pool:snapshot');
             if (mode !== 'on' || snapshot?.complete !== true) { projects[id] = { complete: false, labels: [] }; continue; }
-            const labels = new Set(), jobs = []; let startAfter = '';
-            for (;;) {
-              const page = await project.storage.list({ prefix: 'gh-job:', startAfter, limit: 128 });
-              for (const job of page.values()) if (!job.missing) jobs.push(job);
-              if (page.size < 128) break;
-              startAfter = [...page.keys()].at(-1);
-            }
+            const labels = new Set(), jobs = (await records(project.storage, 'gh-job:')).filter(job => !job.missing);
             for (const job of runnableDemand(jobs, project.config.workflowConcurrency, true, { laneCaps: await lanesSwitchOn(project.storage, project.config) })) {
               if (job.status !== 'queued') continue;
               try { const [repo, label] = JSON.parse(job.pool); if (repo === project.config.repo && project.config.labels?.includes(label)) labels.add(label); } catch {}
@@ -929,6 +941,7 @@ export class Fleet {
       }
       if (url.pathname === '/router/status' && request.method === 'GET') {
         if (!await authorizedControl(request, this.env)) return new Response(null, { status: 401 });
+        if (!url.searchParams.has('project') && !url.searchParams.has('job_id')) return Response.json({ autoscale: this.router.autoscale ?? null }, { headers: { 'Cache-Control': 'no-store' } });
         const project = this.router.projects.get(url.searchParams.get('project'));
         const id = Number(url.searchParams.get('job_id'));
         if (!project || !Number.isSafeInteger(id) || id < 1) return new Response(null, { status: 400 });
@@ -1362,5 +1375,5 @@ export class Fleet {
       return new Response(null, { status: 503, headers });
     }
   }
-  alarm() { return this.router ? this.router.tick() : this.controller.tick(); }
+  alarm() { return this.repoWebhookInbox ? this.repoWebhookInbox.alarm() : this.router ? this.router.tick() : this.controller.tick(); }
 }

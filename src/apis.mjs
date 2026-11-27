@@ -70,6 +70,12 @@ export class APIs {
   }
   async github(job, path, options = {}) {
     const { actionsWrite = false, permissions = null, ...requestOptions } = options;
+    if (this.env.GITHUB_POLL_REPO) {
+      if (job.repo !== this.env.GITHUB_POLL_REPO || !this.env.GITHUB_POLL_TOKEN || actionsWrite) {
+        throw new ApiError('github', 0, 'poll_auth_denied');
+      }
+      return this.request('github', `/repos/${job.repo}${path}`, { ...requestOptions, token: this.env.GITHUB_POLL_TOKEN });
+    }
     // a call may ask for its own token scope (e.g. checks:read) so that a permission the App
     // lacks fails only that call, never the shared read or write tokens.
     const scope = permissions ? `scope:${Object.entries(permissions).map(([k, v]) => `${k}=${v}`).sort().join(',')}` : actionsWrite ? 'write' : 'read';
@@ -91,8 +97,10 @@ export class APIs {
       throw error;
     }
   }
+  // A snapshot scan makes up to 40 calls on a loaded host; a 10 s per-call timeout failed the
+  // whole scan on a box that answers in 20 s, so only the scan gets the longer budget.
   snapshotPage(job, path, etag) {
-    return this.github(job, path, { metadata: true, headers: etag ? { 'If-None-Match': etag } : {} });
+    return this.github(job, path, { metadata: true, timeoutMs: 30_000, headers: etag ? { 'If-None-Match': etag } : {} });
   }
   getJob(job, id = job.assignedJobId ?? job.id) { return this.github(job, `/actions/jobs/${id}`); }
   getRun(job, id) { return this.github(job, `/actions/runs/${id}`); }
@@ -118,7 +126,10 @@ export class APIs {
       body = { type: job.machineSize ?? job.size, ttlSeconds: ttl, noEnv: true, snapshots: false, monitoring: false,
         failFast: true, setupScript: snapshot ? snapshotBootstrap(snapshot.manifestSha256, { reusable: job.routerReusable === true, ...(lease || browser ? { leaseProfileSha256: snapshot.profileSha256 } : {}), ...(browser ? { browserManifestSha256: snapshot.browserManifestSha256 } : {}) }) : job.routerResetMode === 'docker' || job.routerDockerAccess === true ? dockerBootstrap() : job.routerReusable ? reuseBootstrap() : bootstrap(), ...(snapshot ? { from: snapshot.name, env: {} } : {}), ...(job.routerCreateName ? { name: job.routerCreateName } : {}) };
     } catch { throw new ApiError('boat', 0, 'request_not_sent'); }
-    return this.request('boat', '/sandboxes', { method: 'POST', headers: { 'Idempotency-Key': job.createKey }, body });
+    // A create carries the setup script and a snapshot reference and is idempotent by its key, so it
+    // gets a longer ceiling than the 10 s read default: a create that outlives 10 s on a loaded box
+    // came back as a transport failure with no status, which left the pool retrying blind.
+    return this.request('boat', '/sandboxes', { method: 'POST', headers: { 'Idempotency-Key': job.createKey }, body, timeoutMs: 60_000 });
   }
   async listSandboxes() {
     let cursor;

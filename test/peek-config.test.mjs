@@ -25,7 +25,7 @@ test('the deployment registers exactly Peek on the owner account', () => {
 
 test('the project passes the router validator', () => {
   assert.deepEqual(validateSuite(project), []);
-  assert.equal(project.reuse.mode, 'off');
+  assert.equal(project.reuse.mode, 'on');
   assert.equal(project.snapshotBoot, true);
   assert.equal(project.rollingSnapshot, true);
   assert.equal(project.externalClaimer, undefined);
@@ -33,9 +33,11 @@ test('the project passes the router validator', () => {
 });
 
 test('the account paces starts at Boat limits and buys the extras past them', () => {
-  assert.deepEqual(account.starts, { minute: 12, hour: 60, day: 260, allowPaidExtra: true });
-  // The one $20 spend ledger covers billed starts; no second per-start cap.
-  assert.equal(account.starts.paidExtraMaxDollarsPerMonth, undefined);
+  assert.deepEqual(account.starts, { minute: 12, hour: 60, day: 260, allowPaidExtra: true, paidExtraMaxDollarsPerMonth: 15 });
+  // Two caps measure different money: the $15 rolling budget bounds billed extra starts
+  // (paid-extra.mjs, and the idle hold's paidExtraRoom), while the $20 spend ledger bounds
+  // every metered reservation, the same start fee included.
+  assert.equal(account.starts.paidExtraMaxDollarsPerMonth, 15);
   assert.equal(account.spend.monthlyUsd, 20);
   assert.deepEqual(account.spend.machineHourUsd, { small: 0.018, default: 0.036, large: 0.072, xlarge: 0.2 });
   assert.equal(account.spend.snapshotDayUsd, 0.056);
@@ -47,14 +49,15 @@ test('the account paces starts at Boat limits and buys the extras past them', ()
   assert.equal(account.poolPacing.mode, 'dynamic');
   assert.equal(account.poolPacing.unpaced, false);
   assert.equal(account.reuse.enabled, true);
-  assert.equal(account.reuse.healthCheck, 'auto');
+  assert.equal(account.reuse.healthCheck, 'observe');
   assert.ok(account.reuse.maxAgeSeconds >= 4 * 3600);
   assert.ok(account.reuse.maxAgeSeconds < project.machineTtlSeconds);
 });
 
-test('the CI pool stays at two single-job boxes', () => {
-  assert.equal(project.caps.concurrent, 2);
-  assert.equal(project.reuse.mode, 'off');
+test('autoscale sizes the CI pool (no fixed box cap) and the live reuse line stays on', () => {
+  assert.equal(project.caps?.concurrent, undefined);
+  assert.equal(project.reuse.mode, 'on');
+  assert.equal(project.reuse.idleHoldSecondsWhenStartsPaid, 3600);
 });
 
 test('the heavy label is default and the light label is small', () => {

@@ -8,15 +8,7 @@ const unresolvedBoat = job => !job.intentDone && !job.intentStarted && (job.phas
 
 import { LANES_SWITCH_KEY, laneRules, laneRank, laneComparator } from './lanes.mjs';
 
-async function all(store, prefix) {
-  const values = []; let startAfter = '';
-  for (;;) {
-    const page = await store.list({ prefix, startAfter, limit: 128 });
-    values.push(...page.values());
-    if (page.size < 128) return values;
-    startAfter = [...page.keys()].at(-1);
-  }
-}
+import { records as all } from './pool-records.mjs';
 
 // Select the oldest eligible job across all labels a real mini slot supports.
 // A tick can share the read cache across offers; every successful claim

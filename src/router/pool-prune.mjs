@@ -1,4 +1,4 @@
-const RETENTION = 7 * 86400_000;
+export const RETENTION = 7 * 86400_000;
 
 export async function prunePool(storage, now) {
   const last = await storage.get('pool:pruned-at');

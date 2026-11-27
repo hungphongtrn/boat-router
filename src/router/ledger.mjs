@@ -207,7 +207,7 @@ export class AccountLedger {
         if (owned + keys.length > ownedDayCap) return { ok: false, reason: 'owned_day_cap' };
       }
       const dynamicEnabled = this.policy.poolPacing?.enabled === true && this.policy.poolPacing?.mode === 'dynamic';
-      const unpaced = dynamicEnabled && this.policy.poolPacing?.unpaced === true;
+      const unpaced = dynamicEnabled && (this.policy.poolPacing?.unpaced === true || this.policy.poolPacing?.slotBudget === true);
       const dynamic = dynamicEnabled ? dynamicPacing({ snapshot, policy: this.policy, claims, previous: state.dynamicPacing, now }) : null;
       if (dynamicEnabled && !dynamic) return { ok: false, reason: 'limits_unavailable' };
       if (dynamic) {
@@ -221,7 +221,9 @@ export class AccountLedger {
         // The provider snapshot includes existing boxes. Claims that may not
         // be reflected in that snapshot must also occupy account slots.
         const unobserved = claims.filter(c => c.status !== 'created' || (c.settledAt ?? c.at) >= snapshot.at).length;
-        if (concurrency.active + unobserved + keys.length > concurrency.limit) return { ok: false, reason: 'concurrency' };
+        const liveCap = this.policy.liveSandboxCap ?? concurrency.limit;
+        if (!validCount(liveCap) || liveCap < 1) throw new TypeError('invalid live sandbox budget');
+        if (concurrency.active + unobserved + keys.length > Math.min(concurrency.limit, liveCap)) return { ok: false, reason: 'concurrency' };
       }
       let freeRefusal = null, freeDailyExhausted = false, freeDailyReserved = false, floorRequired = false;
       for (const [name, span] of Object.entries(WINDOWS)) {
@@ -271,6 +273,8 @@ export class AccountLedger {
       const pacingActive = pacing?.enabled === true && !dynamicEnabled && Math.max(snapshot.windows.day.used / snapshot.windows.day.limit, snapshot.windows.hour.used / snapshot.windows.hour.limit) >= fromPct;
       const eligible = [], poolComplete = new Map(), poolStatuses = new Map();
       for (const item of state.waiting) {
+        // A pool request older than twice the 15 min retry ceiling is orphaned; it must not hold every newer request behind it.
+        if (item.pool && !keys.includes(item.key) && now - item.at > 30 * 60 * 1000) continue;
         if (item.pool) {
           if (!poolComplete.has(item.project)) {
             let complete = await tx.get(`project:${item.project}:pool:snapshot-complete`);
@@ -305,7 +309,8 @@ export class AccountLedger {
           if (!Number.isFinite(marginPct) || marginPct < 0 || marginPct >= 100 || !validCount(burst) || burst < 1 || !validCount(reserve)) throw new TypeError('invalid pool pacing');
           const previous = state.poolPacing;
           const tokens = previous ? Math.min(burst, previous.tokens + Math.max(0, now - previous.at) * limit * (1 - marginPct / 100) / WINDOWS.day) : burst;
-          if (day.used + unobserved + count + reserve > limit || tokens < count) continue;
+          // A group wider than the burst would wait forever; it needs a full bucket, not more tokens than the bucket holds.
+          if (day.used + unobserved + count + reserve > limit || tokens < Math.min(count, burst)) continue;
         }
         if (cap == null || claims.filter(c => c.project === item.project && ((c.settledAt ?? c.at) > now - WINDOWS.day || c.status !== 'created')).length + count <= cap) eligible.push(item);
       }
