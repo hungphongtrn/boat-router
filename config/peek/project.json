@@ -6,9 +6,6 @@
     "mode": "on",
     "idleHoldSecondsWhenStartsPaid": 3600
   },
-  "caps": {
-    "concurrent": 2
-  },
   "labels": [
     "peek-router",
     "peek-router-light"

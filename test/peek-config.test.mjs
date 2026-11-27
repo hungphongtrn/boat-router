@@ -54,8 +54,8 @@ test('the account paces starts at Boat limits and buys the extras past them', ()
   assert.ok(account.reuse.maxAgeSeconds < project.machineTtlSeconds);
 });
 
-test('the CI pool stays at two boxes and the live reuse line stays on', () => {
-  assert.equal(project.caps.concurrent, 2);
+test('autoscale sizes the CI pool (no fixed box cap) and the live reuse line stays on', () => {
+  assert.equal(project.caps?.concurrent, undefined);
   assert.equal(project.reuse.mode, 'on');
   assert.equal(project.reuse.idleHoldSecondsWhenStartsPaid, 3600);
 });
