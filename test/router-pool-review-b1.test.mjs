@@ -119,7 +119,7 @@ test('surplus ready boxes retire after the hold even while another job is queued
   const clock = { now: 10_000_000 }, cfg = project('alpha', 'example/alpha');
   cfg.dispatchOnly = true;
   cfg.machineTtlSeconds = 86400;
-  cfg.reuse = { mode: 'on', idleHoldSeconds: 900 };
+  cfg.reuse = { mode: 'on', idleHoldSeconds: 900, holdPolicy: { enabled: false } };
   const p = await setupProject(cfg, new AccountLedger(new Storage(), {}, () => clock.now), clock, [], [{ id: 1, queuedAt: clock.now - 1000 }]);
   const pool = JSON.stringify([cfg.repo, 'work-large']);
   for (const id of ['one', 'two']) await p.storage.put(`box:${id}`, { machineId: id, pool, state: 'ready', since: clock.now - 900_000, createdAt: clock.now - 1_000_000, generation: 1, reusable: true, baselineHash: 'ok', runnerFenced: true });
@@ -130,7 +130,7 @@ test('surplus ready boxes retire after the hold even while another job is queued
 
 test('ready idle box uses the scarcity hold and reports an overdue sample', async () => {
   const clock = { now: 10_000_000 }, cfg = project('alpha', 'example/alpha');
-  cfg.dispatchOnly = true; cfg.machineTtlSeconds = 86400; cfg.reuse = { mode: 'on', idleHoldSeconds: 900 };
+  cfg.dispatchOnly = true; cfg.machineTtlSeconds = 86400; cfg.reuse = { mode: 'on', idleHoldSeconds: 900, holdPolicy: { enabled: false } };
   const ledger = new AccountLedger(new Storage(), {}, () => clock.now);
   await ledger.storage.put(ledger.key, { pacingStatus: { sampledAt: clock.now, effectiveStartsPerHour: 1 } });
   const p = await setupProject(cfg, ledger, clock, [], []);
