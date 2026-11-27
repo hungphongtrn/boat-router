@@ -29,13 +29,13 @@ export class Provisioner {
       if (!start.machineId) await tx.put(startKey, { ...start, machineId });
     });
   }
-  async start({ project, key, compatibility, snapshot }) {
+  async start({ project, key, compatibility, snapshot, cost }) {
     if (this.inFlight.has(key)) return { ok: false, reason: 'in_flight' };
     this.inFlight.add(key);
     try {
       await this.bind(project, key, compatibility);
       await this.ledger.enqueue(project, key);
-      const admission = await this.ledger.admit(project, key, snapshot);
+      const admission = await this.ledger.admit(project, key, snapshot, { cost: cost ?? { kind: 'machine', size: compatibility.size, ttlSeconds: this.ledger.spend?.defaultTtlSeconds ?? 86_400 } });
       if (!admission.ok) return admission;
       if (admission.recovered) return { ok: false, reason: 'reconciliation_required' };
       // Fence the call durably before leaving the transaction boundary. A

@@ -9,7 +9,8 @@
     "concurrent": 2
   },
   "labels": [
-    "peek-router"
+    "peek-router",
+    "peek-router-light"
   ],
   "machineTtlSeconds": 28800,
   "jobs": {
@@ -32,6 +33,9 @@
   "sizes": {
     "peek-router": {
       "machine": "default"
+    },
+    "peek-router-light": {
+      "machine": "small"
     }
   },
   "triggers": [

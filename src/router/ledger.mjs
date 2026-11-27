@@ -1,5 +1,6 @@
 import { dynamicPacing } from './dynamic-pacing.mjs';
 import { dayLimit, paidExtraBudget, paidExtraEnabled, paidExtraPrice, paidExtraSpend, paidExtraStart, paidExtraSummary, paidStartAllowed, PAID_EXTRA_WINDOW_MS } from './paid-extra.mjs';
+import { confirmStorageDeleted, normalizeSpendPolicy, pruneSpend, releaseSpendInState, reserveSpend, settleSpend, spendAmount, SPEND_WINDOW_MS, summarizeSpend } from './spend-ledger.mjs';
 const WINDOWS = { minute: 60_000, hour: 3_600_000, day: 86_400_000 };
 const validCount = n => Number.isSafeInteger(n) && n >= 0;
 function releaseFloor(state, key) {
@@ -24,7 +25,11 @@ export function snapshotLimits(limits, at) {
   }
   const active = limits?.activeSandboxes, maxActive = limits?.maxActiveSandboxes;
   const concurrency = validCount(active) && validCount(maxActive) && maxActive > 0 ? { active, limit: maxActive } : null;
-  return { at: limits?.observedAt ?? at, canStart: limits?.canStart === true && limits?.checkoutRequired !== true && !['past_due', 'unpaid', 'canceled'].includes(limits?.billingStatus), ...(limits?.nextStartDollars === undefined ? {} : { nextStartDollars: limits.nextStartDollars }), windows, concurrency };
+  const overagePrices = limits?.overagePrices && typeof limits.overagePrices === 'object' ? {
+    ...(Number.isFinite(limits.overagePrices.vmHourDollars) ? { vmHourDollars: limits.overagePrices.vmHourDollars } : {}),
+    ...(Number.isFinite(limits.overagePrices.savedSnapshotDayDollars) ? { savedSnapshotDayDollars: limits.overagePrices.savedSnapshotDayDollars } : {}),
+  } : null;
+  return { at: limits?.observedAt ?? at, canStart: limits?.canStart === true && limits?.checkoutRequired !== true && !['past_due', 'unpaid', 'canceled'].includes(limits?.billingStatus), ...(limits?.nextStartDollars === undefined ? {} : { nextStartDollars: limits.nextStartDollars }), ...(overagePrices ? { overagePrices } : {}), windows, concurrency };
 }
 function projectCap(policy, project, now) {
   if (policy.openStartQueue === true) return null;
@@ -41,7 +46,17 @@ function projectCap(policy, project, now) {
 }
 
 export class AccountLedger {
-  constructor(storage, policy, now = Date.now) { Object.assign(this, { storage, policy, now }); this.key = policy.ledgerKey ?? 'account:ledger'; }
+  constructor(storage, policy, now = Date.now) {
+    Object.assign(this, { storage, policy, now });
+    this.key = policy.ledgerKey ?? 'account:ledger';
+    this.spend = normalizeSpendPolicy(policy.spend);
+  }
+  // The refresh and lease paths reserve through the same state and the same
+  // ceiling the start ledger admits against.
+  async reserveSpend(project, key, cost) { return reserveSpend(this, project, key, cost); }
+  async settleSpend(key, status, options) { return settleSpend(this, key, status, options); }
+  async confirmStorageDeleted(key, options) { return confirmStorageDeleted(this, key, options); }
+  async spendStatus() { return summarizeSpend(this.spend, (await this.storage.get(this.key))?.spendReservations, this.now()); }
   async enqueue(project, key, at = this.now(), jobId, options) { return this.enqueueBatch(project, [key], at, jobId, options); }
   async enqueueBatch(project, keys, at = this.now(), jobId, { pool = false, label, client, snapshotRecovery = false } = {}) {
     if (!/^[a-z0-9][a-z0-9-]{0,62}$/.test(project) || !Array.isArray(keys) || keys.length < 1 || keys.length > 64 || new Set(keys).size !== keys.length || keys.some(key => typeof key !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(key) || ['__proto__', 'constructor', 'prototype'].includes(key)) || !Number.isFinite(at)) throw new TypeError('invalid start request');
@@ -130,20 +145,49 @@ export class AccountLedger {
       }
       const claim = state.claims[key];
       const cancelled = claim?.project === project && claim.status === 'pending';
-      if (cancelled) { delete state.claims[key]; releaseFloor(state, key); }
+      if (cancelled) { delete state.claims[key]; releaseFloor(state, key); releaseSpendInState(state, key); }
       if (item || cancelled) await tx.put(this.key, state);
       return Boolean(item || cancelled);
     });
   }
   async admit(project, key, snapshot, options) { return this.admitBatch(project, [key], snapshot, options); }
-  async admitBatch(project, keys, snapshot, { pool = false } = {}) {
+  async admitBatch(project, keys, snapshot, { pool = false, cost } = {}) {
     if (!Array.isArray(keys) || keys.length < 1 || keys.length > 64 || new Set(keys).size !== keys.length || keys.some(key => typeof key !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(key) || ['__proto__', 'constructor', 'prototype'].includes(key))) throw new TypeError('invalid start batch');
     const now = this.now();
+    // A start with a spend policy must price its maximum lifetime before any
+    // provider call. A missing cost is a refusal, never a free start.
+    if (this.spend && !cost) return { ok: false, reason: 'spend_cost_required' };
+    // The tracked tariff is only valid while the provider still quotes no
+    // higher rate. Missing or higher quotes refuse the start rather than
+    // underprice it. A positive `nextStartDollars` is an extra-start fee and
+    // is admitted with the machine.
+    if (this.spend && cost.kind === 'machine') {
+      const quote = snapshot?.overagePrices?.vmHourDollars;
+      if (!Number.isFinite(quote) || quote > this.spend.machineHourUsd.default + 1e-9) return { ok: false, reason: 'spend_quote' };
+    }
+    const startFeeUsd = this.spend && cost.kind === 'machine' && Number.isFinite(snapshot?.nextStartDollars) && snapshot.nextStartDollars > 0 ? snapshot.nextStartDollars : 0;
+    const amountUsd = this.spend ? Math.ceil((spendAmount(this.spend, cost) + startFeeUsd) * 1e6) / 1e6 : 0;
     return this.storage.transaction(async tx => {
       const state = await tx.get(this.key) ?? { claims: {}, waiting: [] };
       const existing = keys.map(key => state.claims[key]);
       if (existing.some(claim => claim && claim.project !== project)) throw new Error('claim belongs to another project');
-      if (existing.every(Boolean)) return { ok: true, recovered: true, ...(keys.length === 1 ? { status: existing[0].status } : { statuses: existing.map(claim => claim.status) }) };
+      if (existing.every(Boolean)) {
+        // Reconciliation of an already-started claim must not be blocked by the
+        // ceiling: the provider write already happened. Price a claim admitted
+        // before this policy was enabled so future starts see the exposure.
+        if (this.spend && cost) {
+          const records = state.spendReservations ?? {};
+          let added = false;
+          for (const [index, key] of keys.entries()) {
+            if (records[key]) continue;
+            records[key] = { project, kind: cost.kind, amountUsd, at: Number.isFinite(existing[index]?.at) ? existing[index].at : now, status: existing[index]?.status === 'pending' ? 'reserved' : 'unknown',
+              ...(cost.kind === 'machine' ? { size: cost.size, ttlSeconds: cost.ttlSeconds } : { days: cost.days ?? this.spend.snapshotRetentionDays }) };
+            added = true;
+          }
+          if (added) { state.spendReservations = records; await tx.put(this.key, state); }
+        }
+        return { ok: true, recovered: true, ...(keys.length === 1 ? { status: existing[0].status } : { statuses: existing.map(claim => claim.status) }) };
+      }
       if (existing.some(Boolean)) return { ok: false, reason: 'partial_batch' };
       const group = JSON.stringify([...keys].sort());
       if (keys.some(key => !state.waiting.some(item => item.key === key && item.project === project && (item.group ?? JSON.stringify([item.key])) === group))) return { ok: false, reason: 'not_queued' };
@@ -268,6 +312,22 @@ export class AccountLedger {
       eligible.sort((a, b) => (this.policy.openStartQueue === true ? 0 : Number(Boolean(a.client)) - Number(Boolean(b.client))) || a.at - b.at || (a.group ?? JSON.stringify([a.key])).localeCompare(b.group ?? JSON.stringify([b.key])) || a.key.localeCompare(b.key));
       const selected = new Set(eligible.slice(0, keys.length).map(item => item.key));
       if (selected.size !== keys.length || keys.some(key => !selected.has(key))) return { ok: false, reason: 'fairness' };
+      // Price the maximum metered lifetime of every admitted start in the same
+      // transaction as its claim. Fresh reservations and the retired ones that
+      // have not been confirmed deleted share this one ceiling.
+      if (this.spend) {
+        const records = state.spendReservations && typeof state.spendReservations === 'object' && !Array.isArray(state.spendReservations) ? state.spendReservations : {};
+        pruneSpend(records, now);
+        const summary = summarizeSpend(this.spend, records, now);
+        const needed = amountUsd * keys.length;
+        if (summary.reservedUsd + needed > this.spend.monthlyUsd + 1e-9) {
+          return { ok: false, reason: 'spend_budget', amountUsd: needed, spentUsd: summary.reservedUsd, capUsd: this.spend.monthlyUsd,
+            nextAt: summary.nextRollOffAt ?? now + SPEND_WINDOW_MS };
+        }
+        for (const key of keys) records[key] = { project, kind: cost.kind, amountUsd, at: now, status: 'reserved',
+          ...(cost.kind === 'machine' ? { size: cost.size, ttlSeconds: cost.ttlSeconds, ...(startFeeUsd ? { startFeeUsd } : {}) } : { days: cost.days ?? this.spend.snapshotRetentionDays }) };
+        state.spendReservations = records;
+      }
       // Floor reservations are account-wide and are stored with the claims in
       // this transaction. They never bypass provider hard limits.
       const useFloor = dynamic && !unpaced && (floorRequired || dynamic.state.credit + 1e-9 < keys.length);
@@ -351,6 +411,7 @@ export class AccountLedger {
       if (!claim || claim.project !== project || claim.status !== 'pending') return false;
       delete state.claims[key];
       releaseFloor(state, key);
+      releaseSpendInState(state, key);
       await tx.put(this.key, state);
       return true;
     });
@@ -389,16 +450,38 @@ export class AccountLedger {
     const state = await this.storage.get(this.key);
     return state?.claims[key] ?? null;
   }
-  async resolve(key, status) {
+  async resolve(key, status, { elapsedSeconds } = {}) {
     if (!['created', 'unknown', 'not_created'].includes(status)) throw new TypeError('invalid claim status');
+    if (elapsedSeconds !== undefined && (!Number.isFinite(elapsedSeconds) || elapsedSeconds < 0)) throw new TypeError('invalid spend elapsed time');
     return this.storage.transaction(async tx => {
       const state = await tx.get(this.key);
       if (!state?.claims[key]) return false;
       if (state.claims[key].status === 'created' && status !== 'created') throw new Error('created claim cannot be refunded');
-      if (status === 'not_created') { delete state.claims[key]; releaseFloor(state, key); }
+      if (status === 'not_created') { delete state.claims[key]; releaseFloor(state, key); releaseSpendInState(state, key); }
       else {
         if (status === 'created' && state.claims[key].status !== 'created') state.claims[key].settledAt = this.now();
         state.claims[key].status = status;
+        const spend = state.spendReservations?.[key];
+        // An ambiguous provider write stays at its maximum. A created start
+        // settles only when the caller confirms provider deletion and supplies
+        // conservative elapsed time; otherwise its full TTL stays charged.
+        if (spend) {
+          if (spend.status !== 'created') spend.status = status;
+          if (status === 'created') {
+            if (spend.status !== 'created') spend.settledAt = this.now();
+            if (spend.kind === 'machine' && elapsedSeconds !== undefined && spend.settledAmount !== true) {
+              const elapsed = Math.min(spend.ttlSeconds, Math.max(1, Math.ceil(elapsedSeconds)));
+              const rate = this.spend?.machineHourUsd?.[spend.size] ?? this.spend?.machineHourUsd?.default;
+              const actual = rate ? Math.ceil(rate * elapsed / 3600 * 1e6) / 1e6 + (spend.startFeeUsd ?? 0) : spend.amountUsd;
+              spend.reservedUsd = spend.amountUsd;
+              spend.amountUsd = Math.min(spend.reservedUsd, actual);
+              spend.elapsedSeconds = elapsed;
+              spend.settledAmount = true;
+              spend.settledAt = this.now();
+            }
+          }
+          state.spendReservations[key] = spend;
+        }
       }
       await tx.put(this.key, state);
       return true;

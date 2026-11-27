@@ -220,7 +220,7 @@ export class BoxFleet {
     let claim = await this.budget.claim(createKey);
     if ((!claim || claim.status === 'pending') && !await reserveSizedProbe(this.storage, record.size, createKey, this.now())) return false;
     if (!claim) {
-      const result = await this.budget.admit(createKey, limits, { queuedAt: record.queuedAt, jobId: record.snapshotRecoveryJobId, pool: true, snapshotRecovery: Boolean(record.snapshotRecoveryJobId) });
+      const result = await this.budget.admit(createKey, limits, { queuedAt: record.queuedAt, jobId: record.snapshotRecoveryJobId, pool: true, snapshotRecovery: Boolean(record.snapshotRecoveryJobId), cost: { kind: 'machine', size: record.size, ttlSeconds: ttl } });
       if (!result.ok) {
         this.logger?.(JSON.stringify({ event: 'admission_refused', project: this.project?.id, reason: result.reason ?? 'refused' }));
         const label = JSON.parse(record.pool)[1], statusKey = `pool:status:${label}`, status = await this.storage.get(statusKey);
@@ -1036,6 +1036,18 @@ export class BoxFleet {
     });
   }
 
+  // Only a provider-confirmed absence or completed deletion ends a machine's
+  // billable life. Settle the shared reservation to elapsed time plus a minute
+  // for stop/delete latency; an ambiguous delete keeps the full TTL charged.
+  async settleDeleted(box) {
+    if (!box?.createKey || typeof this.budget?.settle !== 'function') return;
+    const started = Number.isFinite(box.createdAt) ? box.createdAt : box.since;
+    if (!Number.isFinite(started)) return;
+    const elapsedSeconds = Math.max(1, Math.ceil((this.now() - started) / 1000) + 60);
+    try { await this.budget.settle(box.createKey, 'created', { elapsedSeconds }); }
+    catch (error) { this.logger?.(JSON.stringify({ event: 'spend_settle_failed', project: this.project?.id, machine_id: box.machineId, message: error?.message ?? 'settle failed' })); }
+  }
+
   async stuckAlert(box, reason) {
     this.logger?.(JSON.stringify({ event: 'box_stuck', project: this.project?.id, machine_id: box.machineId, state: box.state, reason, since: box.since }));
     await this.emit?.('alert_box_stuck', null, { machine_id: box.machineId, phase: box.state, status: reason });
@@ -1393,7 +1405,7 @@ export class BoxFleet {
       if (typeof this.api.sandbox === 'function') {
         try { await this.api.sandbox(box); }
         catch (error) {
-          if (error?.status === 404) return this.transition(machineId, 'sandbox_missing', { failureReason: 'sandbox_missing' });
+          if (error?.status === 404) { const gone = await this.transition(machineId, 'sandbox_missing', { failureReason: 'sandbox_missing' }); await this.settleDeleted(gone); return gone; }
         }
       }
       const running = box.orphan && (snapshot.jobs ?? []).some(job => job.status === 'in_progress' && ((box.aliases ?? []).includes(job.runnerName) || job.runnerName?.startsWith(prefix)));
@@ -1406,14 +1418,14 @@ export class BoxFleet {
       return this.transition(machineId, 'unregistered', { runnerFenced: true });
     }
     if (box.state === 'purging') {
-      if (!box.operationId) return this.transition(machineId, 'purged');
+      if (!box.operationId) { const purged = await this.transition(machineId, 'purged'); await this.settleDeleted(purged); return purged; }
       const result = await this.api.deletion(box);
-      if (result?.operation?.status === 'completed') return this.transition(machineId, 'purged');
+      if (result?.operation?.status === 'completed') { const purged = await this.transition(machineId, 'purged'); await this.settleDeleted(purged); return purged; }
       // After the purge deadline the sandbox read decides on its own: a 404 ends the record.
       if (box.runnerFenced === true && (result?.operation?.id === box.operationId || Number.isFinite(box.stuckAlertedAt)) && typeof this.api.sandbox === 'function') {
         try { await this.api.sandbox(box); }
         catch (error) {
-          if (error?.status === 404) return this.transition(machineId, 'purged', { deletedBy: 'sandbox_404', deletionOperationId: box.operationId, deletionOperationStatus: result?.operation?.status ?? null });
+          if (error?.status === 404) { const purged = await this.transition(machineId, 'purged', { deletedBy: 'sandbox_404', deletionOperationId: box.operationId, deletionOperationStatus: result?.operation?.status ?? null }); await this.settleDeleted(purged); return purged; }
         }
       }
     }
