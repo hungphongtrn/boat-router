@@ -25,14 +25,21 @@ test('the deployment registers exactly Peek on the owner account', () => {
 
 test('the project passes the router validator', () => {
   assert.deepEqual(validateSuite(project), []);
-  assert.equal(project.reuse.mode, 'on');
+  assert.equal(project.reuse.mode, 'off');
   assert.equal(project.snapshotBoot, true);
+  assert.equal(project.rollingSnapshot, true);
   assert.equal(project.externalClaimer, undefined);
   assert.equal(project.localFirst, undefined);
 });
 
 test('the account paces starts at Boat limits and buys the extras past them', () => {
-  assert.deepEqual(account.starts, { minute: 12, hour: 60, day: 260, allowPaidExtra: true, paidExtraMaxDollarsPerMonth: 2 });
+  assert.deepEqual(account.starts, { minute: 12, hour: 60, day: 260, allowPaidExtra: true });
+  // The one $20 spend ledger covers billed starts; no second per-start cap.
+  assert.equal(account.starts.paidExtraMaxDollarsPerMonth, undefined);
+  assert.equal(account.spend.monthlyUsd, 20);
+  assert.deepEqual(account.spend.machineHourUsd, { small: 0.018, default: 0.036, large: 0.072, xlarge: 0.2 });
+  assert.equal(account.spend.snapshotDayUsd, 0.056);
+  assert.equal(account.spend.snapshotRetentionDays, 30);
   assert.equal(account.margin, 0.1);
   assert.equal(account.openStartQueue, true);
   assert.equal(account.dayReserve, 0);
@@ -45,23 +52,15 @@ test('the account paces starts at Boat limits and buys the extras past them', ()
   assert.ok(account.reuse.maxAgeSeconds < project.machineTtlSeconds);
 });
 
-test('reuse holds a box long enough for Peek jobs', () => {
-  assert.equal(project.machineTtlSeconds, 28800);
-  const timeouts = Object.values(project.jobs).map(job => job.timeoutMinutes);
-  assert.ok(Math.max(...timeouts) >= 30, 'the longest Peek job is at least 30 minutes');
-  const headroom = Math.max(300, 1200 + Math.max(...timeouts) * 60);
-  assert.ok(project.machineTtlSeconds - headroom >= 4 * 3600, 'the reuse window stays positive and useful');
-});
-
-test('the pool stays at two boxes and retires an idle one within 90 minutes', () => {
+test('the CI pool stays at two single-job boxes', () => {
   assert.equal(project.caps.concurrent, 2);
-  assert.equal(project.reuse.idleHoldSeconds, 5400);
-  assert.ok(project.reuse.idleHoldSeconds <= 2 * 3600, 'an idle box never holds a slot for more than two hours');
+  assert.equal(project.reuse.mode, 'off');
 });
 
-test('the label Peek jobs ask for is routed at the default size', () => {
-  assert.deepEqual(project.labels, ['peek-router']);
+test('the heavy label is default and the light label is small', () => {
+  assert.deepEqual(project.labels, ['peek-router', 'peek-router-light']);
   assert.deepEqual(project.sizes['peek-router'], { machine: 'default' });
+  assert.deepEqual(project.sizes['peek-router-light'], { machine: 'small' });
   assert.deepEqual(project.triggers, [{ on: 'workflow_job', executor: 'actions-jit' }]);
 });
 

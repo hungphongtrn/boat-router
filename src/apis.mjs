@@ -10,6 +10,7 @@ import { lightResetCommand, lightResetDiagnosticCommand, parseLightResetResult, 
 import { dockerBaselineCommand, dockerResetCommand, dockerStartCommand, parseDockerBaselineResult, parseDockerResetResult } from './router/docker-reset.mjs';
 import { PROBE, REUSE_PROBE } from './router/jit-liveness.mjs';
 import { setupProviderFields, setupOutputTail, setupCaptureStatus, setupErrorCategory, setupRetryEligible, setupPhase, setupExitCode } from './router/setup-diagnostics.mjs';
+import { latestRollingSnapshot, rollingSnapshotManifest } from './router/rolling-snapshot.mjs';
 
 export const providerWallet = env => env.BOAT_PROVIDER_WALLET ?? env.BOAT_WALLET ?? defaultWallet;
 
@@ -100,12 +101,18 @@ export class APIs {
   jobAnnotations(job, id) { return this.github(job, `/check-runs/${id}/annotations?per_page=100`, { permissions: { checks: 'read' } }); }
   convertManifest(code) { return this.request('github', `/app-manifests/${encodeURIComponent(code)}/conversions`, { method: 'POST' }); }
   limits() { return this.request('boat', '/limits'); }
+  async rollingSnapshot() {
+    const { snapshots } = await this.request('boat', '/saved-snapshots?namePrefix=peek-ci-');
+    if (!Array.isArray(snapshots)) throw new ApiError('boat', 502, 'invalid_snapshot_list');
+    return latestRollingSnapshot(snapshots);
+  }
   create(job, ttl) {
     let body;
     try {
       const snapshot = job.routerSnapshot;
       const lease = snapshot?.kind === 'lease-v1', browser = snapshot?.kind === 'browser-v1';
-      if (snapshot && (!(lease ? /^lease-ci-\d{8}-[a-f0-9]{8,64}$/ : browser ? /^browser-ci-\d{8}-[a-f0-9]{8,64}$/ : /^[a-z][a-z0-9-]{0,40}-\d{8}-[a-f0-9]{8,64}$/).test(snapshot.name ?? '') ||
+      const rolling = snapshot && rollingSnapshotManifest(snapshot.name);
+      if (snapshot && (!(rolling ? rolling === snapshot.manifestSha256 && job.routerReusable !== true : (lease ? /^lease-ci-\d{8}-[a-f0-9]{8,64}$/ : browser ? /^browser-ci-\d{8}-[a-f0-9]{8,64}$/ : /^[a-z][a-z0-9-]{0,40}-\d{8}-[a-f0-9]{8,64}$/).test(snapshot.name ?? '')) ||
         !/^[a-f0-9]{64}$/.test(snapshot.manifestSha256 ?? '') || (lease && (!/^[a-f0-9]{64}$/.test(snapshot.profileSha256 ?? '') || job.routerReusable !== true)) ||
         (browser && (!/^[a-f0-9]{64}$/.test(snapshot.browserManifestSha256 ?? '') || !/^[a-f0-9]{64}$/.test(snapshot.profileSha256 ?? '') || job.routerReusable !== true)) || (!lease && !browser && (snapshot.kind != null || snapshot.profileSha256 != null || snapshot.browserManifestSha256 != null)) || job.routerResetMode === 'docker' || job.routerDockerAccess === true)) throw new TypeError('invalid snapshot');
       body = { type: job.machineSize ?? job.size, ttlSeconds: ttl, noEnv: true, snapshots: false, monitoring: false,

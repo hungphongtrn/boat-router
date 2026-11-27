@@ -3,15 +3,14 @@
   "repo": "hungphongtrn/peek",
   "account": "peek",
   "reuse": {
-    "mode": "on",
-    "idleHoldSeconds": 5400,
-    "idleHoldSecondsWhenStartsPaid": 1200
+    "mode": "off"
   },
   "caps": {
     "concurrent": 2
   },
   "labels": [
-    "peek-router"
+    "peek-router",
+    "peek-router-light"
   ],
   "machineTtlSeconds": 28800,
   "jobs": {
@@ -34,6 +33,9 @@
   "sizes": {
     "peek-router": {
       "machine": "default"
+    },
+    "peek-router-light": {
+      "machine": "small"
     }
   },
   "triggers": [
@@ -43,6 +45,7 @@
     }
   ],
   "snapshotBoot": true,
+  "rollingSnapshot": true,
   "workflowConcurrency": [
     {
       "workflowPath": ".github/workflows/ci.yml",

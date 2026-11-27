@@ -9,6 +9,26 @@ The example is a starting point. Review the account, project, runner, GitHub App
 5. Run `npm test`, `npm run check`, and `npm run build`. The last command is a Wrangler dry run. Inspect its output and bindings before deployment.
 6. Configure the GitHub App and webhook secret for the target repositories. Verify the webhook signature, the operator control token, provider limits, and the disabled Worker before enabling starts under your own deployment procedure.
 
+### Peek router maintenance
+
+The `Boat router` GitHub workflow runs syntax checks, Node tests, and a Wrangler
+dry run on pull requests and `main`; it does not need Boat or Cloudflare
+credentials. Require `Router check` on `main`.
+
+For a live rollout, configure the repository's `production` environment to
+allow deployments from `main` only and require operator approval. Set
+`CLOUDFLARE_ACCOUNT_ID`, `ROUTER_ENABLED` (`true` or `false`), `PUBLIC_ORIGIN`,
+and `BOAT_PROVIDER_WALLET` as environment variables. Store an account-scoped
+Workers Scripts Edit token as the `CLOUDFLARE_API_TOKEN` environment secret.
+Check the tracked `wrangler.jsonc` against the live target before enabling
+deploys: explicitly configured bindings and variables are applied even with
+`--keep-vars`.
+
+Dispatch `Boat router` on `main` with `deploy: true`. It rechecks the selected
+revision, then deploys that revision only if it is still the head of `main`.
+This updates `peek-boat-router` and reuses its `FLEET` Durable Object and
+existing Worker secrets. It does not build or activate a new Boat snapshot.
+
 For external claimers, configure `externalClaimer` on a project and use the authenticated `/router/local/claim`, `/router/local/started`, and `/router/local/release` routes. Scope credentials to the claimer. A claim remains held when runner retirement is uncertain. Investigate before using the operator release route.
 
 The example enables the experimental router, pacing, and reuse, but `ENABLED=false` prevents machine starts. Replace `BOAT_PROVIDER_WALLET` with the provider wallet value. It must be nonempty and differ from the `BOAT_WALLET` account ID. Set `ROUTER_PROJECTS` to the registered project IDs. Replace `PUBLIC_ORIGIN` with the deployed HTTPS origin. Set start limits, `poolPacing`, TTL, reuse policy, and the cron to suit the provider account. `START_PACING` controls the legacy controller; `poolPacing` controls router pool starts.

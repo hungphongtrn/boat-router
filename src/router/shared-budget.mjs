@@ -10,15 +10,15 @@ export class SharedBudget {
     const digest = await crypto.subtle.digest('SHA-256', bytes);
     return [...new Uint8Array(digest)].map(byte => byte.toString(16).padStart(2, '0')).join('');
   }
-  async admit(key, limits, { queuedAt = this.now(), jobId, pool = false, label, snapshotRecovery = false } = {}) {
+  async admit(key, limits, { queuedAt = this.now(), jobId, pool = false, label, snapshotRecovery = false, cost } = {}) {
     const claim = await this.claimKey(key);
     await this.ledger.enqueue(this.project, claim, queuedAt, jobId, { pool, label, snapshotRecovery });
-    const result = await this.ledger.admit(this.project, claim, snapshotLimits(limits, this.now()), { pool });
+    const result = await this.ledger.admit(this.project, claim, snapshotLimits(limits, this.now()), { pool, cost });
     if (result.recovered && result.status !== 'pending') return { ok: false, reason: 'reconciliation_required', nextAt: this.now() + 5000 };
     return result.ok ? { ok: true, claim } : { ...result, nextAt: this.now() + 5000 };
   }
   async enqueue(key, queuedAt = this.now(), jobId, options) { return this.ledger.enqueue(this.project, await this.claimKey(key), queuedAt, jobId, options); }
-  async admitBatch(keys, limits, { queuedAt = this.now() } = {}) {
+  async admitBatch(keys, limits, { queuedAt = this.now(), cost } = {}) {
     if (!Array.isArray(keys) || !keys.length || new Set(keys).size !== keys.length) throw new TypeError('invalid budget batch');
     const hashes = await Promise.all(keys.map(key => this.claimKey(key)));
     const claims = await Promise.all(hashes.map(hash => this.ledger.claim(hash)));
@@ -28,7 +28,7 @@ export class SharedBudget {
     // Pending claims have not called the provider and can be released safely.
     if (claims.some(Boolean)) for (const hash of hashes) await this.ledger.cancelPending(this.project, hash);
     await this.ledger.enqueueBatch(this.project, hashes, queuedAt);
-    const result = await this.ledger.admitBatch(this.project, hashes, snapshotLimits(limits, this.now()));
+    const result = await this.ledger.admitBatch(this.project, hashes, snapshotLimits(limits, this.now()), { cost });
     if (result.recovered) return { ok: false, reason: 'reconciliation_required', nextAt: this.now() + 5000 };
     return result.ok ? { ok: true } : { ...result, nextAt: this.now() + 5000 };
   }
@@ -38,9 +38,9 @@ export class SharedBudget {
   async claim(key) { return this.ledger.claim(await this.claimKey(key)); }
   // `not_created` requires conclusive provider proof; uncertain calls remain
   // charged. The caller must never mark a started machine as not created.
-  async settle(key, status) {
+  async settle(key, status, options) {
     const claimKey = await this.claimKey(key), claim = await this.ledger.claim(claimKey);
     if (!claim || claim.project !== this.project) return false;
-    return this.ledger.resolve(claimKey, status);
+    return this.ledger.resolve(claimKey, status, options);
   }
 }
