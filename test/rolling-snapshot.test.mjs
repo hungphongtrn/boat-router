@@ -35,6 +35,25 @@ test('a saving generation is invisible; ready generations can boot separate boxe
     assert.equal(start.snapshots, false);
     assert.deepEqual(start.env, {});
   }
-  assert.throws(() => api.create({ createKey: 'reuse', routerSnapshot: first, routerReusable: true }, 600), { code: 'request_not_sent' });
-  assert.equal(starts.length, 2);
+  await api.create({ createKey: 'reuse', routerSnapshot: first, routerReusable: true }, 600);
+  assert.equal(starts.length, 3);
+  assert.equal(starts[2].from, older);
+  assert.equal(starts[2].noEnv, true);
+  assert.match(starts[2].setupScript, /reuse-path/);
+});
+
+test('a retained generation can be pinned exactly and an unready pin fails closed', async () => {
+  const captures = [
+    { name: newer, status: 'ready', snapshotId: 'snapshot-2' },
+    { name: older, status: 'ready', snapshotId: 'snapshot-1' },
+  ];
+  const api = new APIs({}, async url => {
+    assert.ok(url.endsWith('/saved-snapshots?namePrefix=peek-ci-'));
+    return Response.json({ snapshots: captures });
+  });
+
+  assert.deepEqual(await api.rollingSnapshot(older), { name: older, manifestSha256: '0'.repeat(64), snapshotId: 'snapshot-1' });
+  assert.equal(await api.rollingSnapshot(`peek-ci-${'b'.repeat(52)}`), null);
+  captures[1] = { name: older, status: 'saving' };
+  assert.equal(await api.rollingSnapshot(older), null);
 });

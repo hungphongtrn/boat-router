@@ -264,15 +264,16 @@ export class BoxFleet {
         const account = record.account ?? this.createAccount ?? env.BOAT_WALLET;
         const eligible = this.project?.snapshotBoot === true && (account === 'primary' || account === 'secondary' || account === env.BOAT_WALLET) && !record.executor && record.resetMode !== 'docker' && this.project?.dockerAccess !== true;
         const suffix = account === 'secondary' ? '_SECONDARY' : '';
-        // A rolling snapshot pins one commit's toolchain and every reusable box must
-        // verify the same baseline, so only a single-job create takes it; with reuse
-        // on, the reusable create keeps the project's fixed base snapshot.
-        const rolling = this.project?.rollingSnapshot === true && record.reusable !== true;
+        // A rolling snapshot pins one commit's toolchain. A fresh box, reusable or
+        // single-job, boots the newest ready generation and verifies it before
+        // registering; a reusable box baselines that same disk and resets to it
+        // between jobs, so its baseline never moves under a running box.
+        const rolling = this.project?.rollingSnapshot === true;
         let routerSnapshot;
         if (eligible && rolling) {
           const api = this.api.forIdentity ? await this.api.forIdentity(record) : this.api;
           try {
-            routerSnapshot = await api.rollingSnapshot();
+            routerSnapshot = await api.rollingSnapshot(env[`PROJECT_ROLLING_SNAPSHOT_NAME${suffix}`] || null);
           } catch (error) {
             await releaseSizedProbe(this.storage, record.size, record.createKey);
             await this.budget.cancelPending(createKey);

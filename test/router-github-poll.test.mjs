@@ -9,6 +9,7 @@ import { snapshotLimits } from '../src/router/ledger.mjs';
 
 const repo = 'hungphongtrn/peek';
 const env = { BOAT_WALLET: 'peek', BOAT_PROVIDER_WALLET: 'provider', ROUTER_PROJECTS: 'peek', ENABLED: 'false', GITHUB_POLL_REPO: repo, GITHUB_POLL_TOKEN: 'test-poll-token', GITHUB_POLL_PAID_CAP_USD: '1.50' };
+const readyRouterSnapshot = { name: `peek-ci-${'a'.repeat(52)}`, status: 'ready', snapshotId: 'snapshot-1' };
 
 test('local slot budget preserves FIFO and starts immediately after a slot frees despite spent hourly floor', async () => {
   const now = () => 100_000_000, storage = new Storage();
@@ -99,6 +100,7 @@ test('a signed repo hook acknowledges before admission and starts one Boat box e
         const window = { limit: 20, used: 0, remaining: 20 };
         return Response.json({ canStart: true, nextStartDollars: 0, overagePrices: { vmHourDollars: 0.036 }, activeSandboxes: 0, maxActiveSandboxes: 20, startLimits: { perMinute: 20, perHour: 20, perDay: 20 }, starts: { minute: window, hour: window, day: window }, machineTypes: [{ type: 'default', available: true }] });
       }
+      if (path.endsWith('/saved-snapshots')) return Response.json({ snapshots: [readyRouterSnapshot] });
       if (path.endsWith('/sandboxes') && method === 'POST') {
         starts++;
         return Response.json({ sandbox: { id: 'bx_23456789' } }, { status: 202 });
@@ -213,6 +215,7 @@ const spentBudgetPoll = (t, nowFn) => {
           planIncluded: { vmHoursRemaining: 0, periodEnd: new Date(nowFn() + 2 * 86_400_000).toISOString() },
           packBalanceHours: 100, last24hUsageSeconds: 296_857 });
       }
+      if (path.endsWith('/saved-snapshots')) return Response.json({ snapshots: [readyRouterSnapshot] });
       if (path.endsWith('/sandboxes') && method === 'POST') { starts++; return Response.json({ sandbox: { id: `bx_2345678${starts}` } }, { status: 202 }); }
       return Response.json({ sandbox: { state: 'running', setupStatus: 'pending' } });
     }
