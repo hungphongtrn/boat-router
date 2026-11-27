@@ -1,0 +1,40 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { APIs } from '../src/apis.mjs';
+
+const older = `peek-ci-${'a'.repeat(52)}`;
+const newer = `peek-ci-${'a'.repeat(51)}q`;
+
+test('a saving generation is invisible; ready generations can boot separate boxes without env or snapshots', async () => {
+  const starts = [];
+  const captures = [
+    { name: newer, status: 'saving' },
+    { name: older, status: 'ready', snapshotId: 'snapshot-1' },
+  ];
+  const api = new APIs({}, async (url, { body }) => {
+    if (url.endsWith('/saved-snapshots?namePrefix=peek-ci-')) {
+      return Response.json({ snapshots: captures });
+    }
+    assert.ok(url.endsWith('/sandboxes'));
+    starts.push(JSON.parse(body));
+    return Response.json({ sandbox: { id: `box-${starts.length}` } });
+  });
+
+  const first = await api.rollingSnapshot();
+  assert.equal(first.snapshotId, 'snapshot-1');
+  captures[0] = { name: newer, status: 'ready', snapshotId: 'snapshot-2' };
+  const second = await api.rollingSnapshot();
+  assert.equal(second.snapshotId, 'snapshot-2');
+  await api.create({ createKey: 'first', routerSnapshot: first }, 600);
+  await api.create({ createKey: 'second', routerSnapshot: second }, 600);
+  assert.deepEqual(starts.map(start => start.from), [older, newer]);
+  assert.match(starts[0].setupScript, new RegExp(`${'0'.repeat(64)}.*toolchain.sha256`));
+  assert.match(starts[1].setupScript, new RegExp(`${'0'.repeat(63)}1.*toolchain.sha256`));
+  for (const start of starts) {
+    assert.equal(start.noEnv, true);
+    assert.equal(start.snapshots, false);
+    assert.deepEqual(start.env, {});
+  }
+  assert.throws(() => api.create({ createKey: 'reuse', routerSnapshot: first, routerReusable: true }, 600), { code: 'request_not_sent' });
+  assert.equal(starts.length, 2);
+});

@@ -2,8 +2,9 @@ import { smokeRepository, localHosts } from '../config/policy.mjs';
 import { transition as applyBoxEvent } from './router/box-state.mjs';
 import { FleetBase } from './router/fleet-base.mjs';
 import { snapshotLimits } from './router/ledger.mjs';
+import { admissionReadiness, spendAmount } from './router/spend-ledger.mjs';
 import { dynamicPacing } from './router/dynamic-pacing.mjs';
-import { paidExtraEnabled, paidExtraSummary } from './router/paid-extra.mjs';
+import { PAID_EXTRA_MAX_DOLLARS, paidExtraEnabled, paidExtraSummary } from './router/paid-extra.mjs';
 import { runnableDemand } from './router/workflow-demand.mjs';
 import { claimAny } from './router/local-fleet.mjs';
 import { ExternalService } from './router/external-service.mjs';
@@ -469,7 +470,7 @@ export class FleetController extends FleetBase {
         return this.patch(job.id, { balancerWaitAt: job.balancerWaitAt ?? now, balancerWaitMachine: balance.waitMachine, nextAt: balance.nextAt });
       }
       if (this.sharedBudget) {
-        const admission = await this.sharedBudget.admit(job.createKey, { ...limits, observedAt: limits.observedAt ?? now }, { queuedAt: job.createdAt ?? now, jobId: job.id });
+        const admission = await this.sharedBudget.admit(job.createKey, { ...limits, observedAt: limits.observedAt ?? now }, { queuedAt: job.createdAt ?? now, jobId: job.id, cost: { kind: 'machine', size: machineSize, ttlSeconds: ttl } });
         if (!admission.ok) { this.logger(JSON.stringify({ event: 'admission_refused', job_id: job.id, reason: admission.reason ?? 'refused' })); return this.patch(job.id, { nextAt: admission.nextAt ?? now + 60_000 }); }
       }
       const reserved = await this.reserve(job, machineSize);
@@ -514,17 +515,28 @@ export class FleetController extends FleetBase {
       return this.patch(job.id, { nextAt: now + 60_000 });
     }
   }
+  // A provider-confirmed delete ends billable machine time. Settle the start
+  // reservation to the job's elapsed time plus stop latency; a missing box or
+  // an ambiguous delete keeps the full TTL charged.
+  async settleJob(job) {
+    if (!this.sharedBudget || !job?.machineCreatedAt) return;
+    const elapsed = Math.max(1, Math.ceil((this.now() - job.machineCreatedAt) / 1000) + 60);
+    try { await this.sharedBudget.settle(job.createKey, 'created', { elapsedSeconds: elapsed }); }
+    catch (error) { this.logger?.(JSON.stringify({ event: 'spend_settle_failed', job_id: job.id, message: error?.message ?? 'settle failed' })); }
+  }
   async destroy(job) {
     let result;
     try { result = await this.api.destroy(job); } catch (e) {
       if (e.status !== 404) throw e;
       await this.release(job);
       if (job.purgeRetries) return this.purgeFailure(job, 404);
+      await this.settleJob(job);
       await this.emit('destroy_absent', job);
       return this.patch(job.id, { phase: 'unregister', nextAt: this.now() });
     }
     if (typeof result.operation?.id !== 'string') throw new ApiError('boat', 502);
     await this.release(job);
+    await this.settleJob(job);
     await this.patch(job.id, { phase: 'unregister', operationId: result.operation.id, permanentFailures: 0, nextAt: this.now() });
     await this.emit('destroy', job, { operation_id: result.operation.id });
   }
@@ -689,7 +701,39 @@ export class Fleet {
         this.ctx.abort('operator restart during disabled deployment');
       }
       if (url.pathname === '/sweep' && request.method === 'POST') { await this.moveAppSecretsOnce(); await this.router.tick(); return new Response(null, { status: 202 }); }
-      if (url.pathname === '/health' && request.method === 'GET') return Response.json({ mode: 'router', account: this.router.account.id });
+      if (url.pathname === '/health' && request.method === 'GET') {
+        // The local fallback's early GitHub route can see an outage here, but it
+        // must also see an exhausted $20 ledger before it starts heavy work.
+        // Only the category is public; no cap, spend or credential leaves.
+        let readiness = { ready: true, admission: 'ready' };
+        try {
+          const spend = await this.router.ledger.spendStatus();
+          if (spend?.enabled === true) {
+            // Ask for the same maximum-lifetime reservation admission will
+            // take, never a shorter one: a nearly spent cap that still covers
+            // an hour but not the configured TTL must read exhausted.
+            const policy = this.router.ledger.spend;
+            const size = url.searchParams.get('size') ?? 'small';
+            const ttl = Number(url.searchParams.get('ttlSeconds') ?? this.env.MACHINE_TTL_SECONDS ?? 7200);
+            if (!Number.isSafeInteger(ttl) || ttl < 1 || ttl * 1000 > 30 * 86_400_000) throw new TypeError('invalid readiness lifetime');
+            const fee = url.searchParams.has('feeUsd')
+              ? Number(url.searchParams.get('feeUsd'))
+              : (paidExtraEnabled(this.router.account) ? PAID_EXTRA_MAX_DOLLARS : 0);
+            if (!Number.isFinite(fee) || fee < 0 || fee > PAID_EXTRA_MAX_DOLLARS) throw new TypeError('invalid readiness start fee');
+            // The query names one selected job. Without one, reserve the
+            // largest lifetime a configured project may start (8h today), so
+            // the generic answer cannot be optimistic for a real job.
+            const lifetime = url.searchParams.has('ttlSeconds') ? ttl : Math.min(30 * 86_400, Math.max(ttl, ...[...this.router.projects.values()].map(project => Number(project.config?.machineTtlSeconds ?? 0)).filter(Number.isSafeInteger)));
+            readiness = admissionReadiness(spend, spendAmount(policy, { kind: 'machine', size, ttlSeconds: lifetime }) + fee);
+            if (readiness.ready) {
+              if (this.env.ENABLED !== 'true') throw new Error('start scheduling paused');
+              const limits = await (this.router.accountLimits?.() ?? this.controller.api.limits());
+              if (limits?.canStart !== true) throw new Error('provider cannot start a box');
+            }
+          }
+        } catch { readiness = { ready: false, admission: 'unavailable' }; }
+        return Response.json({ mode: 'router', account: this.router.account.id, ...readiness }, { headers: { 'Cache-Control': 'no-store' } });
+      }
       if (claimerPath === '/router/local/claim' && request.method === 'GET') {
         if (url.searchParams.get('demand') === '1') {
           if (!await authorizedControl(request, this.env) && !await authorizedLocal(request, this.env)) return new Response(null, { status: 401 });
@@ -848,6 +892,46 @@ export class Fleet {
         const policy = selected?.ledger.policy ?? this.router.account;
         return Response.json({ claims: ledger?.claims ?? {}, waiting: ledger?.waiting ?? [], poolPacing: ledger?.poolPacing ?? null,
           ...(paidExtraEnabled(policy) ? { paidExtra: paidExtraSummary(ledger?.paidExtraSpend, policy, Date.now()) } : {}) }, { headers: { 'Cache-Control': 'no-store' } });
+      }
+      // One spend ledger for starts, leases, refreshes and retained snapshots.
+      // These routes are the operator/refresh side of the same reservations the
+      // start and lease paths write inside their admission transaction. They
+      // deliberately ignore ENABLED: the first refresh must reserve and settle
+      // while start scheduling is paused, before any rolling snapshot exists.
+      if (url.pathname === '/router/spend' && request.method === 'GET') {
+        if (!await authorizedControl(request, this.env)) return new Response(null, { status: 401 });
+        const name = url.searchParams.get('account'), selected = name ? this.router.accountPools?.[name] : null;
+        if (name && !selected) return new Response(null, { status: 400 });
+        const ledger = selected?.ledger ?? this.router.ledger;
+        const status = await ledger.spendStatus();
+        return Response.json({ ...status, ...(selected ? { account: name } : {}), policy: ledger.spend ? {
+          monthlyUsd: ledger.spend.monthlyUsd, machineHourUsd: ledger.spend.machineHourUsd,
+          snapshotDayUsd: ledger.spend.snapshotDayUsd, snapshotRetentionDays: ledger.spend.snapshotRetentionDays } : null }, { headers: { 'Cache-Control': 'no-store' } });
+      }
+      if (['/router/spend/reserve', '/router/spend/settle', '/router/spend/storage-deleted'].includes(url.pathname) && request.method === 'POST') {
+        if (!await authorizedControl(request, this.env)) return new Response(null, { status: 401 });
+        const name = url.searchParams.get('account'), selected = name ? this.router.accountPools?.[name] : null;
+        if (name && !selected) return new Response(null, { status: 400 });
+        const ledger = selected?.ledger ?? this.router.ledger;
+        if (!ledger.spend) return Response.json({ ok: false, reason: 'spend_disabled' }, { status: 503, headers: { 'Cache-Control': 'no-store' } });
+        let body;
+        try { body = await request.json(); } catch { return new Response(null, { status: 400 }); }
+        if (!body || typeof body !== 'object' || Array.isArray(body)) return new Response(null, { status: 400 });
+        try {
+          if (url.pathname === '/router/spend/reserve') {
+            const result = await ledger.reserveSpend(body.project, body.key, body.cost);
+            return Response.json(result, { headers: { 'Cache-Control': 'no-store' } });
+          }
+          if (url.pathname === '/router/spend/settle') {
+            const ok = await ledger.settleSpend(body.key, body.status, body.elapsedSeconds === undefined ? undefined : { elapsedSeconds: body.elapsedSeconds });
+            return Response.json(ok ? { ok: true } : { ok: false, reason: 'not_reserved' }, { status: ok ? 200 : 404, headers: { 'Cache-Control': 'no-store' } });
+          }
+          const released = await ledger.confirmStorageDeleted(body.key, body.elapsedSeconds === undefined ? undefined : { elapsedSeconds: body.elapsedSeconds });
+          return Response.json(released ? { ok: true } : { ok: false, reason: 'not_reserved' }, { status: released ? 200 : 404, headers: { 'Cache-Control': 'no-store' } });
+        } catch (error) {
+          const conflict = /conflict|created spend cannot be refunded/.test(error?.message ?? '');
+          return Response.json({ ok: false, reason: error?.message ?? 'invalid_spend_request' }, { status: conflict ? 409 : 400, headers: { 'Cache-Control': 'no-store' } });
+        }
       }
       if (url.pathname === '/router/balancer' && request.method === 'GET') {
         if (!await authorizedControl(request, this.env)) return new Response(null, { status: 401 });

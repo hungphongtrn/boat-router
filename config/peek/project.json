@@ -6,8 +6,12 @@
     "mode": "on",
     "idleHoldSecondsWhenStartsPaid": 3600
   },
+  "caps": {
+    "concurrent": 2
+  },
   "labels": [
-    "peek-router"
+    "peek-router",
+    "peek-router-light"
   ],
   "machineTtlSeconds": 28800,
   "jobs": {
@@ -32,6 +36,9 @@
     "ci-test-run": {
       "timeoutMinutes": 36
     },
+    "shard": {
+      "timeoutMinutes": 30
+    },
     "promotion": {
       "timeoutMinutes": 25
     },
@@ -48,6 +55,9 @@
   "sizes": {
     "peek-router": {
       "machine": "default"
+    },
+    "peek-router-light": {
+      "machine": "small"
     }
   },
   "triggers": [
@@ -56,5 +66,13 @@
       "executor": "actions-jit"
     }
   ],
-  "snapshotBoot": true
+  "snapshotBoot": true,
+  "rollingSnapshot": true,
+  "workflowConcurrency": [
+    {
+      "workflowPath": ".github/workflows/ci.yml",
+      "jobPrefix": "shard (",
+      "maxParallel": 4
+    }
+  ]
 }

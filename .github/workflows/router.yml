@@ -1,0 +1,79 @@
+name: Boat router
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      deploy:
+        description: Deploy the tested main revision to Cloudflare
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Router check
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - run: npm run check
+      - run: npm test
+      - run: npm run build
+
+  deploy:
+    name: Deploy router
+    if: github.event_name == 'workflow_dispatch' && inputs.deploy && github.ref == 'refs/heads/main' && github.repository == 'hungphongtrn/boat-router'
+    needs: check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: production
+    concurrency:
+      group: router-production
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - name: Deploy the checked revision
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PUBLIC_ORIGIN: ${{ vars.PUBLIC_ORIGIN }}
+          BOAT_PROVIDER_WALLET: ${{ vars.BOAT_PROVIDER_WALLET }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          ROUTER_ENABLED: ${{ vars.ROUTER_ENABLED }}
+        run: |
+          set -euo pipefail
+          [[ $(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha) == "$GITHUB_SHA" ]] || {
+            echo '::error::main moved; dispatch a deploy for its current head'
+            exit 1
+          }
+          : "${CLOUDFLARE_ACCOUNT_ID:?set this in the production environment}"
+          : "${CLOUDFLARE_API_TOKEN:?set this in the production environment}"
+          : "${PUBLIC_ORIGIN:?set this in the production environment}"
+          : "${BOAT_PROVIDER_WALLET:?set this in the production environment}"
+          case "$ROUTER_ENABLED" in
+            true|false) ;;
+            *) echo '::error::production ROUTER_ENABLED must be true or false'; exit 1 ;;
+          esac
+          npm exec -- wrangler deploy --keep-vars \
+            --var "ENABLED:$ROUTER_ENABLED" \
+            --var "PUBLIC_ORIGIN:$PUBLIC_ORIGIN" \
+            --var "BOAT_PROVIDER_WALLET:$BOAT_PROVIDER_WALLET"

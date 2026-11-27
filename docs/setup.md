@@ -9,6 +9,26 @@ The example is a starting point. Review the account, project, runner, GitHub App
 5. Run `npm test`, `npm run check`, and `npm run build`. The last command is a Wrangler dry run. Inspect its output and bindings before deployment.
 6. Configure the GitHub App and webhook secret for the target repositories. Verify the webhook signature, the operator control token, provider limits, and the disabled Worker before enabling starts under your own deployment procedure.
 
+### Peek router maintenance
+
+The `Boat router` GitHub workflow runs syntax checks, Node tests, and a Wrangler
+dry run on pull requests and `main`; it does not need Boat or Cloudflare
+credentials. Require `Router check` on `main`.
+
+For a live rollout, configure the repository's `production` environment to
+allow deployments from `main` only and require operator approval. Set
+`CLOUDFLARE_ACCOUNT_ID`, `ROUTER_ENABLED` (`true` or `false`), `PUBLIC_ORIGIN`,
+and `BOAT_PROVIDER_WALLET` as environment variables. Store an account-scoped
+Workers Scripts Edit token as the `CLOUDFLARE_API_TOKEN` environment secret.
+Check the tracked `wrangler.jsonc` against the live target before enabling
+deploys: explicitly configured bindings and variables are applied even with
+`--keep-vars`.
+
+Dispatch `Boat router` on `main` with `deploy: true`. It rechecks the selected
+revision, then deploys that revision only if it is still the head of `main`.
+This updates `peek-boat-router` and reuses its `FLEET` Durable Object and
+existing Worker secrets. It does not build or activate a new Boat snapshot.
+
 For external claimers, configure `externalClaimer` on a project and use the authenticated `/router/local/claim`, `/router/local/started`, and `/router/local/release` routes. Scope credentials to the claimer. A claim remains held when runner retirement is uncertain. Investigate before using the operator release route.
 
 The example enables the experimental router, pacing, and reuse, but `ENABLED=false` prevents machine starts. Replace `BOAT_PROVIDER_WALLET` with the provider wallet value. It must be nonempty and differ from the `BOAT_WALLET` account ID. Set `ROUTER_PROJECTS` to the registered project IDs. Replace `PUBLIC_ORIGIN` with the deployed HTTPS origin. Set start limits, `poolPacing`, TTL, reuse policy, and the cron to suit the provider account. `START_PACING` controls the legacy controller; `poolPacing` controls router pool starts.
@@ -29,7 +49,7 @@ Boat accepts starts past the account's free day allowance and bills each one (ab
 
 - `starts.day` becomes the day ceiling instead of being clamped to the provider's reported limit, still with `margin`. With `starts.day: 260` and a 10 % margin the router paces 234 starts and stops hard at 260.
 - A `nextStartDollars` up to $0.07 is accepted. A higher price refuses the start as `paid_start_ceiling`; an omitted price gives no opinion.
-- Set `starts.paidExtraMaxDollarsPerMonth` to bound the rolling 30-day spend (we use `2`, two dollars). Every admitted paid extra is recorded at `nextStartDollars`, or $0.07 when Boat omits the price; a start that would take the sum past the cap waits as `paid_extra_budget` with a `nextAt` of when the oldest record ages out. A free start is never counted or refused. Leave the field unset for no cap, which also keeps the ledger state as it was (nothing is recorded).
+- Set `starts.paidExtraMaxDollarsPerMonth` to bound the rolling 30-day spend (Peek uses `15`, fifteen dollars, inside the wider `spend.monthlyUsd` ledger that also charges the same start fee). Every admitted paid extra is recorded at `nextStartDollars`, or $0.07 when Boat omits the price; a start that would take the sum past the cap waits as `paid_extra_budget` with a `nextAt` of when the oldest record ages out. A free start is never counted or refused. Leave the field unset for no cap, which also keeps the ledger state as it was (nothing is recorded).
 - `GET /router/claims` and `GET /router/pacing` report `paidExtra` (`capUsd`, `spentUsd`, `starts`, `nextRollOffAt`) on an account with the opt-in, so the spend is readable without the provider.
 - Everything else still refuses: the provider's minute and hour windows, `canStart: false`, `checkoutRequired`, a blocked billing status (`past_due`, `unpaid`, `canceled`) and zero funds. Dynamic pacing and reuse stay in place, so extras follow the day rate instead of bursting.
 - It is off by default. It needs an account ledger that may spend a billed start: the two-account cutover policy keeps `forbidPaidStarts: true`, so extras do not apply there.

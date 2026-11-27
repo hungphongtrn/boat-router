@@ -22,15 +22,15 @@ test('local slot budget preserves FIFO and starts immediately after a slot frees
   assert.equal(router.account.reuse.idleHoldSeconds, 3600);
   assert.equal(router.projects.get('peek').config.reuse.idleHoldSecondsWhenStartsPaid, 3600);
   await storage.put(router.ledger.key, { claims: {}, waiting: [], dynamicPacing: { at: now(), credit: 0, ratePerMs: 0, floorStarts: [{ key: 'spent1', at: now() }, { key: 'spent2', at: now() }], floorOverflow: [] } });
-  const limits = active => snapshotLimits({ canStart: true, activeSandboxes: active, maxActiveSandboxes: 100, nextStartDollars: 0, starts: { minute: { limit: 12, used: 0 }, hour: { limit: 60, used: 9 }, day: { limit: 200, used: 138 } } }, now());
+  const limits = active => snapshotLimits({ canStart: true, activeSandboxes: active, maxActiveSandboxes: 100, nextStartDollars: 0, overagePrices: { vmHourDollars: 0.036 }, starts: { minute: { limit: 12, used: 0 }, hour: { limit: 60, used: 9 }, day: { limit: 200, used: 138 } } }, now());
   await router.ledger.enqueue('peek', 'first', now()-2000);
   await router.ledger.enqueue('peek', 'second', now()-1000);
-  assert.equal((await router.ledger.admit('peek', 'first', limits(1), { pool: true })).reason, 'concurrency');
-  assert.equal((await router.ledger.admit('peek', 'second', limits(0), { pool: true })).reason, 'fairness');
-  assert.equal((await router.ledger.admit('peek', 'first', limits(0), { pool: true })).ok, true);
-  assert.equal((await router.ledger.admit('peek', 'second', limits(0), { pool: true })).reason, 'concurrency', 'in-flight starts hold the slot');
+  assert.equal((await router.ledger.admit('peek', 'first', limits(1), { pool: true, cost: { kind: 'machine', size: 'default', ttlSeconds: 600 } })).reason, 'concurrency');
+  assert.equal((await router.ledger.admit('peek', 'second', limits(0), { pool: true, cost: { kind: 'machine', size: 'default', ttlSeconds: 600 } })).reason, 'fairness');
+  assert.equal((await router.ledger.admit('peek', 'first', limits(0), { pool: true, cost: { kind: 'machine', size: 'default', ttlSeconds: 600 } })).ok, true);
+  assert.equal((await router.ledger.admit('peek', 'second', limits(0), { pool: true, cost: { kind: 'machine', size: 'default', ttlSeconds: 600 } })).reason, 'concurrency', 'in-flight starts hold the slot');
   await router.ledger.cancelPending('peek', 'first');
-  assert.equal((await router.ledger.admit('peek', 'second', limits(0), { pool: true })).ok, true);
+  assert.equal((await router.ledger.admit('peek', 'second', limits(0), { pool: true, cost: { kind: 'machine', size: 'default', ttlSeconds: 600 } })).ok, true);
   const state = await storage.get(router.ledger.key);
   assert.equal(state.pacingStatus.admissionMode, 'slot_budget');
   state.paidExtraSpend = [{ at: now(), dollars: 1.5 }];
@@ -38,7 +38,7 @@ test('local slot budget preserves FIFO and starts immediately after a slot frees
   await router.ledger.cancelPending('peek', 'second');
   await router.ledger.enqueue('peek', 'paid');
   const paid = limits(0); paid.nextStartDollars = 0.03;
-  assert.equal((await router.ledger.admit('peek', 'paid', paid, { pool: true })).reason, 'paid_extra_budget');
+  assert.equal((await router.ledger.admit('peek', 'paid', paid, { pool: true, cost: { kind: 'machine', size: 'default', ttlSeconds: 600 } })).reason, 'paid_extra_budget');
   for (const value of ['0', '-1', '1.5', '101', 'NaN']) assert.throws(() => installRouter(new Storage(), () => ({ ...env, GITHUB_POLL_MAX_LIVE: value }), { api: new APIs(env), now }), /invalid poll live budget/);
   assert.throws(() => installRouter(new Storage(), () => ({ ...localEnv, GITHUB_POLL_UNPACED: 'true' }), { api: new APIs(env), now }), /invalid poll live budget/);
 });
@@ -67,18 +67,18 @@ test('local unpaced admission drains a spent pacing floor but preserves FIFO, pr
   await storage.put(ledger.key, { claims: {}, waiting: [], dynamicPacing: { at: now(), credit: 0.13, ratePerMs: 4 / 3_600_000, floorStarts: [{ key: 'used1', at: now() }, { key: 'used2', at: now() }], floorOverflow: [] } });
   await ledger.enqueue('peek', 'oldest', now() - 2000);
   await ledger.enqueue('peek', 'next', now() - 1000);
-  const limits = (changes = {}) => snapshotLimits({ canStart: true, activeSandboxes: 15, maxActiveSandboxes: 100, nextStartDollars: 0, starts: { minute: { limit: 12, used: 0 }, hour: { limit: 60, used: 9 }, day: { limit: 200, used: 138 } }, ...changes }, now());
-  assert.equal((await ledger.admit('peek', 'next', limits(), { pool: true })).reason, 'fairness');
-  assert.equal((await ledger.admit('peek', 'oldest', limits(), { pool: true })).ok, true);
-  assert.equal((await ledger.admit('peek', 'next', limits(), { pool: true })).ok, true);
+  const limits = (changes = {}) => snapshotLimits({ canStart: true, activeSandboxes: 15, maxActiveSandboxes: 100, nextStartDollars: 0, overagePrices: { vmHourDollars: 0.036 }, starts: { minute: { limit: 12, used: 0 }, hour: { limit: 60, used: 9 }, day: { limit: 200, used: 138 } }, ...changes }, now());
+  assert.equal((await ledger.admit('peek', 'next', limits(), { pool: true, cost: { kind: 'machine', size: 'default', ttlSeconds: 600 } })).reason, 'fairness');
+  assert.equal((await ledger.admit('peek', 'oldest', limits(), { pool: true, cost: { kind: 'machine', size: 'default', ttlSeconds: 600 } })).ok, true);
+  assert.equal((await ledger.admit('peek', 'next', limits(), { pool: true, cost: { kind: 'machine', size: 'default', ttlSeconds: 600 } })).ok, true);
   await ledger.enqueue('peek', 'blocked');
-  assert.equal((await ledger.admit('peek', 'blocked', limits({ activeSandboxes: 100 }), { pool: true })).reason, 'concurrency');
+  assert.equal((await ledger.admit('peek', 'blocked', limits({ activeSandboxes: 100 }), { pool: true, cost: { kind: 'machine', size: 'default', ttlSeconds: 600 } })).reason, 'concurrency');
   const full = { minute: { limit: 12, used: 12 }, hour: { limit: 60, used: 9 }, day: { limit: 200, used: 138 } };
-  assert.equal((await ledger.admit('peek', 'blocked', limits({ starts: full }), { pool: true })).reason, 'minute_cap');
+  assert.equal((await ledger.admit('peek', 'blocked', limits({ starts: full }), { pool: true, cost: { kind: 'machine', size: 'default', ttlSeconds: 600 } })).reason, 'minute_cap');
   const state = await storage.get(ledger.key);
   state.paidExtraSpend = [{ at: now(), dollars: 1.5 }];
   await storage.put(ledger.key, state);
-  assert.equal((await ledger.admit('peek', 'blocked', limits({ nextStartDollars: 0.03 }), { pool: true })).reason, 'paid_extra_budget');
+  assert.equal((await ledger.admit('peek', 'blocked', limits({ nextStartDollars: 0.03 }), { pool: true, cost: { kind: 'machine', size: 'default', ttlSeconds: 600 } })).reason, 'paid_extra_budget');
   assert.equal(installRouter(new Storage(), () => env, { api: new APIs(env), now, logger: () => {} }).account.poolPacing.unpaced, false);
   assert.throws(() => installRouter(new Storage(), () => ({ ...env, GITHUB_POLL_UNPACED: 'yes' }), { api: new APIs(env), now }), /invalid poll unpaced/);
 });
@@ -97,7 +97,7 @@ test('a signed repo hook acknowledges before admission and starts one Boat box e
     if (u.hostname === 'boat.dev') {
       if (path.endsWith('/limits')) {
         const window = { limit: 20, used: 0, remaining: 20 };
-        return Response.json({ canStart: true, nextStartDollars: 0, activeSandboxes: 0, maxActiveSandboxes: 20, startLimits: { perMinute: 20, perHour: 20, perDay: 20 }, starts: { minute: window, hour: window, day: window }, machineTypes: [{ type: 'default', available: true }] });
+        return Response.json({ canStart: true, nextStartDollars: 0, overagePrices: { vmHourDollars: 0.036 }, activeSandboxes: 0, maxActiveSandboxes: 20, startLimits: { perMinute: 20, perHour: 20, perDay: 20 }, starts: { minute: window, hour: window, day: window }, machineTypes: [{ type: 'default', available: true }] });
       }
       if (path.endsWith('/sandboxes') && method === 'POST') {
         starts++;
@@ -207,7 +207,7 @@ const spentBudgetPoll = (t, nowFn) => {
     const u = new URL(url), path = u.pathname;
     if (u.hostname === 'boat.dev') {
       if (path.endsWith('/limits')) {
-        return Response.json({ canStart: true, nextStartDollars: 0, activeSandboxes: 0, maxActiveSandboxes: 100,
+        return Response.json({ canStart: true, nextStartDollars: 0, overagePrices: { vmHourDollars: 0.036 }, activeSandboxes: 0, maxActiveSandboxes: 100,
           starts: { minute: { limit: 20, used: 0 }, hour: { limit: 60, used: 0 }, day: { limit: 200, used: 0 } },
           machineTypes: [{ type: 'default', available: true }],
           planIncluded: { vmHoursRemaining: 0, periodEnd: new Date(nowFn() + 2 * 86_400_000).toISOString() },

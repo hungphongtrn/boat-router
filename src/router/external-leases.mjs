@@ -289,7 +289,7 @@ export class ExternalLeaseStarts {
     }
     if (!claim) {
       await this.ledger.enqueue(project, lease.claimKey, lease.createdAt, undefined, { client });
-      const admitted = await this.ledger.admit(project, lease.claimKey, limits);
+      const admitted = await this.ledger.admit(project, lease.claimKey, limits, { cost: { kind: 'machine', size: lease.size, ttlSeconds: lease.machineTtlSeconds ?? ttlSeconds } });
       if (!admitted.ok) {
         await this.storage.put(key, { ...lease, lastReason: admitted.reason });
         return false;

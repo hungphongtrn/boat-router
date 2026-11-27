@@ -3,6 +3,7 @@ import { plan, poolKey, poolSize, supplyCounts, uncovered, localOfferActive } fr
 import { records } from './pool-records.mjs';
 import { registrationRejected, rejectedRegistrationAbsent } from './registration-recovery.mjs';
 import { observeRouterStall } from './stall-alarm.mjs';
+import { rollingSnapshotManifest } from './rolling-snapshot.mjs';
 import { isPlanRefusal, isSizeRefusal } from '../domain.mjs';
 import { prunePool, RETENTION } from './pool-prune.mjs';
 import { waitClaims } from './wait-for-busy.mjs';
@@ -226,7 +227,7 @@ export class BoxFleet {
     let claim = await this.budget.claim(createKey);
     if ((!claim || claim.status === 'pending') && !await reserveSizedProbe(this.storage, record.size, createKey, this.now())) return false;
     if (!claim) {
-      const result = await this.budget.admit(createKey, limits, { queuedAt: record.queuedAt, jobId: record.snapshotRecoveryJobId, pool: true, snapshotRecovery: Boolean(record.snapshotRecoveryJobId) });
+      const result = await this.budget.admit(createKey, limits, { queuedAt: record.queuedAt, jobId: record.snapshotRecoveryJobId, pool: true, snapshotRecovery: Boolean(record.snapshotRecoveryJobId), cost: { kind: 'machine', size: record.size, ttlSeconds: ttl } });
       if (!result.ok) {
         this.logger?.(JSON.stringify({ event: 'admission_refused', project: this.project?.id, reason: result.reason ?? 'refused' }));
         const label = JSON.parse(record.pool)[1], statusKey = `pool:status:${label}`, status = await this.storage.get(statusKey);
@@ -263,10 +264,33 @@ export class BoxFleet {
         const account = record.account ?? this.createAccount ?? env.BOAT_WALLET;
         const eligible = this.project?.snapshotBoot === true && (account === 'primary' || account === 'secondary' || account === env.BOAT_WALLET) && !record.executor && record.resetMode !== 'docker' && this.project?.dockerAccess !== true;
         const suffix = account === 'secondary' ? '_SECONDARY' : '';
-        const name = eligible ? env[`PROJECT_SNAPSHOT_NAME${suffix}`] : undefined;
-        const manifestSha256 = eligible ? env[`PROJECT_SNAPSHOT_MANIFEST_SHA256${suffix}`] : undefined;
-        if ((name || manifestSha256) && (!/^[a-z][a-z0-9-]{0,40}-\d{8}-[a-f0-9]{8,64}$/.test(name ?? '') || !/^[a-f0-9]{64}$/.test(manifestSha256 ?? ''))) throw new TypeError('invalid project snapshot configuration');
-        record = { ...record, bootPath: name ? 'snapshot' : 'plain', ...(name ? { routerSnapshot: { name, manifestSha256 } } : {}) };
+        // A rolling snapshot pins one commit's toolchain and every reusable box must
+        // verify the same baseline, so only a single-job create takes it; with reuse
+        // on, the reusable create keeps the project's fixed base snapshot.
+        const rolling = this.project?.rollingSnapshot === true && record.reusable !== true;
+        let routerSnapshot;
+        if (eligible && rolling) {
+          const api = this.api.forIdentity ? await this.api.forIdentity(record) : this.api;
+          try {
+            routerSnapshot = await api.rollingSnapshot();
+          } catch (error) {
+            await releaseSizedProbe(this.storage, record.size, record.createKey);
+            await this.budget.cancelPending(createKey);
+            throw error;
+          }
+        } else if (eligible) {
+          const name = env[`PROJECT_SNAPSHOT_NAME${suffix}`];
+          const manifestSha256 = env[`PROJECT_SNAPSHOT_MANIFEST_SHA256${suffix}`];
+          if ((name || manifestSha256) && (!/^[a-z][a-z0-9-]{0,40}-\d{8}-[a-f0-9]{8,64}$/.test(name ?? '') || !/^[a-f0-9]{64}$/.test(manifestSha256 ?? ''))) throw new TypeError('invalid project snapshot configuration');
+          if (name) routerSnapshot = { name, manifestSha256 };
+        }
+        if (eligible && rolling && !routerSnapshot) {
+          await releaseSizedProbe(this.storage, record.size, record.createKey);
+          await this.budget.cancelPending(createKey);
+          this.logger?.(JSON.stringify({ event: 'snapshot_not_ready', project: this.project.id }));
+          return false;
+        }
+        record = { ...record, bootPath: routerSnapshot ? 'snapshot' : 'plain', ...(routerSnapshot ? { routerSnapshot } : {}) };
         await this.storage.put(key, record);
       }
       if (!await this.budget.begin(createKey)) return false;
@@ -280,7 +304,9 @@ export class BoxFleet {
         sandbox = result?.sandbox;
         if (!/^bx_[23456789abcdefghjkmnpqrstuvwxyz]{8}$/.test(sandbox?.id ?? '')) throw new Error('invalid sandbox');
       } catch (error) {
-        if (record.bootPath === 'snapshot' && error?.service === 'boat' && error.status === 404 && error.code === 'snapshot_not_found') {
+        // A discovered rolling generation has no plain fallback to take; a project's fixed
+        // base snapshot still falls back so a retired name cannot stop every create.
+        if (record.bootPath === 'snapshot' && !rollingSnapshotManifest(record.routerSnapshot?.name) && error?.service === 'boat' && error.status === 404 && error.code === 'snapshot_not_found') {
           const fallbackKey = crypto.randomUUID();
           const fallbackName = `boat-router-${(await this.budget.claimKey(fallbackKey)).slice(0, 32)}`;
           record = { ...record, state: 'snapshot_missing', fallbackKey, fallbackName };
@@ -320,7 +346,7 @@ export class BoxFleet {
     await afterStart?.(record, 'created');
     this.alert?.('create_failures', { value: 0, limit: 1, active: false });
     if (!await this.budget.settle(createKey, 'created')) return false;
-    this.logger?.(JSON.stringify({ event: 'create', project: this.project?.id, machine_id: sandbox.id, size: record.size, job_id: record.orderJobId, run_id: record.orderRunId, source: record.orderSource, create_ms: createMs }));
+    this.logger?.(JSON.stringify({ event: 'create', project: this.project?.id, machine_id: sandbox.id, size: record.size, job_id: record.orderJobId, run_id: record.orderRunId, source: record.orderSource, snapshot: record.routerSnapshot?.name, create_ms: createMs }));
     return this.storage.transaction(async tx => {
       const current = await tx.get(key);
       if (!current) return false;
@@ -1118,6 +1144,18 @@ export class BoxFleet {
     });
   }
 
+  // Only a provider-confirmed absence or completed deletion ends a machine's
+  // billable life. Settle the shared reservation to elapsed time plus a minute
+  // for stop/delete latency; an ambiguous delete keeps the full TTL charged.
+  async settleDeleted(box) {
+    if (!box?.createKey || typeof this.budget?.settle !== 'function') return;
+    const started = Number.isFinite(box.createdAt) ? box.createdAt : box.since;
+    if (!Number.isFinite(started)) return;
+    const elapsedSeconds = Math.max(1, Math.ceil((this.now() - started) / 1000) + 60);
+    try { await this.budget.settle(box.createKey, 'created', { elapsedSeconds }); }
+    catch (error) { this.logger?.(JSON.stringify({ event: 'spend_settle_failed', project: this.project?.id, machine_id: box.machineId, message: error?.message ?? 'settle failed' })); }
+  }
+
   async stuckAlert(box, reason) {
     this.logger?.(JSON.stringify({ event: 'box_stuck', project: this.project?.id, machine_id: box.machineId, state: box.state, reason, since: box.since }));
     await this.emit?.('alert_box_stuck', null, { machine_id: box.machineId, phase: box.state, status: reason });
@@ -1231,7 +1269,7 @@ export class BoxFleet {
     if (providerLimited) await this.storage.put('startBackoffUntil', this.now() + 60_000);
     else await this.verificationOutcome(box, reason, false, diagnostic);
     let retry = null;
-    if ((box.bootPath === 'snapshot' || (!box.setupRetry && !providerLimited && diagnostic.retryEligible === true)) && box.createKey && this.budget && box.pool && box.size) {
+    if ((box.bootPath === 'snapshot' ? !rollingSnapshotManifest(box.routerSnapshot?.name) : !box.setupRetry && !providerLimited && diagnostic.retryEligible === true) && box.createKey && this.budget && box.pool && box.size) {
       const createKey = crypto.randomUUID();
       const routerCreateName = `boat-router-${(await this.budget.claimKey(createKey)).slice(0, 32)}`;
       retry = { pool: box.pool, size: box.size, createKey, routerCreateName, state: 'pending', at: this.now(), queuedAt: box.queuedAt ?? box.createdAt ?? this.now(), reusable: box.reusable === true, setupRetry: true, ...(box.bootPath === 'snapshot' ? { bootPath: 'plain_fallback', fallbackOf: box.createKey, fallbackAfterMachineId: box.machineId } : {}), ...(box.account ? { account: box.account } : this.createAccount ? { account: this.createAccount } : {}) };
@@ -1318,7 +1356,15 @@ export class BoxFleet {
         if (boxDeadline(box, this.now(), options) === 'boot_timeout') return this.failedBoot(box, 'boot_timeout', result);
         return;
       }
-      if (!box.reusable) return this.transition(machineId, 'boot_done', { bootDoneObservedAt: this.now() });
+      if (!box.reusable) {
+        const bootDoneObservedAt = this.now();
+        const ready = await this.transition(machineId, 'boot_done', { bootDoneObservedAt });
+        if (ready && box.routerSnapshot && Number.isFinite(box.createdAt)) this.logger?.(JSON.stringify({
+          event: 'snapshot_boot', project: this.project?.id, machine_id: box.machineId, snapshot: box.routerSnapshot.name,
+          seconds: (bootDoneObservedAt - box.createdAt) / 1000,
+        }));
+        return ready;
+      }
       box = await this.transition(machineId, 'baseline_start', { processId: null, bootDoneObservedAt: this.now() });
       if (!box) return;
       try {
@@ -1480,7 +1526,7 @@ export class BoxFleet {
       if (typeof this.api.sandbox === 'function') {
         try { await this.api.sandbox(box); }
         catch (error) {
-          if (error?.status === 404) return this.transition(machineId, 'sandbox_missing', { failureReason: 'sandbox_missing' });
+          if (error?.status === 404) { const gone = await this.transition(machineId, 'sandbox_missing', { failureReason: 'sandbox_missing' }); await this.settleDeleted(gone); return gone; }
         }
       }
       const running = box.orphan && (snapshot.jobs ?? []).some(job => job.status === 'in_progress' && ((box.aliases ?? []).includes(job.runnerName) || job.runnerName?.startsWith(prefix)));
@@ -1493,14 +1539,14 @@ export class BoxFleet {
       return this.transition(machineId, 'unregistered', { runnerFenced: true });
     }
     if (box.state === 'purging') {
-      if (!box.operationId) return this.transition(machineId, 'purged');
+      if (!box.operationId) { const purged = await this.transition(machineId, 'purged'); await this.settleDeleted(purged); return purged; }
       const result = await this.api.deletion(box);
-      if (result?.operation?.status === 'completed') return this.transition(machineId, 'purged');
+      if (result?.operation?.status === 'completed') { const purged = await this.transition(machineId, 'purged'); await this.settleDeleted(purged); return purged; }
       // After the purge deadline the sandbox read decides on its own: a 404 ends the record.
       if (box.runnerFenced === true && (result?.operation?.id === box.operationId || Number.isFinite(box.stuckAlertedAt)) && typeof this.api.sandbox === 'function') {
         try { await this.api.sandbox(box); }
         catch (error) {
-          if (error?.status === 404) return this.transition(machineId, 'purged', { deletedBy: 'sandbox_404', deletionOperationId: box.operationId, deletionOperationStatus: result?.operation?.status ?? null });
+          if (error?.status === 404) { const purged = await this.transition(machineId, 'purged', { deletedBy: 'sandbox_404', deletionOperationId: box.operationId, deletionOperationStatus: result?.operation?.status ?? null }); await this.settleDeleted(purged); return purged; }
         }
       }
     }
