@@ -1,0 +1,11 @@
+{
+  "peek-runs": {
+    "enabled": true,
+    "project": "peek",
+    "maxActive": 4,
+    "ttlSeconds": 1800,
+    "startsPerDay": 60,
+    "rollingSnapshot": true,
+    "warmReuse": false
+  }
+}

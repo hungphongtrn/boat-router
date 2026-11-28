@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { validateSuite } from '../src/router/plugins.mjs';
-import { accounts, projects } from '../config/installation.mjs';
+import { accounts, leaseClients, projects } from '../config/installation.mjs';
 import { defaultWallet, setupOwner, repositories, smokeRepository, localHosts } from '../config/policy.mjs';
 
 const wrangler = JSON.parse(readFileSync(new URL('../wrangler.jsonc', import.meta.url), 'utf8'));
@@ -21,6 +21,19 @@ test('the deployment registers exactly Peek on the owner account', () => {
   assert.equal(project.account, account.id);
   assert.equal(setupOwner, 'hungphongtrn');
   assert.equal(smokeRepository, null);
+});
+
+test('the installed peek-runs lease client names the Peek project and its policy', () => {
+  assert.deepEqual(leaseClients['peek-runs'], {
+    enabled: true,
+    project: 'peek',
+    maxActive: 4,
+    ttlSeconds: 1800,
+    startsPerDay: 60,
+    rollingSnapshot: true,
+    warmReuse: false,
+  });
+  assert.equal(JSON.stringify(leaseClients).includes('tokenHash'), false, 'a token hash never lives in the repository');
 });
 
 test('the project passes the router validator', () => {

@@ -1,5 +1,5 @@
 import { safeLogger } from '../redact.mjs';
-import { accounts, projects as projectDefinitions } from '../../config/installation.mjs';
+import { accounts, leaseClients, projects as projectDefinitions } from '../../config/installation.mjs';
 import { createHash } from 'node:crypto';
 import { reuseBootstrap } from '../refresh.mjs';
 import { dockerBootstrap } from '../bootstrap.mjs';
@@ -72,8 +72,12 @@ export function installRouter(storage, getEnv, { api, now = Date.now, logger = c
   if (!selected) throw new TypeError('unknown router account');
   const provider = getEnv().BOAT_PROVIDER_WALLET;
   if (typeof provider !== 'string' || !provider.trim() || provider.trim() !== provider || provider === selected.id) throw new TypeError('invalid router provider wallet');
-  let externalClients = {};
-  try { externalClients = JSON.parse(getEnv().EXTERNAL_LEASE_CLIENTS ?? '{}'); } catch {}
+  // The installed file names each client and its policy; the Worker secret adds
+  // or replaces a client, so a deployment can override one without a redeploy.
+  let externalClients = { ...(leaseClients && !Array.isArray(leaseClients) && typeof leaseClients === 'object' ? leaseClients : {}) };
+  let envClients = {};
+  try { envClients = JSON.parse(getEnv().EXTERNAL_LEASE_CLIENTS ?? '{}'); } catch {}
+  if (envClients && !Array.isArray(envClients) && typeof envClients === 'object') externalClients = { ...externalClients, ...envClients };
   if (!externalClients || Array.isArray(externalClients) || typeof externalClients !== 'object') externalClients = {};
   // A client credential rotates through its own secret: EXTERNAL_LEASE_TOKEN_HASHES
   // maps a client name to the SHA-256 hex of its current token and replaces the
@@ -94,6 +98,7 @@ export function installRouter(storage, getEnv, { api, now = Date.now, logger = c
       const overrides = {};
       if (policy.maxActive === null || (Number.isSafeInteger(policy.maxActive) && policy.maxActive > 0)) overrides.maxActive = policy.maxActive;
       if (typeof policy.warmReuse === 'boolean') overrides.warmReuse = policy.warmReuse;
+      if (typeof policy.rollingSnapshot === 'boolean') overrides.rollingSnapshot = policy.rollingSnapshot;
       if (policy.startsPerDay === null) overrides.startsPerDay = null;
       if (policy.concurrencyReserve === 0) overrides.concurrencyReserve = 0;
       externalClients[name] = { ...externalClients[name], ...overrides };

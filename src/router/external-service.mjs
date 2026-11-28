@@ -6,6 +6,7 @@ import { reuseHold } from './reuse-pacing.mjs';
 import { runnableDemand } from './workflow-demand.mjs';
 import { lanesSwitchOn } from './lanes.mjs';
 import { breakerForSize } from './verification-breaker.mjs';
+import { validLeaseSize } from './sizes.mjs';
 
 async function records(storage, prefix) {
   const out = []; let startAfter = '';
@@ -32,7 +33,7 @@ export class ExternalService {
   }
   config(client) {
     const cfg = this.clients?.[client];
-    if (!cfg || cfg.enabled !== true || (cfg.maxActive !== null && (!Number.isSafeInteger(cfg.maxActive) || cfg.maxActive < 1)) || (cfg.startsPerDay !== null && (!Number.isSafeInteger(cfg.startsPerDay) || cfg.startsPerDay < 0)) || !Number.isSafeInteger(cfg.ttlSeconds) || cfg.ttlSeconds < 60 || cfg.ttlSeconds > 3600 || !this.router.projects.has(cfg.project)) return null;
+    if (!cfg || cfg.enabled !== true || (cfg.maxActive !== null && (!Number.isSafeInteger(cfg.maxActive) || cfg.maxActive < 1)) || (cfg.startsPerDay !== null && (!Number.isSafeInteger(cfg.startsPerDay) || cfg.startsPerDay < 0)) || !Number.isSafeInteger(cfg.ttlSeconds) || cfg.ttlSeconds < 60 || cfg.ttlSeconds > 3600 || (cfg.rollingSnapshot !== undefined && typeof cfg.rollingSnapshot !== 'boolean') || (cfg.warmReuse !== undefined && typeof cfg.warmReuse !== 'boolean') || !this.router.projects.has(cfg.project)) return null;
     return cfg;
   }
   async ciIdle(size = 'default', allowDeferred = false) {
@@ -91,9 +92,9 @@ export class ExternalService {
     if (lease.lastReason && /^[a-z_]+$/.test(lease.lastReason)) return lease.lastReason;
     return /^[a-z_]+$/.test(lease.state ?? '') ? `lease_${lease.state}` : 'lease_pending';
   }
-  async claim(client, id, size, isolation = null, repoKey = null, fromTick = false, selection = null) {
+  async claim(client, id, size, isolation = null, repoKey = null, fromTick = false, selection = null, rolling = false) {
     const cfg = this.config(client);
-    if (!cfg || !['default', 'large'].includes(size) || (repoKey !== null && !/^[a-f0-9]{64}$/.test(repoKey))) return null;
+    if (!cfg || !validLeaseSize(size) || (repoKey !== null && !/^[a-f0-9]{64}$/.test(repoKey))) return null;
     const project = this.router.projects.get(cfg.project);
     if (await project.storage.get('pool:mode') !== 'on') return null;
     const prior = await this.storage.get(`external-lease:${client}:${id}`);
@@ -107,11 +108,19 @@ export class ExternalService {
     }
     // external-v2 clients use the externallease user, isolate /tmp/w, and put transferred files under /tmp/lease-<id>.
     const reuseEnabled = cfg.warmReuse === true && this.router.account.reuse?.enabled === true && project.config.reuse?.mode === 'on' && project.config.dockerAccess !== true && await project.storage.get('reuse:override') !== 'off';
-    if (selection && (!prior || ['waiting', 'reserved'].includes(prior.state)) && (!reuseEnabled || isolation !== 'external-v2')) return null;
+    // A rolling generation is a boot disk, not a reuse feature: it needs no warm
+    // reuse, so only the base kinds still require the isolated lease mode.
+    if (selection && (!prior || ['waiting', 'reserved'].includes(prior.state)) && (!reuseEnabled || isolation !== 'external-v2') && selection.routerSnapshot?.kind !== 'peek-ci') return null;
     let lease = await this.leases.reserve(client, id, cfg.maxActive, cfg.ttlSeconds * 1000);
     if (!lease) return null;
-    if (!lease.size && lease.state === 'reserved') lease = await this.leases.transition(client, id, ['reserved'], 'reserved', { size, project: cfg.project, repoKey, isolation: reuseEnabled && isolation === 'external-v2' ? isolation : null, ...(selection ?? {}) });
+    if (!lease.size && lease.state === 'reserved') lease = await this.leases.transition(client, id, ['reserved'], 'reserved', { size, project: cfg.project, repoKey, isolation: reuseEnabled && isolation === 'external-v2' ? isolation : null, ...(rolling ? { rollingSnapshot: true } : {}), ...(selection ?? {}) });
     if (!lease || lease.size !== size) return null;
+    // A rolling client never boots plain: without a stored generation it waits
+    // for the next publication instead of spending a start on an empty box.
+    if (rolling && !lease.routerSnapshot) {
+      if (lease.state === 'reserved') await this.leases.transition(client, id, ['reserved'], 'waiting', { lastReason: 'ci_snapshot_unavailable' });
+      if (lease.state !== 'active') return null;
+    }
     if (lease.state === 'active') return lease.expiresAt > this.now() ? lease : null;
     if (lease.expiresAt <= this.now()) return null;
     if (lease.state === 'fencing') await this.fence.resume(cfg.project, client, id);
@@ -189,12 +198,13 @@ export class ExternalService {
   async admissionEntries() {
     if (this.router.account.openStartQueue !== true) return [];
     return (await records(this.storage, 'external-lease:'))
-      .filter(lease => ['waiting', 'reserved', 'starting'].includes(lease.state) && !lease.machineId && !lease.releaseRequested && lease.expiresAt > this.now() && Number.isFinite(lease.createdAt) && ['default', 'large'].includes(lease.size) && this.config(lease.client))
+      .filter(lease => ['waiting', 'reserved', 'starting'].includes(lease.state) && !lease.machineId && !lease.releaseRequested && lease.expiresAt > this.now() && Number.isFinite(lease.createdAt) && validLeaseSize(lease.size) && this.config(lease.client))
       .map(lease => ({ at: lease.createdAt, rank: `external:${lease.client}:${lease.id}`, lease }));
   }
   async admitStart(entry) {
     const lease = entry.lease;
-    return this.claim(lease.client, lease.id, lease.size, lease.isolation ?? null, lease.repoKey ?? null, true, lease.base ? { base: lease.base, baseId: lease.baseId, routerSnapshot: lease.routerSnapshot } : null);
+    const selection = lease.baseId || lease.routerSnapshot ? { base: lease.base, baseId: lease.baseId, routerSnapshot: lease.routerSnapshot, ...(lease.rollingSnapshot ? { rollingSnapshot: true } : {}) } : null;
+    return this.claim(lease.client, lease.id, lease.size, lease.isolation ?? null, lease.repoKey ?? null, true, selection, lease.rollingSnapshot === true);
   }
   async release(client, id) {
     const lease = await this.storage.get(`external-lease:${client}:${id}`);

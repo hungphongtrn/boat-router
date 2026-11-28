@@ -1,5 +1,6 @@
 import account from './peek/account.json' with { type: 'json' };
 import project from './peek/project.json' with { type: 'json' };
+import clients from './peek/clients.json' with { type: 'json' };
 import example from '../examples/account.json' with { type: 'json' };
 import secondary from '../examples/account-secondary.json' with { type: 'json' };
 import projectA from '../examples/project.json' with { type: 'json' };
@@ -10,6 +11,10 @@ import projectC from '../examples/project-c.json' with { type: 'json' };
 // example accounts and projects below are fixtures the test suite runs on and are
 // never selected by the deployed Worker.
 export const accounts = [account, example, secondary];
+// Lease clients installed with the Worker. A token is never here: it arrives as
+// the EXTERNAL_LEASE_TOKEN_HASHES secret, and EXTERNAL_LEASE_CLIENTS overrides
+// or adds a client on top of this file.
+export const leaseClients = clients;
 export const projects = [
   { config: project },
   { config: projectA },

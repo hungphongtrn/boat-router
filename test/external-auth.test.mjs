@@ -213,3 +213,85 @@ test('an established lease stream stays open after the handshake deadline', asyn
     assert.equal(fleet.router.ticking, null);
   } finally { globalThis.setTimeout = original; }
 });
+
+const alphabet = 'abcdefghijklmnopqrstuvwxyz234567';
+function rollingName(manifestSha256) {
+  const value = BigInt(`0x${manifestSha256}`) << 4n;
+  let encoded = '';
+  for (let index = 51; index >= 0; index--) encoded += alphabet[Number((value >> BigInt(index * 5)) & 31n)];
+  return `peek-ci-${encoded}`;
+}
+
+function leaseFleet(storage, clients, extra = {}) {
+  return new Fleet({ storage, waitUntil() {} }, { PLUGIN_ROUTER: 'true', BOAT_WALLET: 'example-account', BOAT_PROVIDER_WALLET: 'team_test', ROUTER_PROJECTS: 'project-a', EXTERNAL_LEASE_CLIENTS: JSON.stringify(clients), ...extra });
+}
+const claimRequest = (client, token, id, body) => new Request('https://fleet/router/lease/claim', { method: 'POST', headers: { 'X-Boat-CI-Enabled': 'true', 'X-Lease-Client': client, Authorization: `Bearer ${token}` }, body: JSON.stringify({ id, ...body }) });
+
+test('a claim body asking for a rolling generation reports the selected snapshot', async () => {
+  const token = 'a'.repeat(40), id = '00000000-0000-4000-8000-000000000001', storage = new Storage();
+  const clients = { lease: { enabled: true, project: 'project-a', maxActive: 6, startsPerDay: 60, ttlSeconds: 900, tokenHash: await hash(token) } };
+  const fleet = leaseFleet(storage, clients);
+  const manifestSha256 = 'a'.repeat(64), name = rollingName(manifestSha256), pins = [];
+  fleet.controller.api = { rollingSnapshot: async preferred => { pins.push(preferred); return { name, manifestSha256, snapshotId: 'snapshot-9' }; } };
+  let captured;
+  fleet.external.claim = async (...args) => { captured = args; return { machineId: 'bx_12345678', expiresAt: Date.now() + 60_000, routerSnapshot: { kind: 'peek-ci', name, snapshotId: 'snapshot-9', manifestSha256 } }; };
+  const response = await fleet.fetch(claimRequest('lease', token, id, { rollingSnapshot: true, isolation: 'external-v2' }));
+  assert.equal(response.status, 200);
+  const body = await response.json();
+  assert.equal(body.snapshotName, name);
+  assert.equal(body.manifestSha256, manifestSha256);
+  assert.deepEqual(pins, [null]);
+  const [, , , , , , selection, rolling] = captured;
+  assert.equal(rolling, true);
+  assert.deepEqual(selection.routerSnapshot, { kind: 'peek-ci', name, snapshotId: 'snapshot-9', manifestSha256 });
+  assert.equal(selection.baseId, manifestSha256);
+});
+
+test('a client default selects the rolling generation and a plain lease reports null', async () => {
+  const token = 'a'.repeat(40), id = '00000000-0000-4000-8000-000000000001', storage = new Storage();
+  const clients = { lease: { enabled: true, project: 'project-a', maxActive: 6, startsPerDay: 60, ttlSeconds: 900, rollingSnapshot: true, tokenHash: await hash(token) } };
+  const fleet = leaseFleet(storage, clients);
+  const manifestSha256 = 'b'.repeat(64), name = rollingName(manifestSha256);
+  fleet.controller.api = { rollingSnapshot: async () => ({ name, manifestSha256, snapshotId: 'snapshot-8' }) };
+  let captured;
+  fleet.external.claim = async (...args) => { captured = args; return { machineId: 'bx_12345678', expiresAt: Date.now() + 60_000, routerSnapshot: { kind: 'peek-ci', name, snapshotId: 'snapshot-8', manifestSha256 } }; };
+  const rolling = await fleet.fetch(claimRequest('lease', token, id, {}));
+  assert.equal(rolling.status, 200);
+  assert.equal(captured[7], true);
+  fleet.external.claim = async () => ({ machineId: 'bx_12345678', expiresAt: Date.now() + 60_000 });
+  const plain = await fleet.fetch(claimRequest('lease', token, id, { rollingSnapshot: false }));
+  assert.equal(plain.status, 200);
+  assert.deepEqual(await plain.json().then(({ snapshotName, manifestSha256: digest }) => [snapshotName, digest]), [null, null]);
+});
+
+test('a pending claim returns a canonical reason and the specific detail', async () => {
+  const token = 'a'.repeat(40), id = '00000000-0000-4000-8000-000000000001', storage = new Storage();
+  const clients = { lease: { enabled: true, project: 'project-a', maxActive: 6, startsPerDay: 60, ttlSeconds: 900, tokenHash: await hash(token) } };
+  const fleet = leaseFleet(storage, clients);
+  fleet.external.claim = async () => null;
+  for (const [detail, reason] of [['lease_cap', 'pool_full'], ['spend_budget', 'budget_exhausted'], ['ci_snapshot_unavailable', 'snapshot_unavailable'], ['start_capacity', 'start_capacity'], ['lease_pool_preparing', 'starting']]) {
+    fleet.external.pendingReason = async () => detail;
+    const response = await fleet.fetch(claimRequest('lease', token, id, {}));
+    assert.equal(response.status, 202, detail);
+    assert.deepEqual(await response.json(), { reason, detail }, detail);
+  }
+});
+
+test('the installed peek-runs client takes its policy from config and its token from the secret', async () => {
+  const storage = new Storage();
+  const env = { PLUGIN_ROUTER: 'true', BOAT_WALLET: 'peek', BOAT_PROVIDER_WALLET: 'team_test', ROUTER_PROJECTS: 'peek' };
+  const fleet = new Fleet({ storage, waitUntil() {} }, env);
+  const config = fleet.external.config('peek-runs');
+  assert.equal(config.project, 'peek');
+  assert.equal(config.ttlSeconds, 1800);
+  assert.equal(config.rollingSnapshot, true);
+  assert.equal(config.warmReuse, false);
+  assert.equal(config.maxActive, null, 'the open start queue owns admission');
+  assert.equal(config.startsPerDay, null);
+  const token = 'e'.repeat(40), id = '00000000-0000-4000-8000-000000000001';
+  const rotated = new Fleet({ storage: new Storage(), waitUntil() {} }, { ...env, EXTERNAL_LEASE_TOKEN_HASHES: JSON.stringify({ 'peek-runs': await hash(token) }) });
+  assert.equal(rotated.external.config('peek-runs').ttlSeconds, 1800);
+  const renew = client => rotated.fetch(new Request('https://fleet/router/lease/renew', { method: 'POST', headers: { 'X-Boat-CI-Enabled': 'true', 'X-Lease-Client': client, Authorization: `Bearer ${token}` }, body: JSON.stringify({ id }) }));
+  assert.equal((await renew('peek-runs')).status, 409);
+  assert.equal((await renew('stranger')).status, 401);
+});

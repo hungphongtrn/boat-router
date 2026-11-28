@@ -57,3 +57,20 @@ test('a retained generation can be pinned exactly and an unready pin fails close
   captures[1] = { name: older, status: 'saving' };
   assert.equal(await api.rollingSnapshot(older), null);
 });
+
+test('a peek-ci lease boots the same generation and manifest check the CI path uses', async () => {
+  const starts = [];
+  const api = new APIs({}, async (url, { body }) => {
+    if (url.endsWith('/saved-snapshots?namePrefix=peek-ci-')) return Response.json({ snapshots: [{ name: newer, status: 'ready', snapshotId: 'snapshot-2' }] });
+    assert.ok(url.endsWith('/sandboxes'));
+    starts.push(JSON.parse(body));
+    return Response.json({ sandbox: { id: `box-${starts.length}` } });
+  });
+  const selected = await api.rollingSnapshot();
+  await api.create({ createKey: 'lease', routerSnapshot: { kind: 'peek-ci', ...selected }, routerReusable: true }, 1800);
+  assert.equal(starts[0].from, newer);
+  assert.match(starts[0].setupScript, new RegExp(`${'0'.repeat(63)}1.*toolchain.sha256`));
+  assert.equal(starts[0].noEnv, true);
+  assert.throws(() => api.create({ createKey: 'mismatch', routerSnapshot: { kind: 'peek-ci', name: older, snapshotId: 'snapshot-1', manifestSha256: 'f'.repeat(64) }, routerReusable: true }, 1800), error => error.code === 'request_not_sent');
+  assert.throws(() => api.create({ createKey: 'profile', routerSnapshot: { kind: 'peek-ci', ...selected, profileSha256: 'f'.repeat(64) }, routerReusable: true }, 1800), error => error.code === 'request_not_sent');
+});

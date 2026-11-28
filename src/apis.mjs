@@ -118,11 +118,14 @@ export class APIs {
     let body;
     try {
       const snapshot = job.routerSnapshot;
-      const lease = snapshot?.kind === 'lease-v1', browser = snapshot?.kind === 'browser-v1';
+      const lease = snapshot?.kind === 'lease-v1', browser = snapshot?.kind === 'browser-v1', rollingLease = snapshot?.kind === 'peek-ci';
       const rolling = snapshot && rollingSnapshotManifest(snapshot.name);
+      // A rolling generation carries no profile digests: its immutable name is
+      // the manifest, and the setup script verifies that manifest on boot.
       if (snapshot && (!(rolling ? rolling === snapshot.manifestSha256 : (lease ? /^lease-ci-\d{8}-[a-f0-9]{8,64}$/ : browser ? /^browser-ci-\d{8}-[a-f0-9]{8,64}$/ : /^[a-z][a-z0-9-]{0,40}-\d{8}-[a-f0-9]{8,64}$/).test(snapshot.name ?? '')) ||
         !/^[a-f0-9]{64}$/.test(snapshot.manifestSha256 ?? '') || (lease && (!/^[a-f0-9]{64}$/.test(snapshot.profileSha256 ?? '') || job.routerReusable !== true)) ||
-        (browser && (!/^[a-f0-9]{64}$/.test(snapshot.browserManifestSha256 ?? '') || !/^[a-f0-9]{64}$/.test(snapshot.profileSha256 ?? '') || job.routerReusable !== true)) || (!lease && !browser && (snapshot.kind != null || snapshot.profileSha256 != null || snapshot.browserManifestSha256 != null)) || job.routerResetMode === 'docker' || job.routerDockerAccess === true)) throw new TypeError('invalid snapshot');
+        (rollingLease && (!rolling || snapshot.profileSha256 != null || snapshot.browserManifestSha256 != null)) ||
+        (browser && (!/^[a-f0-9]{64}$/.test(snapshot.browserManifestSha256 ?? '') || !/^[a-f0-9]{64}$/.test(snapshot.profileSha256 ?? '') || job.routerReusable !== true)) || (!lease && !browser && !rollingLease && (snapshot.kind != null || snapshot.profileSha256 != null || snapshot.browserManifestSha256 != null)) || job.routerResetMode === 'docker' || job.routerDockerAccess === true)) throw new TypeError('invalid snapshot');
       body = { type: job.machineSize ?? job.size, ttlSeconds: ttl, noEnv: true, snapshots: false, monitoring: false,
         failFast: true, setupScript: snapshot ? snapshotBootstrap(snapshot.manifestSha256, { reusable: job.routerReusable === true, ...(lease || browser ? { leaseProfileSha256: snapshot.profileSha256 } : {}), ...(browser ? { browserManifestSha256: snapshot.browserManifestSha256 } : {}) }) : job.routerResetMode === 'docker' || job.routerDockerAccess === true ? dockerBootstrap() : job.routerReusable ? reuseBootstrap() : bootstrap(), ...(snapshot ? { from: snapshot.name, env: {} } : {}), ...(job.routerCreateName ? { name: job.routerCreateName } : {}) };
     } catch { throw new ApiError('boat', 0, 'request_not_sent'); }

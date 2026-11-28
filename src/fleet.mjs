@@ -10,6 +10,8 @@ import { claimAny } from './router/local-fleet.mjs';
 import { ExternalService } from './router/external-service.mjs';
 import { leaseBase } from './router/lease-base.mjs';
 import { browserBase } from './router/browser-base.mjs';
+import { leaseRollingSnapshot } from './router/lease-snapshot.mjs';
+import { canonicalPendingReason } from './router/pending-reason.mjs';
 import { providerWallet } from './apis.mjs';
 import { BUILD_COMMIT, BUILD_DEPLOYMENT } from './build.mjs';
 import { installRouter } from './router/install.mjs';
@@ -1265,13 +1267,22 @@ export class Fleet {
         const prior = await this.storage.get(`external-lease:${client}:${id}`);
         if (prior?.state === 'closed') return new Response(null, { status: 410, headers });
         if (body.base != null && (body.base !== 'browser-v1' || config?.seededBase !== true || this.router.account.openStartQueue !== true || body.isolation !== 'external-v2')) return new Response(null, { status: 400, headers });
+        if (body.rollingSnapshot != null && typeof body.rollingSnapshot !== 'boolean') return new Response(null, { status: 400, headers });
         if (prior?.size && (prior.base === 'browser-v1') !== (body.base === 'browser-v1')) return new Response(null, { status: 409, headers });
         const configured = config?.seededBase === true && body.isolation === 'external-v2' && ['LEASE_BASE_SNAPSHOT_NAME','LEASE_BASE_SNAPSHOT_ID','LEASE_BASE_MANIFEST_SHA256','LEASE_BASE_PROFILE_SHA256'].some(key => this.env[key] != null);
-        const selection = prior?.size ? (prior.base ? { base: prior.base, baseId: prior.baseId, routerSnapshot: prior.routerSnapshot } : null) : body.base ? await browserBase(this.env) : configured ? await leaseBase(this.env) : null;
-        if ((body.base || configured) && !prior?.size && !selection) return new Response(null, { status: 503, headers });
-        const lease = await this.external.claim(client, id, body.size ?? 'default', body.isolation ?? null, body.repoKey ?? null, false, selection);
+        // A rolling lease selects the newest ready generation, or the operator's
+        // exact pin, in the account its box will be created in. The choice is
+        // stored on the lease, so a retry never re-resolves to another disk.
+        const rolling = prior?.size ? prior.rollingSnapshot === true : body.rollingSnapshot ?? config?.rollingSnapshot === true;
+        const discoverRolling = () => leaseRollingSnapshot({ api: this.router.externalApi ?? this.controller.api, env: this.env, account: this.router.externalCreateAccount ?? 'primary' }).catch(() => null);
+        let selection = prior?.size ? (prior.baseId || prior.routerSnapshot ? { base: prior.base, baseId: prior.baseId, routerSnapshot: prior.routerSnapshot, ...(prior.rollingSnapshot ? { rollingSnapshot: true } : {}) } : null) : body.base ? await browserBase(this.env) : rolling ? await discoverRolling() : configured ? await leaseBase(this.env) : null;
+        if (rolling && !selection) selection = await discoverRolling();
+        if (!prior?.size && (body.base || (configured && !rolling)) && !selection) return new Response(null, { status: 503, headers });
+        const lease = await this.external.claim(client, id, body.size ?? 'default', body.isolation ?? null, body.repoKey ?? null, false, selection, rolling);
         await project.storage.setAlarm(Date.now() + 10000);
-        return lease ? Response.json({ id, machineId: lease.machineId, expiresAt: lease.expiresAt, ...(lease.isolation === 'external-v2' ? { isolation: lease.isolation } : {}), ...(lease.base === 'browser-v1' ? { base: lease.base } : {}) }, { headers }) : Response.json({ reason: await this.external.pendingReason(client, id, body.size ?? 'default') }, { status: 202, headers });
+        if (lease) return Response.json({ id, machineId: lease.machineId, expiresAt: lease.expiresAt, snapshotName: lease.routerSnapshot?.name ?? null, manifestSha256: lease.routerSnapshot?.manifestSha256 ?? null, ...(lease.isolation === 'external-v2' ? { isolation: lease.isolation } : {}), ...(lease.base === 'browser-v1' ? { base: lease.base } : {}) }, { headers });
+        const detail = await this.external.pendingReason(client, id, body.size ?? 'default');
+        return Response.json({ reason: canonicalPendingReason(detail), detail }, { status: 202, headers });
       }
       if (action === 'release') {
         const done = await this.external.release(client, id);

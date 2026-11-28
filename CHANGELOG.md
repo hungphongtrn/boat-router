@@ -34,7 +34,10 @@ The router has run our own CI on Boat since the first release. This release port
 
 ### Lease API
 
-- An authenticated client can lease a whole box (`default` or `large`), optionally from a pinned base snapshot, run commands, stream output, read and write files, and return the box for reuse. File writes take a fence and wait up to 20 s for a running tick; the stream handshake has a timeout. On one seeded base, a type-check job waited 54 s and ran 47 s on a fresh box (2026-11-11).
+- An authenticated client can lease a whole box (`small`, `default` or `large`), optionally from a pinned base snapshot, run commands, stream output, read and write files, and return the box for reuse. File writes take a fence and wait up to 20 s for a running tick; the stream handshake has a timeout. On one seeded base, a type-check job waited 54 s and ran 47 s on a fresh box (2026-11-11).
+- **Rolling CI leases.** A client with `rollingSnapshot: true` (or `"rollingSnapshot": true` in its claim) boots the newest ready `peek-ci-*` generation the router publishes for its own CI — the same disk a CI box boots, with the same manifest check on boot — and never a plain box: with no ready generation the claim waits and reports `snapshot_unavailable`. The generation is stored on the lease before ledger admission, so a retry boots the same disk, and the claimed response names it as `snapshotName` and `manifestSha256`.
+- **Canonical pending reasons.** A pending claim answers `202` with one reason from a closed list — `pool_full`, `budget_exhausted`, `starting`, `pool_disabled`, `snapshot_unavailable` or `start_capacity` — and the specific internal string in `detail`, so a client can act on the class of wait without matching our internal vocabulary.
+- **An installed lease client.** `config/peek/clients.json` installs `peek-runs`, the client the Peek Run harness leases a box with: project `peek`, `ttlSeconds` 1800, rolling CI generation, no warm reuse. `EXTERNAL_LEASE_CLIENTS` adds or overrides a client and `EXTERNAL_LEASE_POLICY` overrides its limits; its token hash arrives only as the `EXTERNAL_LEASE_TOKEN_HASHES` secret.
 
 ### Operations
 
