@@ -231,7 +231,8 @@ export class BoxFleet {
     let claim = await this.budget.claim(createKey);
     if ((!claim || claim.status === 'pending') && !await reserveSizedProbe(this.storage, record.size, createKey, this.now())) return false;
     if (!claim) {
-      const result = await this.budget.admit(createKey, limits, { queuedAt: record.queuedAt, jobId: record.snapshotRecoveryJobId, pool: true, snapshotRecovery: Boolean(record.snapshotRecoveryJobId), cost: { kind: 'machine', size: record.size, ttlSeconds: ttl } });
+      const observedAt = Number.isFinite(limits?.observedAt) ? limits.observedAt : this.now();
+      const result = await this.budget.admit(createKey, limits, { queuedAt: record.queuedAt, jobId: record.snapshotRecoveryJobId, pool: true, snapshotRecovery: Boolean(record.snapshotRecoveryJobId), ownLive: await this.ownLiveBoxes(observedAt), cost: { kind: 'machine', size: record.size, ttlSeconds: ttl } });
       if (!result.ok) {
         this.logger?.(JSON.stringify({ event: 'admission_refused', project: this.project?.id, reason: result.reason ?? 'refused' }));
         const label = JSON.parse(record.pool)[1], statusKey = `pool:status:${label}`, status = await this.storage.get(statusKey);
@@ -366,6 +367,17 @@ export class BoxFleet {
 
   async pendingLeaseStarts() {
     return this.countLeaseStarts ? await this.countLeaseStarts() : 0;
+  }
+
+  // The sandboxes this router created and still holds: recorded, not deleted, not an adopted
+  // orphan, and already reflected in the provider snapshot the admission read. A box created
+  // after that snapshot is still one of the ledger's unobserved claims, so counting it here
+  // would take its slot twice. The account ledger's live budget bounds this router's own spend
+  // only, so a sandbox another API key created (in the provider's active count) is never one.
+  async ownLiveBoxes(observedAt = this.now()) {
+    if (this.countOwnLive) return this.countOwnLive(observedAt);
+    const boxes = await records(this.storage, 'box:');
+    return boxes.filter(box => holdsCapSlot(box) && (this.createAccount === undefined || (box.account ?? 'primary') === this.createAccount) && !(Number.isFinite(box.createdAt) && box.createdAt >= observedAt)).length;
   }
 
   async admissionEntries() {
