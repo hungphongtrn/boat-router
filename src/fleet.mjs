@@ -15,6 +15,7 @@ import { canonicalPendingReason } from './router/pending-reason.mjs';
 import { networkSummary } from './router/lease-network.mjs';
 import { parseKeepOnFailSeconds, holdActive } from './router/lease-hold.mjs';
 import { normalizeProcessId } from './router/lease-cancel.mjs';
+import { missingDevCredentials } from './router/tailnet.mjs';
 import { providerWallet } from './apis.mjs';
 import { BUILD_COMMIT, BUILD_DEPLOYMENT } from './build.mjs';
 import { installRouter } from './router/install.mjs';
@@ -548,11 +549,11 @@ export class FleetController extends FleetBase {
 }
 
 export class Fleet {
-  constructor(ctx, env, deployment = BUILD_DEPLOYMENT) {
+  constructor(ctx, env, deployment = BUILD_DEPLOYMENT, fetcher = fetch) {
     this.ctx = ctx;
     this.env = env;
     this.storage = env.PLUGIN_ROUTER === 'true' ? new ReadCache().wrap(ctx.storage) : ctx.storage;
-    const api = new APIs(env, fetch, Date.now, () => this.storage.get('github-app'));
+    const api = new APIs(env, fetcher, Date.now, () => this.storage.get('github-app'));
     this.controller = new FleetController(this.storage, env, api);
     this.setup = new SetupController(this.storage, env, api, Date.now, event => this.controller.emit(event, null));
     this.router = env.PLUGIN_ROUTER === 'true' ? installRouter(this.storage, () => this.env, { api, waitUntil: promise => ctx.waitUntil(promise), deployment }) : null;
@@ -1241,9 +1242,22 @@ export class Fleet {
     if (difference) return new Response(null, { status: 401, headers });
     if (request.method !== 'POST' || Number(request.headers.get('Content-Length')) > 6_000_000) return new Response(null, { status: 400, headers });
     let body; try { const text = await request.text(); if (text.length > 6_000_000) return new Response(null, { status: 413, headers }); body = JSON.parse(text); } catch { return new Response(null, { status: 400, headers }); }
+    const action = url.pathname.slice('/router/lease/'.length);
+    // A dev preflight creates nothing: it reports the names this deployment
+    // still needs and proves the OAuth exchange works before the first claim.
+    if (action === 'dev-preflight') {
+      const missing = missingDevCredentials(this.env, config);
+      if (missing.length) return Response.json({ ok: false, missing }, { headers });
+      try {
+        if (typeof this.external.api?.tailnetOAuth !== 'function') throw new Error('tailnet client unavailable');
+        await this.external.api.tailnetOAuth();
+      } catch (error) {
+        return Response.json({ ok: false, missing: ['tailscale_oauth'], detail: Number.isSafeInteger(error?.status) && error.status > 0 ? `tailscale HTTP ${error.status}` : 'oauth unavailable' }, { headers });
+      }
+      return Response.json({ ok: true }, { headers });
+    }
     const id = body?.id;
     if (!/^[a-f0-9-]{36}$/.test(id ?? '')) return new Response(null, { status: 400, headers });
-    const action = url.pathname.slice('/router/lease/'.length);
     if (action === 'file-write' && this.router.ticking) {
       if ((this.leaseWriteWaiters ?? 0) >= 3) return new Response(null, { status: 409, headers });
       this.leaseWriteWaiters = (this.leaseWriteWaiters ?? 0) + 1;
@@ -1271,6 +1285,14 @@ export class Fleet {
         if (prior?.state === 'closed') return new Response(null, { status: 410, headers });
         if (body.base != null && (body.base !== 'browser-v1' || config?.seededBase !== true || this.router.account.openStartQueue !== true || body.isolation !== 'external-v2')) return new Response(null, { status: 400, headers });
         if (body.rollingSnapshot != null && typeof body.rollingSnapshot !== 'boolean') return new Response(null, { status: 400, headers });
+        if (body.dev !== undefined && typeof body.dev !== 'boolean') return new Response(null, { status: 400, headers });
+        // Only a client whose installed policy carries tailnet access may ask
+        // for a dev lease, and only one dev lease may be open at a time.
+        if (body.dev === true && config?.tailnet !== true) return Response.json({ reason: 'tailnet_not_allowed' }, { status: 400, headers });
+        if (body.dev === true) {
+          const block = await this.external.devBlock(client, id);
+          if (block) return Response.json({ reason: 'dev_lease_active', detail: block.detail }, { status: 202, headers });
+        }
         if (prior?.size && (prior.base === 'browser-v1') !== (body.base === 'browser-v1')) return new Response(null, { status: 409, headers });
         const configured = config?.seededBase === true && body.isolation === 'external-v2' && ['LEASE_BASE_SNAPSHOT_NAME','LEASE_BASE_SNAPSHOT_ID','LEASE_BASE_MANIFEST_SHA256','LEASE_BASE_PROFILE_SHA256'].some(key => this.env[key] != null);
         // A rolling lease selects the newest ready generation, or the operator's
@@ -1281,9 +1303,9 @@ export class Fleet {
         let selection = prior?.size ? (prior.baseId || prior.routerSnapshot ? { base: prior.base, baseId: prior.baseId, routerSnapshot: prior.routerSnapshot, ...(prior.rollingSnapshot ? { rollingSnapshot: true } : {}) } : null) : body.base ? await browserBase(this.env) : rolling ? await discoverRolling() : configured ? await leaseBase(this.env) : null;
         if (rolling && !selection) selection = await discoverRolling();
         if (!prior?.size && (body.base || (configured && !rolling)) && !selection) return new Response(null, { status: 503, headers });
-        const lease = await this.external.claim(client, id, body.size ?? 'default', body.isolation ?? null, body.repoKey ?? null, false, selection, rolling);
+        const lease = await this.external.claim(client, id, body.size ?? 'default', body.isolation ?? null, body.repoKey ?? null, false, selection, rolling, body.dev === true);
         await project.storage.setAlarm(Date.now() + 10000);
-        if (lease) return Response.json({ id, machineId: lease.machineId, expiresAt: lease.expiresAt, snapshotName: lease.routerSnapshot?.name ?? null, manifestSha256: lease.routerSnapshot?.manifestSha256 ?? null, ...(lease.isolation === 'external-v2' ? { isolation: lease.isolation } : {}), ...(lease.base === 'browser-v1' ? { base: lease.base } : {}), ...(config.network ? { network: networkSummary(config.network) } : {}) }, { headers });
+        if (lease) return Response.json({ id, machineId: lease.machineId, expiresAt: lease.expiresAt, snapshotName: lease.routerSnapshot?.name ?? null, manifestSha256: lease.routerSnapshot?.manifestSha256 ?? null, ...(lease.isolation === 'external-v2' ? { isolation: lease.isolation } : {}), ...(lease.base === 'browser-v1' ? { base: lease.base } : {}), ...(lease.dev === true && lease.tailnet?.hostname ? { tailnet: { hostname: lease.tailnet.hostname } } : {}), ...(config.network ? { network: networkSummary(config.network) } : {}) }, { headers });
         const detail = await this.external.pendingReason(client, id, body.size ?? 'default');
         return Response.json({ reason: canonicalPendingReason(detail), detail }, { status: 202, headers });
       }

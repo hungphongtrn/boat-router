@@ -10,6 +10,7 @@ import { validLeaseSize } from './sizes.mjs';
 import { normalizeNetwork } from './lease-network.mjs';
 import { heldUntil, holdActive } from './lease-hold.mjs';
 import { snapshotFresh } from './snapshot-freshness.mjs';
+import { cleanupPlan, devCleanupKey, devHostname, devRetryDelayMs } from './tailnet.mjs';
 
 async function records(storage, prefix) {
   const out = []; let startAfter = '';
@@ -24,8 +25,8 @@ async function records(storage, prefix) {
 // Public handlers must serialize calls with Router.tick and authenticate the
 // client before invoking this service. All leases fail closed by default.
 export class ExternalService {
-  constructor(router, storage, api, clients, now = Date.now) {
-    Object.assign(this, { router, storage, api, clients, now });
+  constructor(router, storage, api, clients, now = Date.now, logger = console.log) {
+    Object.assign(this, { router, storage, api, clients, now, logger });
     this.leases = new ExternalLeases(storage, now);
     this.fence = new WarmLeaseFence(storage, api, now);
     // The account health mode covers lease boxes of both accounts.
@@ -36,7 +37,7 @@ export class ExternalService {
   }
   config(client) {
     const cfg = this.clients?.[client];
-    if (!cfg || cfg.enabled !== true || (cfg.maxActive !== null && (!Number.isSafeInteger(cfg.maxActive) || cfg.maxActive < 1)) || (cfg.startsPerDay !== null && (!Number.isSafeInteger(cfg.startsPerDay) || cfg.startsPerDay < 0)) || !Number.isSafeInteger(cfg.ttlSeconds) || cfg.ttlSeconds < 60 || cfg.ttlSeconds > 3600 || (cfg.rollingSnapshot !== undefined && typeof cfg.rollingSnapshot !== 'boolean') || (cfg.warmReuse !== undefined && typeof cfg.warmReuse !== 'boolean') || !this.router.projects.has(cfg.project)) return null;
+    if (!cfg || cfg.enabled !== true || (cfg.maxActive !== null && (!Number.isSafeInteger(cfg.maxActive) || cfg.maxActive < 1)) || (cfg.startsPerDay !== null && (!Number.isSafeInteger(cfg.startsPerDay) || cfg.startsPerDay < 0)) || !Number.isSafeInteger(cfg.ttlSeconds) || cfg.ttlSeconds < 60 || cfg.ttlSeconds > 3600 || (cfg.rollingSnapshot !== undefined && typeof cfg.rollingSnapshot !== 'boolean') || (cfg.warmReuse !== undefined && typeof cfg.warmReuse !== 'boolean') || (cfg.tailnet !== undefined && typeof cfg.tailnet !== 'boolean') || (cfg.devMaxActive !== undefined && (!Number.isSafeInteger(cfg.devMaxActive) || cfg.devMaxActive < 1)) || !this.router.projects.has(cfg.project)) return null;
     // A malformed network policy disables the client rather than leaking a box
     // with the provider's open default, so it is validated on every read.
     let network;
@@ -99,9 +100,19 @@ export class ExternalService {
     if (lease.lastReason && /^[a-z_]+$/.test(lease.lastReason)) return lease.lastReason;
     return /^[a-z_]+$/.test(lease.state ?? '') ? `lease_${lease.state}` : 'lease_pending';
   }
-  async claim(client, id, size, isolation = null, repoKey = null, fromTick = false, selection = null, rolling = false) {
+  // One non-closed dev lease, whatever the ordinary client cap says: install.mjs
+  // nulls maxActive whenever the open start queue owns admission.
+  async devBlock(client, id) {
+    const cfg = this.config(client);
+    const limit = Number.isSafeInteger(cfg?.devMaxActive) && cfg.devMaxActive >= 1 ? cfg.devMaxActive : 1;
+    const active = (await records(this.storage, 'external-lease:')).filter(item => item.dev === true && item.state !== 'closed' && !(item.client === client && item.id === id) && !(item.state === 'reserved' && !item.machineId && !item.claimKey && item.expiresAt <= this.now()));
+    return active.length >= limit ? { reason: 'dev_lease_active', detail: { leaseId: active[0].id, hostname: active[0].tailnet?.hostname ?? null, expiresAt: active[0].expiresAt } } : null;
+  }
+  async claim(client, id, size, isolation = null, repoKey = null, fromTick = false, selection = null, rolling = false, dev = false) {
     const cfg = this.config(client);
     if (!cfg || !validLeaseSize(size) || (repoKey !== null && !/^[a-f0-9]{64}$/.test(repoKey))) return null;
+    if (dev && cfg.tailnet !== true) return null;
+    if (dev && await this.devBlock(client, id)) return null;
     const project = this.router.projects.get(cfg.project);
     if (await project.storage.get('pool:mode') !== 'on') return null;
     const prior = await this.storage.get(`external-lease:${client}:${id}`);
@@ -120,7 +131,14 @@ export class ExternalService {
     if (selection && (!prior || ['waiting', 'reserved'].includes(prior.state)) && (!reuseEnabled || isolation !== 'external-v2') && selection.routerSnapshot?.kind !== 'peek-ci') return null;
     let lease = await this.leases.reserve(client, id, cfg.maxActive, cfg.ttlSeconds * 1000);
     if (!lease) return null;
-    if (!lease.size && lease.state === 'reserved') lease = await this.leases.transition(client, id, ['reserved'], 'reserved', { size, project: cfg.project, repoKey, isolation: reuseEnabled && isolation === 'external-v2' ? isolation : null, ...(rolling ? { rollingSnapshot: true } : {}), ...(cfg.network ? { network: cfg.network } : {}), ...(selection ?? {}) });
+    // A retried dev claim keeps the hostname its first claim fixed, so cleanup
+    // always matches the device the box actually joined with.
+    if (dev && lease.dev !== true) {
+      if (!['reserved', 'waiting'].includes(lease.state)) return null;
+      lease = await this.leases.transition(client, id, [lease.state], lease.state, { dev: true, tailnet: { hostname: devHostname(id) } });
+      if (!lease) return null;
+    }
+    if (!lease.size && lease.state === 'reserved') lease = await this.leases.transition(client, id, ['reserved'], 'reserved', { size, project: cfg.project, repoKey, isolation: reuseEnabled && isolation === 'external-v2' ? isolation : null, ...(rolling ? { rollingSnapshot: true } : {}), ...(cfg.network ? { network: cfg.network } : {}), ...(selection ?? {}), ...(dev && lease.dev !== true ? { dev: true, tailnet: { hostname: devHostname(id) } } : {}) });
     if (!lease || lease.size !== size) return null;
     // A rolling client never boots plain: without a stored generation it waits
     // for the next publication instead of spending a start on an empty box.
@@ -213,7 +231,15 @@ export class ExternalService {
     const selection = lease.baseId || lease.routerSnapshot ? { base: lease.base, baseId: lease.baseId, routerSnapshot: lease.routerSnapshot, ...(lease.rollingSnapshot ? { rollingSnapshot: true } : {}) } : null;
     return this.claim(lease.client, lease.id, lease.size, lease.isolation ?? null, lease.repoKey ?? null, true, selection, lease.rollingSnapshot === true);
   }
+  // A dev lease ends its Tailnet identity with the box: the release itself
+  // attempts the device delete and key revoke, and the sweep retries a failure.
   async release(client, id, keepOnFailSeconds = 0, operationApi = null) {
+    const result = await this.releaseLease(client, id, keepOnFailSeconds, operationApi);
+    const lease = await this.storage.get(`external-lease:${client}:${id}`);
+    if (lease?.dev === true && (lease.state === 'closed' || lease.state === 'cleaning')) await this.devCleanup(lease);
+    return result;
+  }
+  async releaseLease(client, id, keepOnFailSeconds = 0, operationApi = null) {
     const lease = await this.storage.get(`external-lease:${client}:${id}`);
     if (!lease || lease.state === 'closed') return true;
     // An upload may still be running at the provider after the client leaves.
@@ -279,6 +305,73 @@ export class ExternalService {
       await tx.put(leaseKey, { ...current, cancelledProcessIds: cancelled });
     });
     return { status: 200, cancelled: true };
+  }
+  // The Tailnet identity of a finished dev lease: every device the join left
+  // behind and the one-shot key. A failure is durable, so a router restart
+  // resumes it instead of leaving a device or key behind.
+  async runDevCleanup(target) {
+    const failures = [];
+    let devices = [];
+    try { devices = await this.api.tailnetDevices(); }
+    catch (error) { failures.push(error); }
+    if (!failures.length) {
+      const plan = cleanupPlan(target.hostname, target.keyId, devices);
+      for (const deviceId of plan.deviceIds) {
+        try { await this.api.tailnetDeleteDevice(deviceId); }
+        catch (error) { if (error?.status !== 404) failures.push(error); }
+      }
+      if (target.keyId) {
+        try { await this.api.tailnetRevokeKey(target.keyId); }
+        catch (error) { if (error?.status !== 404) failures.push(error); }
+      }
+    }
+    if (failures.length) { await this.recordDevCleanup(target); return false; }
+    await this.storage.delete(devCleanupKey(target.client, target.id));
+    await this.storage.transaction(async tx => {
+      const key = `external-lease:${target.client}:${target.id}`, current = await tx.get(key);
+      if (current) await tx.put(key, { ...current, ...(current.devKey?.id ? { devKey: { id: current.devKey.id, revoked: true } } : {}), tailnetCleaned: true });
+    });
+    return true;
+  }
+  async recordDevCleanup(target) {
+    const key = devCleanupKey(target.client, target.id);
+    const existing = await this.storage.get(key);
+    const attempts = (Number.isSafeInteger(existing?.attempts) ? existing.attempts : 0) + 1;
+    const nextAt = this.now() + devRetryDelayMs(attempts);
+    await this.storage.put(key, { client: target.client, id: target.id, hostname: target.hostname ?? null, keyId: target.keyId ?? null, attempts, nextAt });
+    this.logger(JSON.stringify({ event: 'dev_tailnet_cleanup_failed', client: target.client, lease_id: target.id, hostname: target.hostname ?? null, attempts, retry_in_ms: nextAt - this.now() }));
+  }
+  async devCleanup(lease) {
+    if (lease.dev !== true) return true;
+    // Once cleanup starts the plaintext is never needed again: only the key id
+    // and the hostname must survive a failed attempt.
+    lease = await this.storage.transaction(async tx => {
+      const key = `external-lease:${lease.client}:${lease.id}`, current = await tx.get(key);
+      if (!current?.devKey?.key) return current ?? lease;
+      const next = { ...current, devKey: { id: current.devKey.id, expiresAt: current.devKey.expiresAt } };
+      await tx.put(key, next);
+      return next;
+    });
+    const hostname = lease.tailnet?.hostname ?? null, keyId = lease.devKey?.id ?? null;
+    if (!hostname && !keyId) {
+      await this.storage.transaction(async tx => {
+        const key = `external-lease:${lease.client}:${lease.id}`, current = await tx.get(key);
+        if (current) await tx.put(key, { ...current, tailnetCleaned: true });
+      });
+      return true;
+    }
+    return this.runDevCleanup({ client: lease.client, id: lease.id, hostname, keyId });
+  }
+  async sweepDev() {
+    for (const record of await records(this.storage, 'dev-cleanup:')) {
+      if (!Number.isFinite(record.nextAt) || record.nextAt > this.now()) continue;
+      await this.runDevCleanup({ client: record.client, id: record.id, hostname: record.hostname ?? null, keyId: record.keyId ?? null });
+    }
+    for (const lease of await records(this.storage, 'external-lease:')) {
+      if (lease.dev !== true || (lease.state !== 'closed' && lease.state !== 'cleaning') || lease.tailnetCleaned === true) continue;
+      if (await this.storage.get(devCleanupKey(lease.client, lease.id))) continue;
+      await this.devCleanup(lease);
+    }
   }
   async sweep() {
     for (const lease of await records(this.storage, 'external-lease:')) {
@@ -386,6 +479,7 @@ export class ExternalService {
         }
       }
     }
+    await this.sweepDev();
   }
 
 }
