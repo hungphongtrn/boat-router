@@ -14,7 +14,7 @@ import { MACHINE_SIZES } from './sizes.mjs';
 import { SetupWatchdog } from './setup-watchdog.mjs';
 import { LOCAL_MODE_KEY, labelLocal, localJobAllowed } from './local-fleet.mjs';
 import { LANES_SWITCH_KEY, laneRules, laneComparator, laneRank, laneUsage, laneRoom, reservedByLane, lanePriorityOf, createYieldsTo, laneLending, borrowedSlots } from './lanes.mjs';
-import { transition as applyBoxEvent, applyTransition, boxDeadline, reservationActive, reservationExpired, MISSING_RESULT_GRACE_MS, RUNNER_GONE_GRACE_MS } from './box-state.mjs';
+import { transition as applyBoxEvent, applyTransition, boxDeadline, holdsCapSlot, reservationActive, reservationExpired, MISSING_RESULT_GRACE_MS, RUNNER_GONE_GRACE_MS } from './box-state.mjs';
 export { boxDeadline } from './box-state.mjs';
 
 // local-first for a pool label whose runtime local switch is on. The local
@@ -101,6 +101,10 @@ const limited = error => error?.service === 'boat' && (error.status === 429 || [
 // What a provider failure says, for the log and the stored last-error: a create that fails here is
 // otherwise only visible as "a create did not happen", which names no cause.
 const failureDetail = error => ({ status: error?.status ?? null, code: String(error?.code?.code ?? error?.code?.type ?? error?.code ?? '') || null, retry_s: Number.isFinite(error?.retrySeconds) ? error.retrySeconds : null });
+// The provider refuses to delete a sandbox this API key did not create ("This API key can delete
+// only the sandboxes it created"), and says the same for an id that is already gone. Retrying it
+// every tick never deletes the box, so the record ends locally instead of holding a create slot.
+const notOwned = error => error?.service === 'boat' && error.status === 403 && String(error?.code?.code ?? error?.code?.type ?? error?.code ?? '') === 'api_key_action_forbidden';
 
 export function placementEvidence(capacity, now, enabled = true) {
   if (!enabled) return { reason: 'project_disabled', categories: [], capacity: null };
@@ -371,7 +375,7 @@ export class BoxFleet {
     const cap = this.project?.caps?.concurrent;
     if (!Number.isSafeInteger(cap) || cap < 0) return ranked;
     const boxes = await records(this.storage, 'box:');
-    const room = Math.max(0, cap - boxes.filter(box => box.state !== 'deleted').length - entries.filter(item => item.state !== 'pending').length - await this.pendingLeaseStarts());
+    const room = Math.max(0, cap - boxes.filter(holdsCapSlot).length - entries.filter(item => item.state !== 'pending').length - await this.pendingLeaseStarts());
     return [...ranked.filter(item => !item.pending), ...ranked.filter(item => item.pending).sort((a, b) => a.lane - b.lane || a.at - b.at || a.rank.localeCompare(b.rank)).slice(0, room)];
   }
 
@@ -461,7 +465,7 @@ export class BoxFleet {
     const cap = project.caps?.concurrent;
     if (!Number.isSafeInteger(cap) || cap < 0) return false;
     const [boxes, creates] = await Promise.all([records(this.storage, 'box:'), records(this.storage, 'create:')]);
-    return boxes.filter(box => box.state !== 'deleted').length + creates.filter(item => item.state !== 'pending').length + await this.pendingLeaseStarts() >= cap;
+    return boxes.filter(holdsCapSlot).length + creates.filter(item => item.state !== 'pending').length + await this.pendingLeaseStarts() >= cap;
   }
 
   async prepareSnapshotRecovery({ pools, demand, boxes, creates, locals, project, account, env, override, now, dockerSwitches = {} }) {
@@ -758,7 +762,7 @@ export class BoxFleet {
       }
     }
     const cap = project.caps?.concurrent ?? Infinity;
-    let room = Math.max(0, cap - boxes.filter(box => box.state !== 'deleted').length - creates.length - await this.pendingLeaseStarts());
+    let room = Math.max(0, cap - boxes.filter(holdsCapSlot).length - creates.length - await this.pendingLeaseStarts());
     const candidates = [];
     for (const pool of pools) {
       const result = output[pool.key];
@@ -1631,13 +1635,29 @@ export class BoxFleet {
     return Boolean(await this.transition(box.machineId, box.afterFence === 'finished' ? 'fenced_finished' : 'fenced_destroy', { runnerFenced: true, afterFence: null, ...(box.retargetPool ? { pool: box.retargetPool, retargetPool: null, localHoldRelease: true } : {}), ...(box.afterFence === 'finished' && !box.retargetPool ? { jobs: (box.jobs ?? 0) + 1 } : {}) }));
   }
 
+  // A sandbox another API key created can never be deleted from here: the provider answers 403
+  // api_key_action_forbidden, and does so even for an id that is already gone. End the record
+  // locally instead of retrying it every tick, settle the reservation on elapsed time exactly as
+  // the confirmed-404 path does, and say what happened: this router did not delete the box.
+  async finishNotOwned(box, error) {
+    const purging = await this.transition(box.machineId, 'destroy_requested', { operationId: null });
+    if (!purging) return false;
+    const purged = await this.transition(box.machineId, 'purged', { deletedBy: 'not_owned', failureReason: 'not_owned' });
+    await this.settleDeleted(purged ?? purging);
+    this.logger?.(JSON.stringify({ event: 'box_not_owned', project: this.project?.id, machineId: box.machineId, status: error?.status ?? 403, code: String(error?.code?.code ?? error?.code?.type ?? error?.code ?? 'api_key_action_forbidden') }));
+    return Boolean(purged);
+  }
+
   async destroy(machineId, { ttlExpired = false } = {}) {
     const box = await this.storage.get(`box:${machineId}`);
     const forced = ttlExpired || box?.forceDestroy === true;
     if (!box || box.state !== 'destroying' || box.machineId !== machineId || box.runnerId && !box.runnerFenced && !forced) return false;
     let operation;
     try { operation = await this.api.destroy(box); }
-    catch (error) { if (error.status !== 404) throw error; }
+    catch (error) {
+      if (notOwned(error)) return this.finishNotOwned(box, error);
+      if (error.status !== 404) throw error;
+    }
     if (operation && typeof operation.operation?.id !== 'string') return false;
     await this.transition(machineId, box.runnerId && !box.runnerFenced ? 'destroy_unregister' : 'destroy_requested', { operationId: operation?.operation?.id ?? null });
     return true;
