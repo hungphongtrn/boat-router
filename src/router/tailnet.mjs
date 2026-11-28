@@ -68,10 +68,15 @@ export function devCreateEnv(authKey, hostname) {
   return { TAILSCALE_AUTHKEY: authKey, PEEK_DEV_HOSTNAME: hostname };
 }
 
-// Every device the join left behind, matched on the lease's own hostname.
+// Every device the join left behind, matched on the lease's own hostname and
+// the Tailscale-suffixed variants it appends when a name collides. Only a
+// device carrying the dev tag belongs to this lease.
 export function cleanupPlan(hostname, keyId, devices) {
+  if (typeof hostname !== 'string' || !hostname) return { deviceIds: [], keyId: typeof keyId === 'string' && keyId ? keyId : null };
+  const escaped = hostname.replace(/[.*+?^$()|[\]\\{}]/g, '\\$&');
+  const pattern = new RegExp('^' + escaped + '(-\\d+)?$');
   const deviceIds = (Array.isArray(devices) ? devices : [])
-    .filter(device => device && device.hostname === hostname && typeof device.id === 'string' && device.id)
+    .filter(device => device && typeof device.id === 'string' && device.id && typeof device.hostname === 'string' && pattern.test(device.hostname) && Array.isArray(device.tags) && device.tags.includes(DEV_TAG))
     .map(device => device.id);
   return { deviceIds: [...new Set(deviceIds)], keyId: typeof keyId === 'string' && keyId ? keyId : null };
 }
