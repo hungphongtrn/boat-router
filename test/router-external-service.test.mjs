@@ -4,6 +4,7 @@ import { Storage } from './helpers.mjs';
 import { TenantStorage } from '../src/router/tenant-storage.mjs';
 import { AccountLedger } from '../src/router/ledger.mjs';
 import { ExternalService } from '../src/router/external-service.mjs';
+import { canonicalPendingReason } from '../src/router/pending-reason.mjs';
 
 const id = '00000000-0000-4000-8000-000000000001';
 
@@ -124,6 +125,34 @@ test('lease refusal reports the client cap and CI gate', async () => {
   assert.equal(await service.pendingReason('compute', id), 'ci_demand_or_snapshot');
   await service.storage.put(`external-lease:compute:${id}`, {client:'compute', id, state:'active', expiresAt:70_000});
   assert.equal(await service.pendingReason('compute', '00000000-0000-4000-8000-000000000002'), 'lease_cap');
+});
+
+test('a project live-cap refusal answers a pool_full capacity wait', async () => {
+  const { storage, projectStorage, service } = setup();
+  const project = service.router.projects.get('project-a');
+  project.config.caps = { concurrent: 1 };
+  await projectStorage.put('pool:mode', 'on');
+  await projectStorage.put('pool:snapshot', { complete: true, at: 10_000, runners: [] });
+  // A busy box fills the live cap and is not a warm candidate the claim fences.
+  await projectStorage.put('box:bx_23456789', { machineId: 'bx_23456789', pool: '["a/b","boat-default"]', state: 'busy', size: 'default', runnerId: 9, generation: 0, reusable: true, baselineHash: 'hash', everOnline: true, createdAt: 1 });
+  service.api.limits = async () => ({ canStart: true, machineTypes: [{ type: 'default', available: true }], starts: Object.fromEntries(['minute', 'hour', 'day'].map(name => [name, { limit: 10, used: 0 }])) });
+  let starts = 0;
+  service.starts.start = async () => { starts++; return false; };
+  assert.equal(await service.claim('compute', id, 'default'), null);
+  const lease = await storage.get(`external-lease:compute:${id}`);
+  assert.equal(lease.state, 'reserved', 'a capacity wait keeps its reservation');
+  assert.equal(lease.lastReason, 'concurrency');
+  assert.equal(starts, 0, 'no start is attempted while the cap is full');
+  const detail = await service.pendingReason('compute', id, 'default');
+  assert.equal(detail, 'concurrency');
+  assert.equal(canonicalPendingReason(detail), 'pool_full');
+  // Room on the cap reaches the ordinary start path and drops the stored wait.
+  project.config.caps = { concurrent: 2 };
+  assert.equal(await service.claim('compute', id, 'default'), null);
+  assert.equal(starts, 1);
+  const admitted = await storage.get(`external-lease:compute:${id}`);
+  assert.equal(admitted.lastReason ?? null, null);
+  assert.equal(canonicalPendingReason(await service.pendingReason('compute', id, 'default')), 'starting');
 });
 
 test('boot breaker blocks pending external creates but resolves uncertain creates', async () => {

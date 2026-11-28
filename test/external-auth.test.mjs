@@ -269,7 +269,7 @@ test('a pending claim returns a canonical reason and the specific detail', async
   const clients = { lease: { enabled: true, project: 'project-a', maxActive: 6, startsPerDay: 60, ttlSeconds: 900, tokenHash: await hash(token) } };
   const fleet = leaseFleet(storage, clients);
   fleet.external.claim = async () => null;
-  for (const [detail, reason] of [['lease_cap', 'pool_full'], ['spend_budget', 'budget_exhausted'], ['ci_snapshot_unavailable', 'snapshot_unavailable'], ['start_capacity', 'start_capacity'], ['lease_pool_preparing', 'starting']]) {
+  for (const [detail, reason] of [['lease_cap', 'pool_full'], ['concurrency', 'pool_full'], ['spend_budget', 'budget_exhausted'], ['ci_snapshot_unavailable', 'snapshot_unavailable'], ['start_capacity', 'start_capacity'], ['lease_pool_preparing', 'starting']]) {
     fleet.external.pendingReason = async () => detail;
     const response = await fleet.fetch(claimRequest('lease', token, id, {}));
     assert.equal(response.status, 202, detail);
