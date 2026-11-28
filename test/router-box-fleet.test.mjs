@@ -774,3 +774,33 @@ test('reuse refusal: enforce enforces the reset check; a window without spare st
   const fresh = await run({ slowHost: true, generation: 0, freshHealth: { measured: false } }, 'enforce');
   assert.equal(fresh.registrations, 1, 'a fresh box (generation 0) is not a reuse');
 });
+
+test('a provider 403 for a sandbox another API key owns finishes the destroy locally', async () => {
+  const storage = new Storage(), logs = [], id = 'bx_23456789';
+  await storage.put(`box:${id}`, { machineId: id, state: 'destroying', since: 0 });
+  let destroys = 0;
+  const fleet = new BoxFleet(storage, { destroy: async () => { destroys++; throw Object.assign(new Error('boat HTTP 403'), { service: 'boat', status: 403, code: 'api_key_action_forbidden' }); } }, () => 1000, { project: { id: 'demo' }, logger: line => logs.push(JSON.parse(line)) });
+  assert.equal(await fleet.destroy(id), true);
+  const box = await storage.get(`box:${id}`);
+  assert.equal(box.state, 'deleted');
+  assert.equal(box.deletedBy, 'not_owned');
+  assert.equal(destroys, 1);
+  assert.deepEqual(logs.filter(line => line.event === 'box_not_owned').map(line => line.machineId), [id]);
+});
+
+test('an adopted orphan does not consume the project cap and a queued light job gets a small box', async () => {
+  const storage = new Storage(), project = { id: 'peek', repo: 'owner/repo', labels: ['peek-router', 'peek-router-light'], sizes: { 'peek-router': { machine: 'large' }, 'peek-router-light': { machine: 'small' } }, caps: { concurrent: 2 } };
+  const light = JSON.stringify([project.repo, 'peek-router-light']), large = JSON.stringify([project.repo, 'peek-router']);
+  await storage.put('box:bx_orphan1', { machineId: 'bx_orphan1', pool: large, state: 'destroying', since: 0, drainOnly: true, orphan: true });
+  await storage.put('box:bx_orphan2', { machineId: 'bx_orphan2', pool: large, state: 'quarantined', since: 0, drainOnly: true, orphan: true });
+  await storage.put('pool:migrated', { done: true });
+  await storage.put('pool:snapshot', { at: 1000, complete: true, runners: [] });
+  await storage.put('gh-job:1', { id: 1, pool: light, status: 'queued', queuedAt: 0 });
+  const budget = { claimKey: async key => key, enqueue: async () => {} };
+  const fleet = new BoxFleet(storage, {}, () => 1000, { project, budget });
+  await fleet.tick({ mode: 'on', env: { ENABLED: 'true' }, project, prepareOnly: true });
+  const creates = [...(await storage.list({ prefix: 'create:' })).values()];
+  assert.equal(creates.length, 1);
+  assert.equal(creates[0].pool, light);
+  assert.equal(creates[0].size, 'small');
+});
