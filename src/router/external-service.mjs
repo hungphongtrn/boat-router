@@ -211,7 +211,15 @@ export class ExternalService {
         if (lease.state === 'reserved' && Number.isSafeInteger(cap)) {
           const boxes = await records(project.storage, 'box:'), creates = await records(project.storage, 'create:');
           const starts = await records(this.storage, 'external-lease:');
-          if (boxes.filter(box => box.state !== 'deleted').length + creates.filter(item => item.state !== 'pending').length + starts.filter(item => item.project === cfg.project && item.state === 'starting').length >= cap) return null;
+          const full = boxes.filter(box => box.state !== 'deleted').length + creates.filter(item => item.state !== 'pending').length + starts.filter(item => item.project === cfg.project && item.state === 'starting').length >= cap;
+          // A project at its live cap is a capacity wait, not a start on its way:
+          // name it so the client reads pool_full instead of a bare reservation.
+          if (full) {
+            await this.leases.transition(client, id, ['reserved'], 'reserved', { lastReason: 'concurrency' });
+            return null;
+          }
+          // The cap has room, so the wait it stored no longer applies.
+          if (lease.lastReason === 'concurrency') await this.leases.transition(client, id, ['reserved'], 'reserved', { lastReason: null });
         }
         const label = project.config.labels.find(value => { try { return poolSize(project.config, value) === size && !((project.config.externalClaimer ?? project.config.localFirst)?.localOnly ?? []).includes(value); } catch { return false; } });
         if (!label) return null;
