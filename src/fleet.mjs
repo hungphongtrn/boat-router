@@ -1367,6 +1367,35 @@ export class Fleet {
         return new Response(null, { status: recorded ? 204 : 409, headers });
       }
       if (action === 'execute' && typeof body.command === 'string' && body.command.length <= 65536) {
+        // A dev lease's key is minted at create with a 300 s TTL. If the box
+        // takes longer to reach the join, replace the expired key and hand the
+        // new one to the box as a file, never in the command or the stream.
+        if (lease.dev === true && body.command.includes('dev-box.sh setup') && (!Number.isFinite(lease.devKey?.expiresAt) || lease.devKey.expiresAt <= Date.now())) {
+          const previousKeyId = lease.devKey?.id ?? null;
+          let minted;
+          try {
+            minted = await this.external.api.tailnetKey(id);
+          } catch {
+            return Response.json({ reason: 'dev_key_mint_failed' }, { status: 502, headers });
+          }
+          if (previousKeyId) {
+            try { await this.external.api.tailnetRevokeKey(previousKeyId); } catch {}
+          }
+          try {
+            await operationApi.request('boat', `${base}/files`, { method: 'PUT', body: { path: '/tmp/peek-dev-tailscale.key', content: minted.key, encoding: 'utf8' }, timeoutMs: 30_000 });
+          } catch {
+            try { await this.external.api.tailnetRevokeKey(minted.id); } catch {}
+            return Response.json({ reason: 'dev_key_write_failed' }, { status: 502, headers });
+          }
+          const stored = await this.storage.transaction(async tx => {
+            const key = `external-lease:${client}:${id}`;
+            const current = await tx.get(key);
+            if (!current || !['active', 'held'].includes(current.state) || current.machineId !== lease.machineId) return false;
+            await tx.put(key, { ...current, devKey: { id: minted.id, expiresAt: minted.expiresAt } });
+            return true;
+          });
+          if (!stored) return Response.json({ reason: 'dev_key_lease_changed' }, { status: 409, headers });
+        }
         const result = await operationApi.request('boat', `${base}/commands`, { method: 'POST', body: { command: body.command, detached: true } });
         return Response.json(result, { headers });
       }

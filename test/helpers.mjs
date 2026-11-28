@@ -1,6 +1,7 @@
 import { generateKeyPairSync } from 'node:crypto';
 import { APIs } from '../src/apis.mjs';
 import { FleetController } from '../src/fleet.mjs';
+import { DEV_TAG } from '../src/router/tailnet.mjs';
 
 export class Storage {
   constructor() { this.data = new Map(); this.alarm = null; this.queue = Promise.resolve(); }
@@ -34,6 +35,7 @@ export function fixture() {
     loseCreateResponse: false, purgeComplete: true, jobOutage: false,
     rollingSnapshots: [], rollingSnapshotId: 'rolling-snapshot-id',
     tailnet: { tokens: 0, keys: [], devices: [], deletes: [], revokes: [], failures: {} },
+    fileFailures: 0,
   };
   const respond = (value, status = 200) => new Response(status === 204 ? null : JSON.stringify(value), { status });
   const fetcher = async (url, options) => {
@@ -64,7 +66,7 @@ export function fixture() {
         fake.tailnet.keys.push({ id, key, body, path });
         const lease = /^peek-dev ([a-f0-9-]{36})$/.exec(body?.description ?? '');
         // A real key holder joins the tailnet; the fake device is the join.
-        if (lease) fake.tailnet.devices.push({ id: `device-${fake.tailnet.devices.length + 1}`, hostname: `peek-dev-${lease[1].slice(0, 8)}` });
+        if (lease) fake.tailnet.devices.push({ id: `device-${fake.tailnet.devices.length + 1}`, hostname: `peek-dev-${lease[1].slice(0, 8)}`, tags: [DEV_TAG] });
         return respond({ id, key }, 200);
       }
       const revoke = /^\/api\/v2\/tailnet\/[^/]+\/keys\/([^/]+)$/.exec(path);
@@ -137,7 +139,10 @@ export function fixture() {
         }
         return fake.machines.has(id) ? respond({ sandbox: fake.machines.get(id) }) : respond({}, 404);
       }
-      if (path.endsWith('/files')) { fake.files.push(body); return respond({ success: true }); }
+      if (path.endsWith('/files')) {
+        if (fake.fileFailures > 0) { fake.fileFailures--; return respond({ error: 'file write refused' }, 500); }
+        fake.files.push(body); return respond({ success: true });
+      }
       if (path.endsWith('/commands')) { fake.commands.push(body); return respond({ success: true, processId: 123 }); }
     }
     throw new Error('Unhandled fake API route');

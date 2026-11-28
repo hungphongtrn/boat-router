@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { Fleet } from '../src/fleet.mjs';
 import { hash } from '../src/setup.mjs';
 import { fixture } from './helpers.mjs';
+import { DEV_TAG } from '../src/router/tailnet.mjs';
 
 const TOKEN = 'a'.repeat(40);
 const ID = '00000000-0000-4000-8000-000000000001';
@@ -44,12 +45,12 @@ function seedRolling(fake) {
   return { digest, name };
 }
 
-function activeDevLease(storage, fake, { keyId = 'key-1', key = 'tskey-auth-fake-seeded', deviceId = 'device-1', expiresAt = Date.now() + 600_000 } = {}) {
+function activeDevLease(storage, fake, { keyId = 'key-1', key = 'tskey-auth-fake-seeded', deviceId = 'device-1', expiresAt = Date.now() + 600_000, devKeyExpiresAt } = {}) {
   const hostname = devHostname(ID), machineId = 'bx_23456789';
   fake.tailnet.keys = [{ id: keyId, key, body: {}, path: '' }];
-  fake.tailnet.devices = [{ id: deviceId, hostname }];
+  fake.tailnet.devices = [{ id: deviceId, hostname, tags: [DEV_TAG] }];
   return Promise.all([
-    storage.put(`external-lease:peek-dev:${ID}`, { id: ID, client: 'peek-dev', project: 'project-a', state: 'active', machineId, size: 'default', pool: '["a/b","boat-default"]', expiresAt, dev: true, tailnet: { hostname }, devKey: { id: keyId, key } }),
+    storage.put(`external-lease:peek-dev:${ID}`, { id: ID, client: 'peek-dev', project: 'project-a', state: 'active', machineId, size: 'default', pool: '["a/b","boat-default"]', expiresAt, dev: true, tailnet: { hostname }, devKey: { id: keyId, key, ...(Number.isFinite(devKeyExpiresAt) ? { expiresAt: devKeyExpiresAt } : {}) } }),
     storage.put(`project:project-a:box:${machineId}`, { machineId, state: 'leased', leaseId: ID, leaseClient: 'peek-dev', size: 'default', pool: '["a/b","boat-default"]' }),
   ]).then(() => ({ hostname, machineId }));
 }
@@ -165,9 +166,11 @@ test('a dev claim mints one key into the create environment and never answers or
   const key = t.fake.tailnet.keys[0].key;
   const [create] = boatCreates(t.fake);
   assert.deepEqual(Object.keys(create.body.env).sort(), ['PEEK_DEV_HOSTNAME', 'TAILSCALE_AUTHKEY']);
+  // noEnv suppresses only the account's stored secrets; the dev key is passed
+  // explicitly in create.body.env. See https://docs.boat.dev/api/reference/agent/create-sandbox
+  assert.equal(create.body.noEnv, true);
   assert.equal(create.body.env.TAILSCALE_AUTHKEY, key);
   assert.equal(create.body.env.PEEK_DEV_HOSTNAME, devHostname(ID));
-  assert.equal(create.body.noEnv, true);
   assert.equal(create.body.from, name);
   assert.match(create.body.setupScript, /phase snapshot_tailnet/);
   assert.equal(create.body.setupScript.includes(key), false);
@@ -225,6 +228,67 @@ test('a provider retry reuses the key the lease already minted', async () => {
   assert.equal(attempts.length, 2);
   assert.equal(attempts[0].devEnv.TAILSCALE_AUTHKEY, attempts[1].devEnv.TAILSCALE_AUTHKEY);
   assert.equal(creates[0].body.env.TAILSCALE_AUTHKEY, attempts[0].devEnv.TAILSCALE_AUTHKEY);
+});
+
+test('an expired dev key is replaced and written to the box before the dev setup', async () => {
+  const t = await setup();
+  await activeDevLease(t.storage, t.fake, { keyId: 'key-old', key: 'tskey-old-secret', devKeyExpiresAt: Date.now() - 1 });
+
+  const response = await t.send('peek-dev', 'execute', { id: ID, command: 'bash dev-box.sh setup' });
+  assert.equal(response.status, 200);
+  const text = await response.text();
+  assert.equal(text.includes('tskey-old-secret'), false);
+
+  assert.deepEqual(t.fake.tailnet.revokes, ['key-old']);
+  assert.equal(t.fake.tailnet.keys.length, 1);
+  const [minted] = t.fake.tailnet.keys;
+  assert.equal(minted.id, 'key-2');
+  assert.notEqual(minted.key, 'tskey-old-secret');
+
+  assert.equal(t.fake.files.length, 1);
+  assert.equal(t.fake.files[0].path, '/tmp/peek-dev-tailscale.key');
+  assert.equal(t.fake.files[0].content, minted.key);
+  assert.equal(t.fake.files[0].encoding, 'utf8');
+  assert.equal(t.fake.commands.length, 1);
+  assert.equal(t.fake.commands[0].command, 'bash dev-box.sh setup');
+  assert.equal(JSON.stringify(t.fake.commands).includes(minted.key), false);
+  assert.equal(t.f.logs.join('\n').includes(minted.key), false);
+
+  const lease = await t.storage.get(`external-lease:peek-dev:${ID}`);
+  assert.equal(lease.devKey.id, 'key-2');
+  assert.equal(lease.devKey.key, undefined);
+  assert.ok(Number.isFinite(lease.devKey.expiresAt));
+  assert.equal(JSON.stringify(lease).includes(minted.key), false);
+});
+
+test('an unexpired dev key is not reminted and no key file is written', async () => {
+  const t = await setup();
+  await activeDevLease(t.storage, t.fake, { keyId: 'key-live', key: 'tskey-live-secret', devKeyExpiresAt: Date.now() + 300_000 });
+
+  const response = await t.send('peek-dev', 'execute', { id: ID, command: 'bash dev-box.sh setup' });
+  assert.equal(response.status, 200);
+  assert.deepEqual(t.fake.tailnet.revokes, []);
+  assert.equal(t.fake.tailnet.keys.length, 1);
+  assert.equal(t.fake.tailnet.keys[0].id, 'key-live');
+  assert.equal(t.fake.files.length, 0);
+  assert.equal(t.fake.commands.length, 1);
+  assert.equal(t.fake.commands[0].command, 'bash dev-box.sh setup');
+  const lease = await t.storage.get(`external-lease:peek-dev:${ID}`);
+  assert.equal(lease.devKey.id, 'key-live');
+});
+
+test('a failed key file write fails the dev setup with a clear reason', async () => {
+  const t = await setup();
+  await activeDevLease(t.storage, t.fake, { keyId: 'key-old', key: 'tskey-old-secret', devKeyExpiresAt: Date.now() - 1 });
+  t.fake.fileFailures = 1;
+
+  const response = await t.send('peek-dev', 'execute', { id: ID, command: 'bash dev-box.sh setup' });
+  assert.equal(response.status, 502);
+  assert.deepEqual(await response.json(), { reason: 'dev_key_write_failed' });
+  assert.equal(t.fake.commands.length, 0);
+  assert.deepEqual(t.fake.tailnet.revokes, ['key-old', 'key-2']);
+  const lease = await t.storage.get(`external-lease:peek-dev:${ID}`);
+  assert.equal(lease.devKey.id, 'key-old');
 });
 
 test('release deletes the device, revokes the key and keeps the key out of every request and log', async () => {
@@ -306,6 +370,23 @@ test('the sweep after a restart ends an expired dev lease and its tailnet identi
   assert.equal(lease.devKey.key, undefined);
   assert.equal(t.fake.tailnet.keys.length, 0);
   assert.equal(t.f.logs.join('\n').includes('tskey-auth'), false);
+});
+
+test('cleanup deletes this lease\'s tagged devices, including suffixed joins', async () => {
+  const t = await setup();
+  const { hostname } = await activeDevLease(t.storage, t.fake, { keyId: 'key-1', key: 'tskey-fake-seeded', deviceId: 'device-exact' });
+  t.fake.tailnet.devices.push(
+    { id: 'device-suffixed', hostname: `${hostname}-1`, tags: [DEV_TAG] },
+    { id: 'device-untagged', hostname, tags: ['tag:other'] },
+    { id: 'device-other-lease', hostname: 'peek-dev-ffffffff', tags: [DEV_TAG] },
+    { id: 'device-suffixed-untagged', hostname: `${hostname}-2`, tags: [] },
+  );
+
+  const response = await t.send('peek-dev', 'release', { id: ID });
+  assert.equal(response.status, 204);
+  assert.deepEqual(t.fake.tailnet.deletes.sort(), ['device-exact', 'device-suffixed'].sort());
+  assert.deepEqual(t.fake.tailnet.revokes, ['key-1']);
+  assert.deepEqual(t.fake.tailnet.devices.map(item => item.id).sort(), ['device-other-lease', 'device-suffixed-untagged', 'device-untagged'].sort());
 });
 
 test('an ordinary lease never asks for a key and keeps an empty create environment', async () => {
