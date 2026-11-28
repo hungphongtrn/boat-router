@@ -32,6 +32,20 @@ test('the installed peek-runs lease client names the Peek project and its policy
     startsPerDay: 60,
     rollingSnapshot: true,
     warmReuse: false,
+    network: {
+      mode: 'allow',
+      inbound: 'boat-only',
+      allow: [
+        'registry.npmjs.org',
+        '*.npmjs.org',
+        'crates.io',
+        '*.crates.io',
+        'static.rust-lang.org',
+        '*.rust-lang.org',
+        'pypi.org',
+        'files.pythonhosted.org',
+      ],
+    },
   });
   assert.equal(JSON.stringify(leaseClients).includes('tokenHash'), false, 'a token hash never lives in the repository');
 });

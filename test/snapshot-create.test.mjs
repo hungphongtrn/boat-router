@@ -45,3 +45,28 @@ test('Boat missing snapshot response reaches fleet as the confirmed fallback err
       error.service === 'boat' && error.status === 404 && error.code === 'snapshot_not_found');
   }
 });
+
+const alphabet = 'abcdefghijklmnopqrstuvwxyz234567';
+function rollingName(manifestSha256) {
+  const value = BigInt(`0x${manifestSha256}`) << 4n;
+  let encoded = '';
+  for (let index = 51; index >= 0; index--) encoded += alphabet[Number((value >> BigInt(index * 5)) & 31n)];
+  return `peek-ci-${encoded}`;
+}
+
+test('a peek-runs create keeps no environment and carries its registry network', async () => {
+  let body;
+  const api = new APIs({}, async (_url, options) => { body = JSON.parse(options.body); return Response.json({ sandbox: { id: 'bx_23456789' } }); });
+  const manifestSha256 = 'f'.repeat(64);
+  const network = { mode: 'allow', inbound: 'boat-only', allow: ['registry.npmjs.org', '*.npmjs.org', 'crates.io', '*.crates.io', 'static.rust-lang.org', '*.rust-lang.org', 'pypi.org', 'files.pythonhosted.org'] };
+  await api.create({ ...job, routerReusable: true, noTailnet: true, network, routerSnapshot: { kind: 'peek-ci', name: rollingName(manifestSha256), snapshotId: 'rolling-snapshot-id', manifestSha256 } }, 1800);
+  assert.equal(body.noEnv, true);
+  assert.deepEqual(body.env ?? {}, {});
+  assert.deepEqual(body.network, network);
+  assert.equal(Object.keys(body).includes('noTailnet'), false, 'the tailnet check lives in the setup script');
+  assert.equal(Object.keys(body).some(key => /secret|token|tailnet/i.test(key)), false);
+  assert.equal(Object.keys(body.env ?? {}).length, 0);
+  assert.match(body.setupScript, /phase snapshot_tailnet/);
+  assert.match(body.setupScript, /test ! -e \/var\/lib\/tailscale\/tailscaled\.state/);
+  assert.match(body.setupScript, /pgrep -x tailscaled/);
+});

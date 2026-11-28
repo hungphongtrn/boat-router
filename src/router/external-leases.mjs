@@ -303,7 +303,9 @@ export class ExternalLeaseStarts {
     if (claim.status === 'pending') {
       if (!await this.ledger.begin(project, lease.claimKey)) return false;
       try {
-        const result = await this.api.create({ ...(lease.account ? { account: lease.account } : {}), createKey: lease.createKey, routerCreateName: lease.routerCreateName, machineSize: size, routerReusable: lease.isolation === 'external-v2', ...(lease.routerSnapshot ? { routerSnapshot: lease.routerSnapshot } : {}) }, lease.machineTtlSeconds ?? ttlSeconds);
+        // A lease box is created for a client: no environment, no tailnet identity
+        // on its disk, and only the client's own registry network policy.
+        const result = await this.api.create({ ...(lease.account ? { account: lease.account } : {}), createKey: lease.createKey, routerCreateName: lease.routerCreateName, machineSize: size, routerReusable: lease.isolation === 'external-v2', noTailnet: true, ...(lease.network ? { network: lease.network } : {}), ...(lease.routerSnapshot ? { routerSnapshot: lease.routerSnapshot } : {}) }, lease.machineTtlSeconds ?? ttlSeconds);
         sandbox = result?.sandbox;
         if (!/^bx_[23456789abcdefghjkmnpqrstuvwxyz]{8}$/.test(sandbox?.id ?? '')) throw new Error('invalid sandbox');
       } catch (error) {

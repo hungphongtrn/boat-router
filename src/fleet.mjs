@@ -12,6 +12,9 @@ import { leaseBase } from './router/lease-base.mjs';
 import { browserBase } from './router/browser-base.mjs';
 import { leaseRollingSnapshot } from './router/lease-snapshot.mjs';
 import { canonicalPendingReason } from './router/pending-reason.mjs';
+import { networkSummary } from './router/lease-network.mjs';
+import { parseKeepOnFailSeconds, holdActive } from './router/lease-hold.mjs';
+import { normalizeProcessId } from './router/lease-cancel.mjs';
 import { providerWallet } from './apis.mjs';
 import { BUILD_COMMIT, BUILD_DEPLOYMENT } from './build.mjs';
 import { installRouter } from './router/install.mjs';
@@ -1280,21 +1283,38 @@ export class Fleet {
         if (!prior?.size && (body.base || (configured && !rolling)) && !selection) return new Response(null, { status: 503, headers });
         const lease = await this.external.claim(client, id, body.size ?? 'default', body.isolation ?? null, body.repoKey ?? null, false, selection, rolling);
         await project.storage.setAlarm(Date.now() + 10000);
-        if (lease) return Response.json({ id, machineId: lease.machineId, expiresAt: lease.expiresAt, snapshotName: lease.routerSnapshot?.name ?? null, manifestSha256: lease.routerSnapshot?.manifestSha256 ?? null, ...(lease.isolation === 'external-v2' ? { isolation: lease.isolation } : {}), ...(lease.base === 'browser-v1' ? { base: lease.base } : {}) }, { headers });
+        if (lease) return Response.json({ id, machineId: lease.machineId, expiresAt: lease.expiresAt, snapshotName: lease.routerSnapshot?.name ?? null, manifestSha256: lease.routerSnapshot?.manifestSha256 ?? null, ...(lease.isolation === 'external-v2' ? { isolation: lease.isolation } : {}), ...(lease.base === 'browser-v1' ? { base: lease.base } : {}), ...(config.network ? { network: networkSummary(config.network) } : {}) }, { headers });
         const detail = await this.external.pendingReason(client, id, body.size ?? 'default');
         return Response.json({ reason: canonicalPendingReason(detail), detail }, { status: 202, headers });
       }
       if (action === 'release') {
-        const done = await this.external.release(client, id);
+        const keepOnFailSeconds = parseKeepOnFailSeconds(body.keepOnFailSeconds);
+        if (keepOnFailSeconds === null) return new Response(null, { status: 400, headers });
+        const held = keepOnFailSeconds > 0 ? await this.storage.get(`external-lease:${client}:${id}`) : null;
+        const operationApi = held?.machineId ? (this.router.externalApi ? await this.router.externalApi.forIdentity(held) : this.controller.api) : null;
+        const done = await this.external.release(client, id, keepOnFailSeconds, operationApi);
         await project.storage.setAlarm(Date.now() + 1000);
+        if (done && typeof done === 'object' && Number.isFinite(done.heldUntil)) return Response.json({ id, heldUntil: done.heldUntil }, { headers });
         return new Response(null, { status: done ? 204 : 202, headers });
       }
+      if (action === 'cancel') {
+        const processId = normalizeProcessId(body.processId);
+        if (processId === null) return new Response(null, { status: 400, headers });
+        const result = await this.external.cancel(client, id, processId);
+        if (result.status === 404) return Response.json({ reason: result.reason ?? 'process_not_found' }, { status: 404, headers });
+        return Response.json({ id, processId, cancelled: result.cancelled === true }, { headers });
+      }
       const lease = await this.storage.get(`external-lease:${client}:${id}`);
-      if (!lease || lease.state !== 'active' || lease.expiresAt <= Date.now() || lease.project !== config.project) return new Response(null, { status: 409, headers });
+      const active = lease?.state === 'active' && lease.expiresAt > Date.now();
+      const held = holdActive(lease, Date.now());
+      if (!lease || (!active && !held) || lease.project !== config.project) return new Response(null, { status: 409, headers });
       if (action === 'renew') {
+        if (!active) return new Response(null, { status: 409, headers });
         const renewed = await this.external.leases.renew(client, id, config.ttlSeconds * 1000);
         return renewed ? Response.json({ expiresAt: renewed.expiresAt }, { headers }) : new Response(null, { status: 409, headers });
       }
+      // A held box is open for debugging only: read, stream and run, nothing else.
+      if (held && !['execute', 'status', 'stream', 'file-read'].includes(action)) return new Response(null, { status: 409, headers });
       if (lease.fileWritePending) return new Response(null, { status: 409, headers });
       const operationApi = this.router.externalApi ? await this.router.externalApi.forIdentity(lease) : this.controller.api;
       const base = `/sandboxes/${lease.machineId}`;

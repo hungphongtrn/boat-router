@@ -599,3 +599,87 @@ test('a created lease settles to its elapsed lifetime on the ledger', async () =
   assert.ok(settled.amountUsd < reserved.amountUsd);
   assert.equal(settled.elapsedSeconds, 60);
 });
+
+const otherId = '00000000-0000-4000-8000-000000000002';
+
+test('releasing a rolling lease deletes its box instead of warming it', async () => {
+  const { storage, projectStorage, service } = setup();
+  await projectStorage.put('pool:mode', 'on');
+  service.clients.compute.warmReuse = true;
+  const key = 'bx_23456789';
+  await storage.put(`project:project-a:box:${key}`, { machineId: key, leaseId: id, leaseClient: 'compute', state: 'leased', generation: 0, createdAt: 1, baselineHash: 'hash' });
+  await storage.put(`external-lease:compute:${id}`, { id, client: 'compute', project: 'project-a', state: 'active', machineId: key, expiresAt: 70_000, isolation: 'external-v2', rollingSnapshot: true });
+  let resets = 0; service.api.lightReset = async () => { resets++; return { processId: 9 }; };
+  assert.equal(await service.release('compute', id), true);
+  assert.equal(resets, 0, 'a rolling lease never returns to the warm pool');
+  assert.equal((await projectStorage.get(`box:${key}`)).state, 'destroying');
+  assert.equal((await storage.get(`external-lease:compute:${id}`)).state, 'cleaning');
+});
+
+test('a bounded keep-on-fail hold keeps the box for debugging and deletes it at its bound', async () => {
+  const { storage, projectStorage, service, setTime } = setup();
+  await projectStorage.put('pool:mode', 'on');
+  const key = 'bx_23456789', leaseKey = `external-lease:compute:${id}`, boxKey = `project:project-a:box:${key}`;
+  await storage.put(boxKey, { machineId: key, leaseId: id, leaseClient: 'compute', state: 'leased', generation: 0, createdAt: 1, baselineHash: 'hash' });
+  await storage.put(leaseKey, { id, client: 'compute', project: 'project-a', state: 'active', machineId: key, expiresAt: 70_000, isolation: 'external-v2' });
+  let resets = 0; service.api.lightReset = async () => { resets++; return { processId: 9 }; };
+  const requests = [];
+  const held = await service.release('compute', id, 900, { request: async (...args) => { requests.push(args); return {}; } });
+  assert.equal(held.heldUntil, 910_000);
+  assert.deepEqual(requests, [['boat', `/sandboxes/${key}`, { method: 'PATCH', body: { ttlSeconds: 900 } }]]);
+  const lease = await storage.get(leaseKey);
+  assert.equal(lease.state, 'held');
+  assert.equal(lease.heldUntil, 910_000);
+  assert.equal(await projectStorage.getAlarm(), 910_000);
+  assert.equal((await storage.get(boxKey)).state, 'leased');
+  assert.equal(resets, 0, 'a held box is never reset for the warm pool');
+  assert.equal(await service.pendingReason('compute', id, 'default'), 'lease_held');
+  assert.equal(await service.leases.renew('compute', id, 60_000), null, 'renew is refused during a hold');
+  assert.equal(await service.leases.reserve('compute', otherId, 1, 5000), null, 'a hold counts against maxActive');
+  setTime(909_999); await service.sweep();
+  assert.equal((await storage.get(leaseKey)).state, 'held');
+  setTime(910_000); await service.sweep();
+  assert.equal((await storage.get(leaseKey)).state, 'cleaning');
+  const destroyed = await storage.get(boxKey);
+  assert.equal(destroyed.state, 'destroying');
+  assert.equal(destroyed.retirementReason, 'hold_expired');
+  assert.equal(destroyed.history.some(item => item.event === 'lease_return'), false);
+});
+
+test('a held lease is deleted at once when it is released without a keep', async () => {
+  const { storage, service } = setup();
+  const key = 'bx_23456789', leaseKey = `external-lease:compute:${id}`, boxKey = `project:project-a:box:${key}`;
+  await storage.put(boxKey, { machineId: key, leaseId: id, leaseClient: 'compute', state: 'leased', generation: 0 });
+  await storage.put(leaseKey, { id, client: 'compute', project: 'project-a', state: 'held', machineId: key, expiresAt: 70_000, heldUntil: 910_000 });
+  assert.equal(await service.release('compute', id), true);
+  assert.equal((await storage.get(leaseKey)).state, 'cleaning');
+  assert.equal((await storage.get(boxKey)).state, 'destroying');
+});
+
+test('cancel deletes an owned process and a repeat cancel is idempotent', async () => {
+  const { storage, service } = setup();
+  const key = 'bx_23456789', leaseKey = `external-lease:compute:${id}`;
+  await storage.put(leaseKey, { id, client: 'compute', project: 'project-a', state: 'active', machineId: key, expiresAt: 70_000 });
+  const calls = [];
+  service.api = { request: async (...args) => { calls.push(args); return {}; } };
+  assert.deepEqual(await service.cancel('compute', id, 7), { status: 200, cancelled: true });
+  assert.deepEqual(calls, [['boat', `/sandboxes/${key}/commands/7`, { method: 'DELETE' }]]);
+  assert.deepEqual(await service.cancel('compute', id, 7), { status: 200, cancelled: false });
+  assert.equal(calls.length, 1);
+  assert.deepEqual((await storage.get(leaseKey)).cancelledProcessIds, [7]);
+});
+
+test('cancel refuses another client, a held lease and a process the provider does not know', async () => {
+  const { storage, service } = setup();
+  const key = 'bx_23456789', leaseKey = `external-lease:compute:${id}`;
+  await storage.put(leaseKey, { id, client: 'compute', project: 'project-a', state: 'active', machineId: key, expiresAt: 70_000 });
+  let calls = 0; service.api = { request: async () => { calls++; return {}; } };
+  assert.deepEqual(await service.cancel('other', id, 7), { status: 404, reason: 'process_not_found' });
+  await storage.put(leaseKey, { id, client: 'compute', project: 'project-a', state: 'held', machineId: key, heldUntil: 70_000 });
+  assert.deepEqual(await service.cancel('compute', id, 7), { status: 404, reason: 'process_not_found' });
+  await storage.put(leaseKey, { id, client: 'compute', project: 'project-a', state: 'active', machineId: key, expiresAt: 70_000 });
+  service.api = { request: async () => { calls++; throw Object.assign(new Error('gone'), { status: 404 }); } };
+  assert.deepEqual(await service.cancel('compute', id, 7), { status: 404, reason: 'process_not_found' });
+  assert.equal((await storage.get(leaseKey)).cancelledProcessIds, undefined);
+  assert.equal(calls, 1);
+});

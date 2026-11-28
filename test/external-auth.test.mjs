@@ -295,3 +295,113 @@ test('the installed peek-runs client takes its policy from config and its token 
   assert.equal((await renew('peek-runs')).status, 409);
   assert.equal((await renew('stranger')).status, 401);
 });
+
+const id = '00000000-0000-4000-8000-000000000001';
+const leaseLease = (state = 'active') => ({ id, client: 'lease', project: 'project-a', state, machineId: 'bx_12345678', expiresAt: Date.now() + 60_000, ...(state === 'held' ? { heldUntil: Date.now() + 60_000 } : {}) });
+const cancelRequest = (token, client, body) => new Request('https://fleet/router/lease/cancel', { method: 'POST', headers: { 'X-Boat-CI-Enabled': 'true', 'X-Lease-Client': client, Authorization: `Bearer ${token}` }, body: JSON.stringify(body) });
+
+test('cancel kills an owned process once and refuses a wrong client, a bad id and an unknown lease', async () => {
+  const token = 'a'.repeat(40), stranger = 'b'.repeat(40), storage = new Storage();
+  const clients = {
+    lease: { enabled: true, project: 'project-a', maxActive: 6, startsPerDay: 60, ttlSeconds: 900, tokenHash: await hash(token) },
+    stranger: { enabled: true, project: 'project-a', maxActive: 6, startsPerDay: 60, ttlSeconds: 900, tokenHash: await hash(stranger) },
+  };
+  const fleet = leaseFleet(storage, clients);
+  const calls = [];
+  fleet.external.api = { request: async (...args) => { calls.push(args); return {}; } };
+  await storage.put(`external-lease:lease:${id}`, leaseLease());
+  for (const processId of [7.5, '7x', -1, true, {}, '0', 0, '1e3']) {
+    assert.equal((await fleet.fetch(cancelRequest(token, 'lease', { id, processId }))).status, 400, JSON.stringify(processId));
+  }
+  assert.equal((await fleet.fetch(cancelRequest(stranger, 'stranger', { id, processId: 7 }))).status, 404);
+  assert.equal((await fleet.fetch(cancelRequest(token, 'lease', { id: '00000000-0000-4000-8000-000000000009', processId: 7 }))).status, 404);
+  const first = await fleet.fetch(cancelRequest(token, 'lease', { id, processId: '7' }));
+  assert.equal(first.status, 200);
+  assert.deepEqual(await first.json(), { id, processId: 7, cancelled: true });
+  assert.deepEqual(calls, [['boat', '/sandboxes/bx_12345678/commands/7', { method: 'DELETE' }]]);
+  const second = await fleet.fetch(cancelRequest(token, 'lease', { id, processId: 7 }));
+  assert.equal(second.status, 200);
+  assert.deepEqual(await second.json(), { id, processId: 7, cancelled: false });
+  assert.equal(calls.length, 1);
+  assert.deepEqual((await storage.get(`external-lease:lease:${id}`)).cancelledProcessIds, [7]);
+});
+
+test('cancel passes a provider 404 through as process_not_found', async () => {
+  const token = 'a'.repeat(40), storage = new Storage();
+  const clients = { lease: { enabled: true, project: 'project-a', maxActive: 6, startsPerDay: 60, ttlSeconds: 900, tokenHash: await hash(token) } };
+  const fleet = leaseFleet(storage, clients);
+  fleet.external.api = { request: async () => { throw Object.assign(new Error('gone'), { status: 404 }); } };
+  await storage.put(`external-lease:lease:${id}`, leaseLease());
+  const result = await fleet.fetch(cancelRequest(token, 'lease', { id, processId: 7 }));
+  assert.equal(result.status, 404);
+  assert.deepEqual(await result.json(), { reason: 'process_not_found' });
+});
+
+test('release holds a lease for a bounded keep and refuses every other value', async () => {
+  const token = 'a'.repeat(40), storage = new Storage();
+  const clients = { lease: { enabled: true, project: 'project-a', maxActive: 6, startsPerDay: 60, ttlSeconds: 900, tokenHash: await hash(token) } };
+  const fleet = leaseFleet(storage, clients);
+  const calls = [];
+  fleet.router.externalApi = { forIdentity: async () => ({ request: async (...args) => { calls.push(args); return {}; } }) };
+  await storage.put(`external-lease:lease:${id}`, leaseLease());
+  await storage.put('project:project-a:box:bx_12345678', { machineId: 'bx_12345678', leaseId: id, leaseClient: 'lease', state: 'leased', generation: 0 });
+  const send = body => fleet.fetch(new Request('https://fleet/router/lease/release', { method: 'POST', headers: { 'X-Boat-CI-Enabled': 'true', 'X-Lease-Client': 'lease', Authorization: `Bearer ${token}` }, body: JSON.stringify({ id, ...body }) }));
+  for (const keepOnFailSeconds of [901, -1, 1.5, '60', true, null]) assert.equal((await send({ keepOnFailSeconds })).status, 400, String(keepOnFailSeconds));
+  const response = await send({ keepOnFailSeconds: 900 });
+  assert.equal(response.status, 200);
+  const body = await response.json();
+  assert.equal(body.id, id);
+  assert.ok(body.heldUntil > Date.now());
+  assert.deepEqual(calls, [['boat', '/sandboxes/bx_12345678', { method: 'PATCH', body: { ttlSeconds: 900 } }]]);
+  assert.equal((await storage.get(`external-lease:lease:${id}`)).state, 'held');
+  const renew = await fleet.fetch(new Request('https://fleet/router/lease/renew', { method: 'POST', headers: { 'X-Boat-CI-Enabled': 'true', 'X-Lease-Client': 'lease', Authorization: `Bearer ${token}` }, body: JSON.stringify({ id }) }));
+  assert.equal(renew.status, 409);
+  const execute = await fleet.fetch(new Request('https://fleet/router/lease/execute', { method: 'POST', headers: { 'X-Boat-CI-Enabled': 'true', 'X-Lease-Client': 'lease', Authorization: `Bearer ${token}` }, body: JSON.stringify({ id, command: 'ls' }) }));
+  assert.equal(execute.status, 200);
+  assert.deepEqual(calls[1], ['boat', '/sandboxes/bx_12345678/commands', { method: 'POST', body: { command: 'ls', detached: true } }]);
+  const write = await fleet.fetch(new Request('https://fleet/router/lease/file-write', { method: 'POST', headers: { 'X-Boat-CI-Enabled': 'true', 'X-Lease-Client': 'lease', Authorization: `Bearer ${token}` }, body: JSON.stringify({ id, path: '/tmp/chunk', content: 'YQ==', encoding: 'base64' }) }));
+  assert.equal(write.status, 409, 'only read, stream and execute work during a hold');
+});
+
+test('release without a keep deletes the box', async () => {
+  const token = 'a'.repeat(40), storage = new Storage();
+  const clients = { lease: { enabled: true, project: 'project-a', maxActive: 6, startsPerDay: 60, ttlSeconds: 900, tokenHash: await hash(token) } };
+  const fleet = leaseFleet(storage, clients);
+  await storage.put(`external-lease:lease:${id}`, leaseLease());
+  await storage.put('project:project-a:box:bx_12345678', { machineId: 'bx_12345678', leaseId: id, leaseClient: 'lease', state: 'leased', generation: 0 });
+  const result = await fleet.fetch(new Request('https://fleet/router/lease/release', { method: 'POST', headers: { 'X-Boat-CI-Enabled': 'true', 'X-Lease-Client': 'lease', Authorization: `Bearer ${token}` }, body: JSON.stringify({ id }) }));
+  assert.equal(result.status, 204);
+  assert.equal((await storage.get(`external-lease:lease:${id}`)).state, 'cleaning');
+});
+
+test('a lease client network policy is validated and named on the claim', async () => {
+  const token = 'a'.repeat(40), storage = new Storage();
+  const network = { mode: 'allow', inbound: 'boat-only', allow: ['registry.npmjs.org', '*.crates.io'] };
+  const clients = { lease: { enabled: true, project: 'project-a', maxActive: 6, startsPerDay: 60, ttlSeconds: 900, tokenHash: await hash(token), network } };
+  const fleet = leaseFleet(storage, clients);
+  assert.deepEqual(fleet.external.config('lease').network, network);
+  fleet.external.claim = async () => ({ machineId: 'bx_12345678', expiresAt: Date.now() + 60_000 });
+  const response = await fleet.fetch(claimRequest('lease', token, id, {}));
+  assert.equal(response.status, 200);
+  assert.deepEqual((await response.json()).network, { mode: 'allow', inbound: 'boat-only' });
+  for (const malformed of [
+    { mode: 'proxy', allow: [], inbound: 'boat-only' },
+    { mode: 'allow', allow: ['https://registry.npmjs.org'], inbound: 'boat-only' },
+    { mode: 'allow', allow: ['registry.npmjs.org/path'], inbound: 'boat-only' },
+    { mode: 'allow', allow: Array.from({ length: 101 }, () => 'a.example.com'), inbound: 'boat-only' },
+    { mode: 'allow', allow: [], inbound: 'open' },
+    { mode: 'allow', allow: [], inbound: 'boat-only', extra: true },
+  ]) {
+    const broken = leaseFleet(new Storage(), { lease: { ...clients.lease, network: malformed } });
+    assert.equal(broken.external.config('lease'), null, JSON.stringify(malformed));
+  }
+});
+
+test('a client without a network policy claims without one', async () => {
+  const token = 'a'.repeat(40), storage = new Storage();
+  const clients = { lease: { enabled: true, project: 'project-a', maxActive: 6, startsPerDay: 60, ttlSeconds: 900, tokenHash: await hash(token) } };
+  const fleet = leaseFleet(storage, clients);
+  fleet.external.claim = async () => ({ machineId: 'bx_12345678', expiresAt: Date.now() + 60_000 });
+  const response = await fleet.fetch(claimRequest('lease', token, id, {}));
+  assert.equal((await response.json()).network, undefined);
+});

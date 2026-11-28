@@ -299,3 +299,29 @@ test('a rolling selection whose name does not encode its digest is refused', asy
     assert.equal(created, 0);
   }
 });
+
+test('a lease create carries its client network policy and the no-tailnet check', async () => {
+  const store = new Storage(), now = () => 10_000;
+  await new ExternalLeases(store, now).reserve('compute', a, 1, 5000);
+  const network = { mode: 'allow', inbound: 'boat-only', allow: ['registry.npmjs.org', '*.crates.io'] };
+  await store.put(`external-lease:compute:${a}`, { client: 'compute', id: a, state: 'reserved', size: 'default', network, createdAt: 1, expiresAt: 20_000 });
+  const ledger = new AccountLedger(store, { starts: { minute: 1, hour: 1, day: 1 }, externalClients: { compute: { startsPerDay: 1 } } }, now);
+  const limits = { at: now(), canStart: true, concurrency: { active: 0, limit: 10 }, windows: Object.fromEntries(['minute', 'hour', 'day'].map(k => [k, { limit: 5, used: 0 }])) };
+  let request;
+  const starts = new ExternalLeaseStarts(store, ledger, { create: async job => { request = job; return { sandbox: { id: 'bx_23456789' } }; } }, now);
+  assert.equal(await starts.start('compute', a, 'project-a', 'default', '["repo","label"]', limits, 1800), true);
+  assert.deepEqual(request.network, network);
+  assert.equal(request.noTailnet, true);
+  assert.equal(request.routerSnapshot, undefined);
+});
+
+test('a lease without a client network sends no network field', async () => {
+  const store = new Storage(), now = () => 10_000;
+  await new ExternalLeases(store, now).reserve('compute', a, 1, 5000);
+  const ledger = new AccountLedger(store, { starts: { minute: 1, hour: 1, day: 1 }, externalClients: { compute: { startsPerDay: 1 } } }, now);
+  const limits = { at: now(), canStart: true, concurrency: { active: 0, limit: 10 }, windows: Object.fromEntries(['minute', 'hour', 'day'].map(k => [k, { limit: 5, used: 0 }])) };
+  let request;
+  const starts = new ExternalLeaseStarts(store, ledger, { create: async job => { request = job; return { sandbox: { id: 'bx_23456789' } }; } }, now);
+  assert.equal(await starts.start('compute', a, 'project-a', 'default', '["repo","label"]', limits, 1800), true);
+  assert.equal(Object.hasOwn(request, 'network'), false);
+});

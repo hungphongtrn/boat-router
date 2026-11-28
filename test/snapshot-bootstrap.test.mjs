@@ -20,7 +20,7 @@ function fixture(t, options) {
   writeFileSync(binary, 'verified tool');
   const manifest = `${digest('verified tool')}  ${options?.relativeManifest ? binary.slice(1) : binary}\n`;
   writeFileSync(join(root, '.boat-ci/toolchain.sha256'), manifest);
-  const script = snapshotBootstrap(digest(manifest), options).replaceAll('/home/user', root).replaceAll('/tmp/w', join(root, 'work'));
+  const script = snapshotBootstrap(digest(manifest), options).replaceAll('/home/user', root).replaceAll('/tmp/w', join(root, 'work')).replaceAll('/var/lib/tailscale/tailscaled.state', join(root, 'tailscale.state'));
   return { root, binary, run: env => spawnSync('bash', ['-c', script], { encoding: 'utf8', env: { ...process.env, ...env } }), ready: () => existsSync(join(root, '.boat-ci/ready')) };
 }
 
@@ -191,4 +191,35 @@ exit 1
   assert.equal(result.status, 0, result.stderr);
   assert.equal(f.ready(), true);
   assert.ok(Number(readFileSync(join(f.root, 'polls'), 'utf8')) >= 3, 'docker ran only after systemd answered running');
+});
+
+test('a lease boot passes only with no tailnet state file and no tailscaled process', t => {
+  const f = fixture(t, { noTailnet: true }), bin = join(f.root, 'bin');
+  mkdirSync(bin);
+  writeFileSync(join(bin, 'pgrep'), '#!/bin/sh\nexit 1\n', { mode: 0o755 });
+  const env = { PATH: `${bin}:${process.env.PATH}` };
+  const clean = f.run(env);
+  assert.equal(clean.status, 0, clean.stderr);
+  assert.equal(f.ready(), true);
+  rmSync(join(f.root, '.boat-ci/ready'));
+  const secret = 'tailnet-identity-must-never-appear';
+  writeFileSync(join(f.root, 'tailscale.state'), secret);
+  const stateful = f.run(env);
+  assert.notEqual(stateful.status, 0);
+  assert.equal(f.ready(), false);
+  assert.equal((stateful.stdout + stateful.stderr).includes(secret), false, 'no file content is printed');
+  rmSync(join(f.root, 'tailscale.state'));
+  writeFileSync(join(bin, 'pgrep'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+  const running = f.run(env);
+  assert.notEqual(running.status, 0);
+  assert.equal(f.ready(), false);
+});
+
+test('a boot without the lease check never probes the tailnet', t => {
+  const f = fixture(t), bin = join(f.root, 'bin');
+  mkdirSync(bin);
+  writeFileSync(join(bin, 'pgrep'), '#!/bin/sh\ntouch "' + '\$TRACE' + '"; exit 0\n', { mode: 0o755 });
+  const result = f.run({ PATH: `${bin}:${process.env.PATH}`, TRACE: join(f.root, 'trace') });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(existsSync(join(f.root, 'trace')), false);
 });

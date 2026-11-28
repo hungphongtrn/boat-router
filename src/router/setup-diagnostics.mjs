@@ -1,6 +1,6 @@
 const STATES = new Set(['starting', 'pending', 'ready', 'idle', 'running', 'error', 'cancelled', 'archived', 'stopped']);
 const SETUP_STATES = new Set(['pending', 'starting', 'running', 'done', 'failed', 'cancelled']);
-export const PHASES = new Set(['apt_update', 'apt_install', 'actions_apt_install', 'node_toolcache', 'ffmpeg_download', 'docker_ready', 'git_download', 'powershell_download', 'shellcheck_download', 'runner_download', 'ready', 'reuse_helper_download', 'reuse_helper_check', 'snapshot_verify', 'snapshot_helper']);
+export const PHASES = new Set(['apt_update', 'apt_install', 'actions_apt_install', 'node_toolcache', 'ffmpeg_download', 'docker_ready', 'git_download', 'powershell_download', 'shellcheck_download', 'runner_download', 'ready', 'reuse_helper_download', 'reuse_helper_check', 'snapshot_verify', 'snapshot_tailnet', 'snapshot_helper']);
 export const SETUP_ERROR_CATEGORIES = new Set(['unknown', 'download_http_5xx', 'download_http_4xx', 'download_rate_limited', 'download_network', 'download_timeout', 'checksum_mismatch', 'apt_network', 'apt_integrity', 'apt_lock', 'command_missing', 'docker_not_ready', 'provider_limited']);
 const CATEGORIES = new Map([
   ['RATE_LIMITED', 'rate_limited'], ['RATE_LIMIT', 'rate_limited'], ['TOO_MANY_REQUESTS', 'rate_limited'],

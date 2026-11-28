@@ -24,6 +24,7 @@ project is registered, so an unregistered repository is refused by the webhook.
 | `triggers` | `workflow_job` / `actions-jit` | The router starts a runner per job and hands it the JIT configuration. |
 | `externalClaimer`, `localFirst` | absent | Boat handles `peek-router`; the separate GitHub light fallback does not claim that label. |
 | `clients.json` `peek-runs` | `enabled`, project `peek`, `ttlSeconds` 1800, `rollingSnapshot: true`, `warmReuse: false` | The Peek Run harness leases one box for its own work. It boots the newest ready `peek-ci-*` generation (the same disk CI boots) and never a plain box, without joining the warm-reuse line. Installed by `config/installation.mjs`; `EXTERNAL_LEASE_CLIENTS` adds or overrides a client and `EXTERNAL_LEASE_POLICY` overrides its `maxActive`, `startsPerDay` and `rollingSnapshot`. |
+| `clients.json` `peek-runs` `network` | `mode: allow`, `inbound: boat-only`, eight registry entries | A Run installs dependencies, so the box reaches npm, crates.io, static.rust-lang.org and PyPI only; nothing from the internet reaches it, while exec, files and stream still work through Boat. A malformed policy disables the client rather than opening its boxes. |
 | `maxActive`, `startsPerDay` of `peek-runs` | 4, 60 | Its own concurrency and daily start ceiling. Both are dropped while the open start queue is on: the account queue then owns admission. |
 
 ## Rolling snapshot

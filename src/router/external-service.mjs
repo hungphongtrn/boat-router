@@ -7,6 +7,8 @@ import { runnableDemand } from './workflow-demand.mjs';
 import { lanesSwitchOn } from './lanes.mjs';
 import { breakerForSize } from './verification-breaker.mjs';
 import { validLeaseSize } from './sizes.mjs';
+import { normalizeNetwork } from './lease-network.mjs';
+import { heldUntil, holdActive } from './lease-hold.mjs';
 
 async function records(storage, prefix) {
   const out = []; let startAfter = '';
@@ -34,7 +36,11 @@ export class ExternalService {
   config(client) {
     const cfg = this.clients?.[client];
     if (!cfg || cfg.enabled !== true || (cfg.maxActive !== null && (!Number.isSafeInteger(cfg.maxActive) || cfg.maxActive < 1)) || (cfg.startsPerDay !== null && (!Number.isSafeInteger(cfg.startsPerDay) || cfg.startsPerDay < 0)) || !Number.isSafeInteger(cfg.ttlSeconds) || cfg.ttlSeconds < 60 || cfg.ttlSeconds > 3600 || (cfg.rollingSnapshot !== undefined && typeof cfg.rollingSnapshot !== 'boolean') || (cfg.warmReuse !== undefined && typeof cfg.warmReuse !== 'boolean') || !this.router.projects.has(cfg.project)) return null;
-    return cfg;
+    // A malformed network policy disables the client rather than leaking a box
+    // with the provider's open default, so it is validated on every read.
+    let network;
+    try { network = normalizeNetwork(cfg.network); } catch { return null; }
+    return { ...cfg, network };
   }
   async ciIdle(size = 'default', allowDeferred = false) {
     for (const project of this.router.projects.values()) {
@@ -83,6 +89,8 @@ export class ExternalService {
       } else if (!await this.ciIdle(size)) return await this.ciIdle(size, true) ? 'deferred_ci_warm_only' : 'ci_demand_or_snapshot';
       return 'reservation_pending';
     }
+    // A held lease is intentionally kept for debugging; it is not a pending claim.
+    if (holdActive(lease, this.now())) return 'lease_held';
     if (lease.expiresAt <= this.now()) return 'lease_expired';
     if (['waiting', 'reserved', 'starting'].includes(lease.state)) {
       if (this.router.account.openStartQueue === true) {
@@ -113,7 +121,7 @@ export class ExternalService {
     if (selection && (!prior || ['waiting', 'reserved'].includes(prior.state)) && (!reuseEnabled || isolation !== 'external-v2') && selection.routerSnapshot?.kind !== 'peek-ci') return null;
     let lease = await this.leases.reserve(client, id, cfg.maxActive, cfg.ttlSeconds * 1000);
     if (!lease) return null;
-    if (!lease.size && lease.state === 'reserved') lease = await this.leases.transition(client, id, ['reserved'], 'reserved', { size, project: cfg.project, repoKey, isolation: reuseEnabled && isolation === 'external-v2' ? isolation : null, ...(rolling ? { rollingSnapshot: true } : {}), ...(selection ?? {}) });
+    if (!lease.size && lease.state === 'reserved') lease = await this.leases.transition(client, id, ['reserved'], 'reserved', { size, project: cfg.project, repoKey, isolation: reuseEnabled && isolation === 'external-v2' ? isolation : null, ...(rolling ? { rollingSnapshot: true } : {}), ...(cfg.network ? { network: cfg.network } : {}), ...(selection ?? {}) });
     if (!lease || lease.size !== size) return null;
     // A rolling client never boots plain: without a stored generation it waits
     // for the next publication instead of spending a start on an empty box.
@@ -206,7 +214,7 @@ export class ExternalService {
     const selection = lease.baseId || lease.routerSnapshot ? { base: lease.base, baseId: lease.baseId, routerSnapshot: lease.routerSnapshot, ...(lease.rollingSnapshot ? { rollingSnapshot: true } : {}) } : null;
     return this.claim(lease.client, lease.id, lease.size, lease.isolation ?? null, lease.repoKey ?? null, true, selection, lease.rollingSnapshot === true);
   }
-  async release(client, id) {
+  async release(client, id, keepOnFailSeconds = 0, operationApi = null) {
     const lease = await this.storage.get(`external-lease:${client}:${id}`);
     if (!lease || lease.state === 'closed') return true;
     // An upload may still be running at the provider after the client leaves.
@@ -216,9 +224,28 @@ export class ExternalService {
       if (lease.machineId || lease.claimKey) return false;
       return Boolean(await this.leases.transition(client, id, ['reserved', 'waiting'], 'closed'));
     }
+    // Releasing an already-held lease either keeps the same bound or ends it now.
+    if (lease.state === 'held') return keepOnFailSeconds > 0 ? { heldUntil: lease.heldUntil } : this.fence.destroy(lease.project, client, id, 'release');
     const cfg = this.config(client), project = cfg && this.router.projects.get(cfg.project);
     const reuseEnabled = cfg?.warmReuse === true && this.router.account.reuse?.enabled === true && project?.config.reuse?.mode === 'on' && project.config.dockerAccess !== true && await project.storage.get('reuse:override') !== 'off';
-    if (lease.state === 'active' && lease.isolation === 'external-v2' && reuseEnabled) {
+    // A bounded hold keeps a box the client may still debug. The box never enters
+    // the warm pool: the sweep deletes it at heldUntil, so its spend settles then.
+    if (keepOnFailSeconds > 0 && lease.state === 'active' && lease.machineId && project) {
+      const holdUntil = heldUntil(this.now(), keepOnFailSeconds);
+      const held = await this.leases.transition(client, id, ['active'], 'held', { heldUntil: holdUntil, holdSeconds: keepOnFailSeconds, fileWritePending: null });
+      if (!held) return false;
+      // Shorten the provider's own auto-stop to the hold bound, so a sweep that
+      // never runs still cannot keep the box past the client's request.
+      try {
+        const api = operationApi ?? (typeof this.api.forIdentity === 'function' ? await this.api.forIdentity(held) : this.api);
+        await api.request('boat', `/sandboxes/${held.machineId}`, { method: 'PATCH', body: { ttlSeconds: keepOnFailSeconds } });
+      } catch { /* The sweep's own delete still ends the hold. */ }
+      await project.storage.setAlarm(holdUntil);
+      return { heldUntil: holdUntil };
+    }
+    // A rolling lease is never warmed for another client, whatever its warmReuse
+    // setting: releasing it deletes the box.
+    if (lease.state === 'active' && lease.isolation === 'external-v2' && reuseEnabled && lease.rollingSnapshot !== true) {
       const box = await project.storage.get(`box:${lease.machineId}`);
       const maxJobs = Math.min(this.router.account.reuse?.maxJobs ?? 60, project.config.reuse?.maxJobs ?? 60);
       const maxAge = Math.min(this.router.account.reuse?.maxAgeSeconds ?? 86400, project.config.reuse?.maxAgeSeconds ?? 86400);
@@ -232,6 +259,27 @@ export class ExternalService {
     // A pending or uncertain create and an in-flight fence require reconciliation.
     await this.storage.put(`external-lease:${client}:${id}`, { ...lease, releaseRequested: true });
     return false;
+  }
+  // Kill a process the client started. The lease must still be the caller's and
+  // active; the provider owns the process id space, so a plain id is required.
+  async cancel(client, id, processId) {
+    const leaseKey = `external-lease:${client}:${id}`, lease = await this.storage.get(leaseKey);
+    if (!lease || lease.state !== 'active' || lease.expiresAt <= this.now()) return { status: 404, reason: 'process_not_found' };
+    // A repeat cancel is idempotent: the process was already asked to stop.
+    if ((lease.cancelledProcessIds ?? []).includes(processId)) return { status: 200, cancelled: false };
+    const api = typeof this.api.forIdentity === 'function' ? await this.api.forIdentity(lease) : this.api;
+    try { await api.request('boat', `/sandboxes/${lease.machineId}/commands/${processId}`, { method: 'DELETE' }); }
+    catch (error) {
+      if (error?.status === 404) return { status: 404, reason: 'process_not_found' };
+      throw error;
+    }
+    await this.storage.transaction(async tx => {
+      const current = await tx.get(leaseKey);
+      if (current?.state !== 'active' || current.machineId !== lease.machineId) return;
+      const cancelled = [...(current.cancelledProcessIds ?? []).filter(item => item !== processId), processId].slice(-64);
+      await tx.put(leaseKey, { ...current, cancelledProcessIds: cancelled });
+    });
+    return { status: 200, cancelled: true };
   }
   async sweep() {
     for (const lease of await records(this.storage, 'external-lease:')) {
@@ -268,6 +316,17 @@ export class ExternalService {
           const box = await this.storage.get(`project:${lease.project}:box:${lease.machineId}`);
           if (current?.state === 'booting' && current.releaseRequested && this.now() - box?.since >= 600000) await this.fence.destroy(lease.project, lease.client, lease.id);
           else if (current?.state === 'booting') await this.starts.ready(lease.client, lease.id);
+        } else if (lease.state === 'held') {
+          // A held box is deleted when its bound ends; the box purge settles its
+          // spend at that moment, so the extra seconds are charged to the same
+          // reservation the start was admitted against.
+          const project = this.router.projects.get(lease.project);
+          const box = await this.storage.get(`project:${lease.project}:box:${lease.machineId}`);
+          // A box the provider already purged leaves nothing to hold: close the
+          // lease so it stops counting against maxActive.
+          if (!box || box.state === 'deleted') await this.leases.transition(lease.client, lease.id, ['held'], 'closed');
+          else if (!Number.isFinite(lease.heldUntil) || this.now() >= lease.heldUntil) await this.fence.destroy(lease.project, lease.client, lease.id, 'hold_expired');
+          else await project?.storage.setAlarm(lease.heldUntil);
         } else if (lease.state === 'active' && expired) await this.release(lease.client, lease.id);
         else if (lease.state === 'cleaning') {
           const box = await this.storage.get(`project:${lease.project}:box:${lease.machineId}`);
