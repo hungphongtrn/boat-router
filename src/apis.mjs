@@ -187,7 +187,7 @@ export class APIs {
         (browser && (!/^[a-f0-9]{64}$/.test(snapshot.browserManifestSha256 ?? '') || !/^[a-f0-9]{64}$/.test(snapshot.profileSha256 ?? '') || job.routerReusable !== true)) || (!lease && !browser && !rollingLease && (snapshot.kind != null || snapshot.profileSha256 != null || snapshot.browserManifestSha256 != null)) || job.routerResetMode === 'docker' || job.routerDockerAccess === true)) throw new TypeError('invalid snapshot');
       // Boat's noEnv only suppresses the account's stored secrets; a dev lease's
       // key still reaches the box through create.body.env. See
-      // https://docs.boat.dev/api/reference/agent/create-sandbox ("pass env to
+      // https://docs.boat.dev/api/reference/sandboxes/create-sandbox ("pass env to
       // give the sandbox a secret of its own").
       body = { type: job.machineSize ?? job.size, ttlSeconds: ttl, noEnv: true, snapshots: false, monitoring: false,
         failFast: job.failFast !== false, setupScript: snapshot ? snapshotBootstrap(snapshot.manifestSha256, { reusable: job.routerReusable === true, ...(job.noTailnet === true ? { noTailnet: true } : {}), ...(lease || browser ? { leaseProfileSha256: snapshot.profileSha256 } : {}), ...(browser ? { browserManifestSha256: snapshot.browserManifestSha256 } : {}) }) : job.routerResetMode === 'docker' || job.routerDockerAccess === true ? dockerBootstrap() : job.routerReusable ? reuseBootstrap() : bootstrap(), ...(snapshot ? { from: snapshot.name, env: job.devEnv ?? {} } : job.devEnv ? { env: job.devEnv } : {}), ...(job.routerCreateName ? { name: job.routerCreateName } : {}), ...(network ? { network } : {}) };
