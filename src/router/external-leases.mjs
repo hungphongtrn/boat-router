@@ -314,12 +314,22 @@ export class ExternalLeaseStarts {
         if (!/^bx_[23456789abcdefghjkmnpqrstuvwxyz]{8}$/.test(sandbox?.id ?? '')) throw new Error('invalid sandbox');
       } catch (error) {
         const refused = error?.service === 'boat' && ((error.status >= 400 && error.status < 500 && ![408, 409].includes(error.status)) || error.code === 'request_not_sent');
+        // failFast answers "no machine of this type is ready" with 503 and creates
+        // nothing billed or counted, so the start is retryable: return the lease
+        // to the queue instead of pinning it in starting until it expires.
+        const noCapacity = error?.service === 'boat' && error.status === 503 && error.code === 'no_ready_machine';
         // a secondary refusal (no credit, plan, rate) parks the secondary account for later leases.
         if (refused && lease.account === 'secondary' && [402, 403, 429].includes(error.status) && typeof this.ledger.blockAccount === 'function') {
           try { await this.ledger.blockAccount('secondary', `lease_${error.status}`, error.status === 429 ? Math.max(30_000, Math.min(900_000, (error.retrySeconds ?? 0) * 1000)) : undefined); } catch {}
         }
-        await this.ledger.resolve(lease.claimKey, refused ? 'not_created' : 'unknown');
+        await this.ledger.resolve(lease.claimKey, refused || noCapacity ? 'not_created' : 'unknown');
         if (refused) await this.storage.put(key, { ...lease, state: 'closed' });
+        else if (noCapacity) await this.storage.transaction(async tx => {
+          const current = await tx.get(key);
+          if (current?.state !== 'starting' || current.claimKey !== lease.claimKey) return;
+          const { createKey, claimKey, routerCreateName, account: unusedAccount, ...waiting } = current;
+          await tx.put(key, { ...waiting, state: 'waiting', lastReason: 'start_capacity' });
+        });
         return false;
       }
     } else {

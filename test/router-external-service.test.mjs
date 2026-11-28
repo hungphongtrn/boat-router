@@ -664,6 +664,26 @@ test('a refused provider create refunds its spend reservation and the lease rele
   assert.equal(await service.release('compute', id), true);
 });
 
+// failFast creates answer "no machine of this type is ready" with 503 and
+// create nothing, so the lease must return to the queue and retry on a later
+// tick instead of sitting in starting until it expires.
+test('a fail-fast create that found no machine re-queues the lease', async () => {
+  const { storage, projectStorage, service } = setup();
+  service.clients.compute.ttlSeconds = 1800; service.clients.compute.machineTtlSeconds = 1800;
+  await projectStorage.put('pool:mode', 'on');
+  await projectStorage.put('pool:snapshot', { complete: true, at: 10_000, runners: [] });
+  service.api.limits = async () => ({ canStart: true, activeSandboxes: 0, maxActiveSandboxes: 10, machineTypes: [{ type: 'default', available: true }], starts: Object.fromEntries(['minute', 'hour', 'day'].map(name => [name, { limit: 10, used: 0 }])) });
+  service.api.create = async () => { throw Object.assign(new Error('no machine'), { service: 'boat', status: 503, code: 'no_ready_machine' }); };
+  assert.equal(await service.claim('compute', id, 'default'), null);
+  const lease = await storage.get(`external-lease:compute:${id}`);
+  assert.equal(lease.state, 'waiting');
+  assert.equal(lease.lastReason, 'start_capacity');
+  assert.equal(lease.machineId ?? null, null);
+  assert.equal(lease.claimKey ?? null, null);
+  assert.equal(lease.createKey ?? null, null);
+  assert.equal(await service.pendingReason('compute', id, 'default'), 'start_capacity');
+});
+
 test('a created lease settles to its elapsed lifetime on the ledger', async () => {
   const { storage, projectStorage, service } = setup();
   service.clients.compute.ttlSeconds = 1800; service.clients.compute.machineTtlSeconds = 1800;
