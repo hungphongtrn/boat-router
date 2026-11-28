@@ -1,6 +1,7 @@
 import { transition as applyBoxEvent } from './box-state.mjs';
 import { leaseBase } from './lease-base.mjs';
 import { browserBase } from './browser-base.mjs';
+import { validLeaseSnapshot } from './lease-snapshot.mjs';
 
 // Durable reservations are retained through cleanup, including uncertain creates.
 export class ExternalLeases {
@@ -214,12 +215,19 @@ export class ExternalLeaseStarts {
   async leaseIdentity(lease, account = 'primary') {
     if (!lease.baseId) return true;
     const selected = lease.routerSnapshot;
-    const computed = selected?.kind === 'browser-v1' ? await browserBase({ BROWSER_BASE_SNAPSHOT_NAME: selected?.name, BROWSER_BASE_SNAPSHOT_ID: selected?.snapshotId, BROWSER_BASE_TOOLCHAIN_SHA256: selected?.manifestSha256, BROWSER_BASE_FILES_SHA256: selected?.browserManifestSha256, BROWSER_BASE_PROFILE_SHA256: selected?.profileSha256 }) : await leaseBase({ LEASE_BASE_SNAPSHOT_NAME: selected?.name, LEASE_BASE_SNAPSHOT_ID: selected?.snapshotId, LEASE_BASE_MANIFEST_SHA256: selected?.manifestSha256, LEASE_BASE_PROFILE_SHA256: selected?.profileSha256 });
-    if (computed?.baseId !== lease.baseId || typeof this.api.forIdentity !== 'function') return false;
+    if (!validLeaseSnapshot(selected)) return false;
+    // A rolling generation's base identity is its manifest digest, already
+    // encoded in the name; the base kinds recompute theirs from the tuple.
+    const computed = selected.kind === 'peek-ci' ? { baseId: selected.manifestSha256 } : selected.kind === 'browser-v1' ? await browserBase({ BROWSER_BASE_SNAPSHOT_NAME: selected?.name, BROWSER_BASE_SNAPSHOT_ID: selected?.snapshotId, BROWSER_BASE_TOOLCHAIN_SHA256: selected?.manifestSha256, BROWSER_BASE_FILES_SHA256: selected?.browserManifestSha256, BROWSER_BASE_PROFILE_SHA256: selected?.profileSha256 }) : await leaseBase({ LEASE_BASE_SNAPSHOT_NAME: selected?.name, LEASE_BASE_SNAPSHOT_ID: selected?.snapshotId, LEASE_BASE_MANIFEST_SHA256: selected?.manifestSha256, LEASE_BASE_PROFILE_SHA256: selected?.profileSha256 });
+    if (computed?.baseId !== lease.baseId) return false;
     const expectedId = account === 'secondary' ? this.secondaryBase(lease)?.snapshotId : selected.snapshotId;
     if (!expectedId) return false;
+    // A single-account router has no account switch and reads the primary
+    // account directly; only a secondary snapshot needs the switch.
+    let api = this.api;
+    if (typeof this.api.forIdentity === 'function') api = await this.api.forIdentity({ account });
+    else if (account !== 'primary') return false;
     try {
-      const api = await this.api.forIdentity({ account });
       const found = (await api.request('boat', `/saved-snapshots/${encodeURIComponent(selected.name)}`))?.snapshot;
       return found?.status === 'ready' && found.snapshotId === expectedId;
     } catch { return false; }
@@ -230,9 +238,8 @@ export class ExternalLeaseStarts {
     if (!lease || !['reserved', 'starting'].includes(lease.state) || (lease.state === 'reserved' && (lease.expiresAt <= this.now() || lease.releaseRequested))) return false;
     // A selected base must have a complete, durable snapshot selection before
     // any ledger admission or provider call. Never fall back to a plain box.
-    const validSelection = !((lease.baseId != null || lease.routerSnapshot != null) && (!/^[a-f0-9]{64}$/.test(lease.baseId ?? '') || !['lease-v1','browser-v1'].includes(lease.routerSnapshot?.kind) ||
-      !(lease.routerSnapshot?.kind === 'browser-v1' ? /^browser-ci-\d{8}-[a-f0-9]{8,64}$/ : /^lease-ci-\d{8}-[a-f0-9]{8,64}$/).test(lease.routerSnapshot?.name ?? '') || !/^[a-f0-9]{64}$/.test(lease.routerSnapshot?.manifestSha256 ?? '') ||
-      !/^[a-f0-9]{64}$/.test(lease.routerSnapshot?.profileSha256 ?? '') || (lease.routerSnapshot?.kind === 'browser-v1' && !/^[a-f0-9]{64}$/.test(lease.routerSnapshot?.browserManifestSha256 ?? '')) || lease.isolation !== 'external-v2'));
+    const validSelection = !((lease.baseId != null || lease.routerSnapshot != null) && (!/^[a-f0-9]{64}$/.test(lease.baseId ?? '') || !validLeaseSnapshot(lease.routerSnapshot) || (lease.routerSnapshot?.kind !== 'peek-ci' && lease.isolation !== 'external-v2')))
+      && !(lease.rollingSnapshot === true && lease.routerSnapshot?.kind !== 'peek-ci');
     const identityAtStart = validSelection && (!(lease.baseId || lease.routerSnapshot) || !lease.account || lease.account === 'primary' || (lease.account === 'secondary' && this.secondaryBase(lease))) && await this.leaseIdentity(lease, lease.account === 'secondary' ? 'secondary' : 'primary');
     if (!identityAtStart && lease.state === 'reserved') return false;
     if (lease.state === 'reserved') {
@@ -300,17 +307,32 @@ export class ExternalLeaseStarts {
     if (claim.status === 'pending') {
       if (!await this.ledger.begin(project, lease.claimKey)) return false;
       try {
-        const result = await this.api.create({ ...(lease.account ? { account: lease.account } : {}), createKey: lease.createKey, routerCreateName: lease.routerCreateName, machineSize: size, routerReusable: lease.isolation === 'external-v2', ...(lease.routerSnapshot ? { routerSnapshot: lease.routerSnapshot } : {}) }, lease.machineTtlSeconds ?? ttlSeconds);
+        // A lease box is created for a client: no environment, no tailnet identity
+        // on its disk, and only the client's own registry network policy.
+        // A lease claim already answers 202 while the box starts, so the create
+        // waits for a machine: a fail-fast create answers no_ready_machine
+        // whenever none is instantly free, creates nothing, and the lease never boots.
+        const result = await this.api.create({ ...(lease.account ? { account: lease.account } : {}), createKey: lease.createKey, routerCreateName: lease.routerCreateName, machineSize: size, routerReusable: lease.isolation === 'external-v2', noTailnet: true, failFast: false, ...(lease.network ? { network: lease.network } : {}), ...(lease.routerSnapshot ? { routerSnapshot: lease.routerSnapshot } : {}) }, lease.machineTtlSeconds ?? ttlSeconds);
         sandbox = result?.sandbox;
         if (!/^bx_[23456789abcdefghjkmnpqrstuvwxyz]{8}$/.test(sandbox?.id ?? '')) throw new Error('invalid sandbox');
       } catch (error) {
         const refused = error?.service === 'boat' && ((error.status >= 400 && error.status < 500 && ![408, 409].includes(error.status)) || error.code === 'request_not_sent');
+        // failFast answers "no machine of this type is ready" with 503 and creates
+        // nothing billed or counted, so the start is retryable: return the lease
+        // to the queue instead of pinning it in starting until it expires.
+        const noCapacity = error?.service === 'boat' && error.status === 503 && error.code === 'no_ready_machine';
         // a secondary refusal (no credit, plan, rate) parks the secondary account for later leases.
         if (refused && lease.account === 'secondary' && [402, 403, 429].includes(error.status) && typeof this.ledger.blockAccount === 'function') {
           try { await this.ledger.blockAccount('secondary', `lease_${error.status}`, error.status === 429 ? Math.max(30_000, Math.min(900_000, (error.retrySeconds ?? 0) * 1000)) : undefined); } catch {}
         }
-        await this.ledger.resolve(lease.claimKey, refused ? 'not_created' : 'unknown');
+        await this.ledger.resolve(lease.claimKey, refused || noCapacity ? 'not_created' : 'unknown');
         if (refused) await this.storage.put(key, { ...lease, state: 'closed' });
+        else if (noCapacity) await this.storage.transaction(async tx => {
+          const current = await tx.get(key);
+          if (current?.state !== 'starting' || current.claimKey !== lease.claimKey) return;
+          const { createKey, claimKey, routerCreateName, account: unusedAccount, ...waiting } = current;
+          await tx.put(key, { ...waiting, state: 'waiting', lastReason: 'start_capacity' });
+        });
         return false;
       }
     } else {

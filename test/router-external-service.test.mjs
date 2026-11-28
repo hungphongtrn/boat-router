@@ -6,6 +6,15 @@ import { AccountLedger } from '../src/router/ledger.mjs';
 import { ExternalService } from '../src/router/external-service.mjs';
 
 const id = '00000000-0000-4000-8000-000000000001';
+
+const alphabet = 'abcdefghijklmnopqrstuvwxyz234567';
+function rollingName(manifestSha256) {
+  const value = BigInt(`0x${manifestSha256}`) << 4n;
+  let encoded = '';
+  for (let index = 51; index >= 0; index--) encoded += alphabet[Number((value >> BigInt(index * 5)) & 31n)];
+  return `peek-ci-${encoded}`;
+}
+
 function setup() {
   let time = 10_000; const now = () => time;
   const storage = new Storage(), projectStorage = new TenantStorage(storage, 'project-a');
@@ -481,4 +490,307 @@ test('open queue defers an HTTP lease start to the ordered admission tick', asyn
   await service.admitStart(entries[0]);
   assert.equal(starts, 1);
   assert.equal((await storage.get(`external-lease:compute:${id}`)).state, 'booting');
+});
+
+test('lease sizes accept small, default and large but never xlarge', async () => {
+  for (const [size, accepted] of [['small', true], ['default', true], ['large', true], ['xlarge', false], ['huge', false]]) {
+    const { storage, projectStorage, service } = setup();
+    projectStorage.put('pool:mode', 'on');
+    await projectStorage.put('pool:snapshot', { complete: true, at: 10_000, runners: [] });
+    service.api.limits = async () => ({ canStart: false });
+    assert.equal(await service.claim('compute', id, size), null, size);
+    const lease = await storage.get(`external-lease:compute:${id}`);
+    assert.equal(Boolean(lease), accepted, size);
+    if (accepted) assert.equal(lease.size, size, size);
+  }
+});
+
+test('a rolling claim with no ready generation waits and never starts a plain box', async () => {
+  const { storage, projectStorage, service } = setup();
+  await projectStorage.put('pool:mode', 'on');
+  await projectStorage.put('pool:snapshot', { complete: true, at: 10_000, runners: [] });
+  let starts = 0;
+  service.api.limits = async () => ({ canStart: true, activeSandboxes: 0, maxActiveSandboxes: 10, machineTypes: [{ type: 'default', available: true }], starts: Object.fromEntries(['minute', 'hour', 'day'].map(name => [name, { limit: 10, used: 0 }])) });
+  service.api.create = async () => { starts++; return { sandbox: { id: 'bx_23456789' } }; };
+  assert.equal(await service.claim('compute', id, 'default', 'external-v2', null, false, null, true), null);
+  const lease = await storage.get(`external-lease:compute:${id}`);
+  assert.equal(lease.state, 'waiting');
+  assert.equal(lease.rollingSnapshot, true);
+  assert.equal(lease.lastReason, 'ci_snapshot_unavailable');
+  assert.equal(starts, 0);
+  assert.equal(await service.pendingReason('compute', id, 'default'), 'ci_snapshot_unavailable');
+});
+
+// A complete snapshot is evidence that the scan loop is alive, and the loop
+// rescans every refresh cycle: one minute when the router polls GitHub, fifteen
+// when repository webhooks carry the queue. A fixed 90 s bound refused every
+// lease outside the first 90 s after each webhook-mode scan.
+test('a webhook-mode snapshot is ready for one refresh cycle', async () => {
+  const { storage, projectStorage, service, setTime } = setup();
+  service.router.account.openStartQueue = true;
+  service.router.projects.get('project-a').config.snapshotIntervalMs = 15 * 60_000;
+  await projectStorage.put('pool:mode', 'on');
+  await projectStorage.put('pool:snapshot', { complete: true, at: 10_000, runners: [] });
+  setTime(10_000 + 10 * 60_000);
+  assert.equal(await service.claim('compute', id, 'default'), null);
+  assert.equal((await storage.get(`external-lease:compute:${id}`))?.state, 'reserved');
+  assert.notEqual(await service.pendingReason('compute', id, 'default'), 'ci_snapshot_unavailable');
+});
+
+test('a snapshot older than one webhook refresh cycle and its grace is not ready', async () => {
+  const { storage, projectStorage, service, setTime } = setup();
+  service.router.account.openStartQueue = true;
+  service.router.projects.get('project-a').config.snapshotIntervalMs = 15 * 60_000;
+  await projectStorage.put('pool:mode', 'on');
+  await projectStorage.put('pool:snapshot', { complete: true, at: 10_000, runners: [] });
+  setTime(10_000 + 15 * 60_000 + 30_000 + 1);
+  assert.equal(await service.claim('compute', id, 'default'), null);
+  assert.equal(await storage.get(`external-lease:compute:${id}`), undefined);
+  assert.equal(await service.pendingReason('compute', id, 'default'), 'ci_snapshot_unavailable');
+});
+
+test('a poll-mode project keeps its 90 second snapshot bound', async () => {
+  const reserveAt = async age => {
+    const { storage, projectStorage, service, setTime } = setup();
+    service.router.account.openStartQueue = true;
+    await projectStorage.put('pool:mode', 'on');
+    await projectStorage.put('pool:snapshot', { complete: true, at: 10_000, runners: [] });
+    setTime(10_000 + age);
+    assert.equal(await service.claim('compute', id, 'default'), null);
+    return Boolean(await storage.get(`external-lease:compute:${id}`));
+  };
+  assert.equal(await reserveAt(90_000), true);
+  assert.equal(await reserveAt(90_001), false);
+});
+
+test('a webhook snapshot gates an idle CI pool on its own refresh cycle', async () => {
+  const { projectStorage, service, setTime } = setup();
+  service.router.projects.get('project-a').config.snapshotIntervalMs = 15 * 60_000;
+  await projectStorage.put('pool:mode', 'on');
+  await projectStorage.put('pool:snapshot', { complete: true, at: 10_000, runners: [] });
+  setTime(10_000 + 10 * 60_000);
+  assert.equal(await service.ciIdle('default'), true);
+  setTime(10_000 + 15 * 60_000 + 30_001);
+  assert.equal(await service.ciIdle('default'), false);
+});
+
+test('queued CI reclaims a warm lease box while the webhook snapshot is current', async () => {
+  const { projectStorage, service, setTime } = setup();
+  service.router.projects.get('project-a').config.snapshotIntervalMs = 15 * 60_000;
+  await projectStorage.put('pool:mode', 'on');
+  await projectStorage.put('pool:snapshot', { complete: true, at: 10_000, runners: [] });
+  await projectStorage.put('pool:status:boat-default', { reuseIdleHoldSeconds: 3600 });
+  await projectStorage.put('gh-job:9', { id: 9, status: 'queued', queuedAt: 9_000, pool: '["a/b","boat-default"]' });
+  await projectStorage.put('box:bx_23456789', { machineId: 'bx_23456789', pool: '["a/b","boat-default"]', state: 'lease-warm', size: 'default', leaseClient: 'compute', createdAt: 1, since: 9_000, baselineHash: 'a'.repeat(64), generation: 2, reusable: true });
+  setTime(10_000 + 10 * 60_000);
+  await service.sweep();
+  assert.equal((await projectStorage.get('box:bx_23456789')).state, 'ready');
+});
+
+test('a rolling claim boots the stored peek-ci generation it selected', async () => {
+  const { storage, projectStorage, service } = setup();
+  await projectStorage.put('pool:mode', 'on');
+  await projectStorage.put('pool:snapshot', { complete: true, at: 10_000, runners: [] });
+  const manifestSha256 = 'd'.repeat(64);
+  const selection = { baseId: manifestSha256, rollingSnapshot: true, account: 'primary', routerSnapshot: { kind: 'peek-ci', name: rollingName(manifestSha256), snapshotId: 'snapshot-id', manifestSha256 } };
+  let request;
+  service.api.forIdentity = async () => ({ request: async () => ({ snapshot: { status: 'ready', snapshotId: 'snapshot-id' } }) });
+  service.api.limits = async () => ({ canStart: true, activeSandboxes: 0, maxActiveSandboxes: 10, machineTypes: [{ type: 'default', available: true }], starts: Object.fromEntries(['minute', 'hour', 'day'].map(name => [name, { limit: 10, used: 0 }])) });
+  service.api.create = async job => { request = job; return { sandbox: { id: 'bx_23456789' } }; };
+  assert.equal(await service.claim('compute', id, 'default', 'external-v2', null, false, selection, true), null);
+  const lease = await storage.get(`external-lease:compute:${id}`);
+  assert.deepEqual(lease.routerSnapshot, selection.routerSnapshot);
+  assert.equal(lease.state, 'booting');
+  assert.deepEqual(request.routerSnapshot, selection.routerSnapshot);
+  // The claim already answers 202 while the box starts, so the create must wait
+  // for a machine rather than fail fast: a fail-fast create answers
+  // no_ready_machine whenever no machine is instantly free, creates nothing,
+  // and the lease never boots.
+  assert.equal(request.failFast, false);
+});
+
+// A single-account router has no account switch, so the identity check may not
+// depend on one: without this, every snapshot-selected lease stayed reserved
+// until it expired, on every tick, and no box was ever created.
+test('a single-account router verifies a rolling generation without an account switch', async () => {
+  const { storage, projectStorage, service } = setup();
+  await projectStorage.put('pool:mode', 'on');
+  await projectStorage.put('pool:snapshot', { complete: true, at: 10_000, runners: [] });
+  const manifestSha256 = 'd'.repeat(64);
+  const selection = { baseId: manifestSha256, rollingSnapshot: true, account: 'primary', routerSnapshot: { kind: 'peek-ci', name: rollingName(manifestSha256), snapshotId: 'snapshot-id', manifestSha256 } };
+  let asked = null, created = null;
+  service.api.request = async (name, path) => { asked = { name, path }; return { snapshot: { status: 'ready', snapshotId: 'snapshot-id' } }; };
+  service.api.limits = async () => ({ canStart: true, activeSandboxes: 0, maxActiveSandboxes: 10, machineTypes: [{ type: 'default', available: true }], starts: Object.fromEntries(['minute', 'hour', 'day'].map(name => [name, { limit: 10, used: 0 }])) });
+  service.api.create = async job => { created = job; return { sandbox: { id: 'bx_23456789' } }; };
+  assert.equal(await service.claim('compute', id, 'default', 'external-v2', null, false, selection, true), null);
+  const lease = await storage.get(`external-lease:compute:${id}`);
+  assert.equal(lease.state, 'booting');
+  assert.deepEqual(asked, { name: 'boat', path: '/saved-snapshots/' + encodeURIComponent(selection.routerSnapshot.name) });
+  assert.deepEqual(created.routerSnapshot, selection.routerSnapshot);
+});
+
+test('a spend ceiling refusal stays pending with no box and no reserved money', async () => {
+  const { storage, projectStorage, service } = setup();
+  service.clients.compute.ttlSeconds = 1800; service.clients.compute.machineTtlSeconds = 1800;
+  const spend = { monthlyUsd: 20, machineHourUsd: { small: 0.018, default: 0.036, large: 0.072, xlarge: 0.2 }, snapshotDayUsd: 0.056, snapshotRetentionDays: 30 };
+  const ledger = new AccountLedger(storage, { starts: { minute: 10, hour: 10, day: 10 }, externalClients: service.clients, spend }, () => 10_000);
+  service.ledger = ledger; service.starts.ledger = ledger;
+  await storage.put('account:ledger', { claims: {}, waiting: [], spendReservations: { seed: { project: 'project-a', kind: 'machine', size: 'default', ttlSeconds: 7200, amountUsd: 19.99, at: 10_000, status: 'reserved' } } });
+  await projectStorage.put('pool:mode', 'on');
+  await projectStorage.put('pool:snapshot', { complete: true, at: 10_000, runners: [] });
+  let starts = 0;
+  service.api.limits = async () => ({ canStart: true, activeSandboxes: 0, maxActiveSandboxes: 10, overagePrices: { vmHourDollars: 0.036 }, machineTypes: [{ type: 'default', available: true }], starts: Object.fromEntries(['minute', 'hour', 'day'].map(name => [name, { limit: 10, used: 0 }])) });
+  service.api.create = async () => { starts++; return { sandbox: { id: 'bx_23456789' } }; };
+  assert.equal(await service.claim('compute', id, 'default'), null);
+  assert.equal(starts, 0);
+  const lease = await storage.get(`external-lease:compute:${id}`);
+  assert.equal(lease.lastReason, 'spend_budget');
+  assert.equal(await service.pendingReason('compute', id, 'default'), 'spend_budget');
+  const status = await ledger.spendStatus();
+  assert.equal(status.records.length, 1, 'no reservation was added');
+  assert.equal(status.records[0].amountUsd, 19.99);
+  assert.equal(storage.data.has('project:project-a:box:bx_23456789'), false);
+});
+
+test('a refused provider create refunds its spend reservation and the lease releases', async () => {
+  const { storage, projectStorage, service } = setup();
+  service.clients.compute.ttlSeconds = 1800; service.clients.compute.machineTtlSeconds = 1800;
+  const spend = { monthlyUsd: 20, machineHourUsd: { small: 0.018, default: 0.036, large: 0.072, xlarge: 0.2 }, snapshotDayUsd: 0.056, snapshotRetentionDays: 30 };
+  const ledger = new AccountLedger(storage, { starts: { minute: 10, hour: 10, day: 10 }, externalClients: service.clients, spend }, () => 10_000);
+  service.ledger = ledger; service.starts.ledger = ledger;
+  await projectStorage.put('pool:mode', 'on');
+  await projectStorage.put('pool:snapshot', { complete: true, at: 10_000, runners: [] });
+  service.api.limits = async () => ({ canStart: true, activeSandboxes: 0, maxActiveSandboxes: 10, overagePrices: { vmHourDollars: 0.036 }, machineTypes: [{ type: 'default', available: true }], starts: Object.fromEntries(['minute', 'hour', 'day'].map(name => [name, { limit: 10, used: 0 }])) });
+  service.api.create = async () => { throw Object.assign(new Error('refused'), { service: 'boat', status: 402 }); };
+  assert.equal(await service.claim('compute', id, 'default'), null);
+  const lease = await storage.get(`external-lease:compute:${id}`);
+  assert.equal(lease.state, 'closed');
+  assert.equal((await ledger.spendStatus()).records.length, 0, 'the pending charge is refunded');
+  assert.equal(await service.release('compute', id), true);
+});
+
+// failFast creates answer "no machine of this type is ready" with 503 and
+// create nothing, so the lease must return to the queue and retry on a later
+// tick instead of sitting in starting until it expires.
+test('a fail-fast create that found no machine re-queues the lease', async () => {
+  const { storage, projectStorage, service } = setup();
+  service.clients.compute.ttlSeconds = 1800; service.clients.compute.machineTtlSeconds = 1800;
+  await projectStorage.put('pool:mode', 'on');
+  await projectStorage.put('pool:snapshot', { complete: true, at: 10_000, runners: [] });
+  service.api.limits = async () => ({ canStart: true, activeSandboxes: 0, maxActiveSandboxes: 10, machineTypes: [{ type: 'default', available: true }], starts: Object.fromEntries(['minute', 'hour', 'day'].map(name => [name, { limit: 10, used: 0 }])) });
+  service.api.create = async () => { throw Object.assign(new Error('no machine'), { service: 'boat', status: 503, code: 'no_ready_machine' }); };
+  assert.equal(await service.claim('compute', id, 'default'), null);
+  const lease = await storage.get(`external-lease:compute:${id}`);
+  assert.equal(lease.state, 'waiting');
+  assert.equal(lease.lastReason, 'start_capacity');
+  assert.equal(lease.machineId ?? null, null);
+  assert.equal(lease.claimKey ?? null, null);
+  assert.equal(lease.createKey ?? null, null);
+  assert.equal(await service.pendingReason('compute', id, 'default'), 'start_capacity');
+});
+
+test('a created lease settles to its elapsed lifetime on the ledger', async () => {
+  const { storage, projectStorage, service } = setup();
+  service.clients.compute.ttlSeconds = 1800; service.clients.compute.machineTtlSeconds = 1800;
+  const spend = { monthlyUsd: 20, machineHourUsd: { small: 0.018, default: 0.036, large: 0.072, xlarge: 0.2 }, snapshotDayUsd: 0.056, snapshotRetentionDays: 30 };
+  const ledger = new AccountLedger(storage, { starts: { minute: 10, hour: 10, day: 10 }, externalClients: service.clients, spend }, () => 10_000);
+  service.ledger = ledger; service.starts.ledger = ledger;
+  await projectStorage.put('pool:mode', 'on');
+  await projectStorage.put('pool:snapshot', { complete: true, at: 10_000, runners: [] });
+  service.api.limits = async () => ({ canStart: true, activeSandboxes: 0, maxActiveSandboxes: 10, overagePrices: { vmHourDollars: 0.036 }, machineTypes: [{ type: 'default', available: true }], starts: Object.fromEntries(['minute', 'hour', 'day'].map(name => [name, { limit: 10, used: 0 }])) });
+  service.api.create = async () => ({ sandbox: { id: 'bx_23456789' } });
+  assert.equal(await service.claim('compute', id, 'default'), null);
+  const lease = await storage.get(`external-lease:compute:${id}`);
+  assert.equal(lease.state, 'booting');
+  const reserved = (await ledger.spendStatus()).records[0];
+  assert.equal(reserved.amountUsd, 0.018);
+  // The box deletion path settles the created claim with conservative elapsed time.
+  await ledger.resolve(lease.claimKey, 'created', { elapsedSeconds: 60 });
+  const settled = (await ledger.spendStatus()).records[0];
+  assert.ok(settled.amountUsd < reserved.amountUsd);
+  assert.equal(settled.elapsedSeconds, 60);
+});
+
+const otherId = '00000000-0000-4000-8000-000000000002';
+
+test('releasing a rolling lease deletes its box instead of warming it', async () => {
+  const { storage, projectStorage, service } = setup();
+  await projectStorage.put('pool:mode', 'on');
+  service.clients.compute.warmReuse = true;
+  const key = 'bx_23456789';
+  await storage.put(`project:project-a:box:${key}`, { machineId: key, leaseId: id, leaseClient: 'compute', state: 'leased', generation: 0, createdAt: 1, baselineHash: 'hash' });
+  await storage.put(`external-lease:compute:${id}`, { id, client: 'compute', project: 'project-a', state: 'active', machineId: key, expiresAt: 70_000, isolation: 'external-v2', rollingSnapshot: true });
+  let resets = 0; service.api.lightReset = async () => { resets++; return { processId: 9 }; };
+  assert.equal(await service.release('compute', id), true);
+  assert.equal(resets, 0, 'a rolling lease never returns to the warm pool');
+  assert.equal((await projectStorage.get(`box:${key}`)).state, 'destroying');
+  assert.equal((await storage.get(`external-lease:compute:${id}`)).state, 'cleaning');
+});
+
+test('a bounded keep-on-fail hold keeps the box for debugging and deletes it at its bound', async () => {
+  const { storage, projectStorage, service, setTime } = setup();
+  await projectStorage.put('pool:mode', 'on');
+  const key = 'bx_23456789', leaseKey = `external-lease:compute:${id}`, boxKey = `project:project-a:box:${key}`;
+  await storage.put(boxKey, { machineId: key, leaseId: id, leaseClient: 'compute', state: 'leased', generation: 0, createdAt: 1, baselineHash: 'hash' });
+  await storage.put(leaseKey, { id, client: 'compute', project: 'project-a', state: 'active', machineId: key, expiresAt: 70_000, isolation: 'external-v2' });
+  let resets = 0; service.api.lightReset = async () => { resets++; return { processId: 9 }; };
+  const requests = [];
+  const held = await service.release('compute', id, 900, { request: async (...args) => { requests.push(args); return {}; } });
+  assert.equal(held.heldUntil, 910_000);
+  assert.deepEqual(requests, [['boat', `/sandboxes/${key}`, { method: 'PATCH', body: { ttlSeconds: 900 } }]]);
+  const lease = await storage.get(leaseKey);
+  assert.equal(lease.state, 'held');
+  assert.equal(lease.heldUntil, 910_000);
+  assert.equal(await projectStorage.getAlarm(), 910_000);
+  assert.equal((await storage.get(boxKey)).state, 'leased');
+  assert.equal(resets, 0, 'a held box is never reset for the warm pool');
+  assert.equal(await service.pendingReason('compute', id, 'default'), 'lease_held');
+  assert.equal(await service.leases.renew('compute', id, 60_000), null, 'renew is refused during a hold');
+  assert.equal(await service.leases.reserve('compute', otherId, 1, 5000), null, 'a hold counts against maxActive');
+  setTime(909_999); await service.sweep();
+  assert.equal((await storage.get(leaseKey)).state, 'held');
+  setTime(910_000); await service.sweep();
+  assert.equal((await storage.get(leaseKey)).state, 'cleaning');
+  const destroyed = await storage.get(boxKey);
+  assert.equal(destroyed.state, 'destroying');
+  assert.equal(destroyed.retirementReason, 'hold_expired');
+  assert.equal(destroyed.history.some(item => item.event === 'lease_return'), false);
+});
+
+test('a held lease is deleted at once when it is released without a keep', async () => {
+  const { storage, service } = setup();
+  const key = 'bx_23456789', leaseKey = `external-lease:compute:${id}`, boxKey = `project:project-a:box:${key}`;
+  await storage.put(boxKey, { machineId: key, leaseId: id, leaseClient: 'compute', state: 'leased', generation: 0 });
+  await storage.put(leaseKey, { id, client: 'compute', project: 'project-a', state: 'held', machineId: key, expiresAt: 70_000, heldUntil: 910_000 });
+  assert.equal(await service.release('compute', id), true);
+  assert.equal((await storage.get(leaseKey)).state, 'cleaning');
+  assert.equal((await storage.get(boxKey)).state, 'destroying');
+});
+
+test('cancel deletes an owned process and a repeat cancel is idempotent', async () => {
+  const { storage, service } = setup();
+  const key = 'bx_23456789', leaseKey = `external-lease:compute:${id}`;
+  await storage.put(leaseKey, { id, client: 'compute', project: 'project-a', state: 'active', machineId: key, expiresAt: 70_000 });
+  const calls = [];
+  service.api = { request: async (...args) => { calls.push(args); return {}; } };
+  assert.deepEqual(await service.cancel('compute', id, 7), { status: 200, cancelled: true });
+  assert.deepEqual(calls, [['boat', `/sandboxes/${key}/commands/7`, { method: 'DELETE' }]]);
+  assert.deepEqual(await service.cancel('compute', id, 7), { status: 200, cancelled: false });
+  assert.equal(calls.length, 1);
+  assert.deepEqual((await storage.get(leaseKey)).cancelledProcessIds, [7]);
+});
+
+test('cancel refuses another client, a held lease and a process the provider does not know', async () => {
+  const { storage, service } = setup();
+  const key = 'bx_23456789', leaseKey = `external-lease:compute:${id}`;
+  await storage.put(leaseKey, { id, client: 'compute', project: 'project-a', state: 'active', machineId: key, expiresAt: 70_000 });
+  let calls = 0; service.api = { request: async () => { calls++; return {}; } };
+  assert.deepEqual(await service.cancel('other', id, 7), { status: 404, reason: 'process_not_found' });
+  await storage.put(leaseKey, { id, client: 'compute', project: 'project-a', state: 'held', machineId: key, heldUntil: 70_000 });
+  assert.deepEqual(await service.cancel('compute', id, 7), { status: 404, reason: 'process_not_found' });
+  await storage.put(leaseKey, { id, client: 'compute', project: 'project-a', state: 'active', machineId: key, expiresAt: 70_000 });
+  service.api = { request: async () => { calls++; throw Object.assign(new Error('gone'), { status: 404 }); } };
+  assert.deepEqual(await service.cancel('compute', id, 7), { status: 404, reason: 'process_not_found' });
+  assert.equal((await storage.get(leaseKey)).cancelledProcessIds, undefined);
+  assert.equal(calls, 1);
 });

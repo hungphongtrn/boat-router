@@ -1,7 +1,23 @@
 import { setupPhaseHelpers, RUNNER_WORK_FOLDER } from './bootstrap.mjs';
 import { REFRESH_HELPER_IMAGE } from './router/reset-constants.mjs';
 
-export function snapshotBootstrap(manifestSha256, { reusable = false, leaseProfileSha256 = null, browserManifestSha256 = null } = {}) {
+// A lease boots a disk its client then drives, so the disk must carry no tailnet
+// identity: a leftover tailscaled state file or process would join our tailnet
+// from inside a client's box. Only the paths are probed; no file content is read.
+export const TAILSCALE_STATE = '/var/lib/tailscale/tailscaled.state';
+
+export function noTailnetAssertion(statePath = TAILSCALE_STATE) {
+  if (typeof statePath !== 'string' || !/^\/[A-Za-z0-9._\/-]{1,255}$/.test(statePath)) throw new TypeError('invalid tailscale state path');
+  // errexit ignores a failure whose value is inverted with "!", so the process
+  // probe reports its own failure instead of negating pgrep.
+  return `test ! -e ${statePath}
+if command -v pgrep >/dev/null 2>&1 && pgrep -x tailscaled >/dev/null 2>&1; then
+  printf 'BOAT_SETUP_FAILED tailscaled is running\\n' >&2
+  exit 1
+fi`;
+}
+
+export function snapshotBootstrap(manifestSha256, { reusable = false, leaseProfileSha256 = null, browserManifestSha256 = null, noTailnet = false } = {}) {
   if (!/^[a-f0-9]{64}$/.test(manifestSha256 ?? '')) throw new TypeError('invalid snapshot manifest hash');
   if (leaseProfileSha256 !== null && !/^[a-f0-9]{64}$/.test(leaseProfileSha256)) throw new TypeError('invalid lease profile hash');
   if (browserManifestSha256 !== null && !/^[a-f0-9]{64}$/.test(browserManifestSha256)) throw new TypeError('invalid browser manifest hash');
@@ -25,7 +41,9 @@ python3 /opt/boat-browser-v1/audit-browser-tree.py verify /opt/boat-browser-v1 /
 ` : ''}
 test ! -e /home/user/.boat-ci/jit
 test ! -e /home/user/.boat-ci/started
-test ! -e /home/user/.boat-ci/ready
+${noTailnet ? `phase snapshot_tailnet
+${noTailnetAssertion()}
+` : ''}test ! -e /home/user/.boat-ci/ready
 for registration in .runner .credentials .credentials_rsaparams .service; do
   test ! -e "/home/user/boat-ci-runner/$registration"
 done

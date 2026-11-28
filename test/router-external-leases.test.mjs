@@ -221,3 +221,107 @@ test('inconsistent waiters with a box or claim keep their slot', async () => {
     assert.equal((await store.get(`external-lease:compute:${a}`)).state, 'waiting');
   }
 });
+
+const alphabet = 'abcdefghijklmnopqrstuvwxyz234567';
+function rollingName(manifestSha256) {
+  const value = BigInt(`0x${manifestSha256}`) << 4n;
+  let encoded = '';
+  for (let index = 51; index >= 0; index--) encoded += alphabet[Number((value >> BigInt(index * 5)) & 31n)];
+  return `peek-ci-${encoded}`;
+}
+async function rollingSelection() {
+  const manifestSha256 = 'f'.repeat(64), name = rollingName(manifestSha256);
+  return { baseId: manifestSha256, rollingSnapshot: true, routerSnapshot: { kind: 'peek-ci', name, snapshotId: 'rolling-snapshot-id', manifestSha256 } };
+}
+
+test('a rolling lease starts from its stored peek-ci generation without a profile digest', async () => {
+  const store = new Storage(), now = () => 10_000;
+  const leases = new ExternalLeases(store, now);
+  await leases.reserve('compute', a, 1, 5000);
+  const selection = await rollingSelection();
+  await leases.transition('compute', a, ['reserved'], 'reserved', { ...selection, isolation: 'external-v2', account: 'primary' });
+  const ledger = new AccountLedger(store, { starts: { minute: 1, hour: 1, day: 1 }, externalClients: { compute: { startsPerDay: 1 } } }, now);
+  const limits = { at: now(), canStart: true, overagePrices: { vmHourDollars: 0.036 }, concurrency: { active: 0, limit: 10 }, windows: Object.fromEntries(['minute', 'hour', 'day'].map(k => [k, { limit: 5, used: 0 }])) };
+  let request, identityChecks = 0;
+  const api = {
+    forIdentity: async identity => {
+      assert.equal(identity.account, 'primary');
+      return { request: async () => { identityChecks++; return { snapshot: { status: 'ready', snapshotId: selection.routerSnapshot.snapshotId } }; } };
+    },
+    create: async job => { request = job; return { sandbox: { id: 'bx_23456789' } }; },
+  };
+  const starts = new ExternalLeaseStarts(store, ledger, api, now);
+  assert.equal(await starts.start('compute', a, 'project-a', 'default', '["repo","label"]', limits, 1800), true);
+  assert.deepEqual(request.routerSnapshot, selection.routerSnapshot);
+  assert.equal(identityChecks >= 1, true);
+  const box = await store.get('project:project-a:box:bx_23456789');
+  assert.deepEqual(box.routerSnapshot, selection.routerSnapshot);
+  assert.equal(box.baseId, selection.baseId);
+  assert.equal((await ledger.claim((await store.get(`external-lease:compute:${a}`)).claimKey)).status, 'created');
+});
+
+test('a rolling generation whose saved snapshot changed cannot spend a start', async () => {
+  const store = new Storage(), now = () => 10_000, leases = new ExternalLeases(store, now);
+  await leases.reserve('compute', a, 1, 5000);
+  const selection = await rollingSelection();
+  await leases.transition('compute', a, ['reserved'], 'reserved', { ...selection, isolation: 'external-v2' });
+  let created = 0;
+  const starts = new ExternalLeaseStarts(store, { claim: async () => ({ status: 'pending' }) }, {
+    forIdentity: async () => ({ request: async () => ({ snapshot: { status: 'ready', snapshotId: 'different' } }) }),
+    create: async () => { created++; return { sandbox: { id: 'bx_23456789' } }; },
+  }, now);
+  assert.equal(await starts.start('compute', a, 'project-a', 'default', '["repo","label"]', {}, 1800), false);
+  assert.equal(created, 0);
+});
+
+test('a rolling lease never starts plain when its generation is missing', async () => {
+  const store = new Storage(), now = () => 10_000, leases = new ExternalLeases(store, now);
+  await leases.reserve('compute', a, 1, 5000);
+  await leases.transition('compute', a, ['reserved'], 'reserved', { rollingSnapshot: true, size: 'default', isolation: 'external-v2' });
+  let created = 0;
+  const starts = new ExternalLeaseStarts(store, { claim: async () => ({ status: 'pending' }) }, { create: async () => { created++; } }, now);
+  assert.equal(await starts.start('compute', a, 'project-a', 'default', '["repo","label"]', {}, 1800), false);
+  assert.equal(created, 0);
+});
+
+test('a rolling selection whose name does not encode its digest is refused', async () => {
+  for (const routerSnapshot of [
+    { kind: 'peek-ci', name: 'peek-ci-' + 'a'.repeat(52), snapshotId: 's', manifestSha256: 'f'.repeat(64) },
+    { kind: 'peek-ci', name: 'peek-ci-20260101-abcd', snapshotId: 's', manifestSha256: 'f'.repeat(64) },
+    { kind: 'peek-ci', name: rollingName('f'.repeat(64)), snapshotId: 's', manifestSha256: 'e'.repeat(64) },
+  ]) {
+    const store = new Storage(), now = () => 10_000, leases = new ExternalLeases(store, now);
+    await leases.reserve('compute', a, 1, 5000);
+    await leases.transition('compute', a, ['reserved'], 'reserved', { baseId: 'f'.repeat(64), rollingSnapshot: true, routerSnapshot, isolation: 'external-v2' });
+    let created = 0;
+    const starts = new ExternalLeaseStarts(store, { claim: async () => ({ status: 'pending' }) }, { create: async () => { created++; } }, now);
+    assert.equal(await starts.start('compute', a, 'project-a', 'default', '["repo","label"]', {}, 1800), false);
+    assert.equal(created, 0);
+  }
+});
+
+test('a lease create carries its client network policy and the no-tailnet check', async () => {
+  const store = new Storage(), now = () => 10_000;
+  await new ExternalLeases(store, now).reserve('compute', a, 1, 5000);
+  const network = { mode: 'allow', inbound: 'boat-only', allow: ['registry.npmjs.org', '*.crates.io'] };
+  await store.put(`external-lease:compute:${a}`, { client: 'compute', id: a, state: 'reserved', size: 'default', network, createdAt: 1, expiresAt: 20_000 });
+  const ledger = new AccountLedger(store, { starts: { minute: 1, hour: 1, day: 1 }, externalClients: { compute: { startsPerDay: 1 } } }, now);
+  const limits = { at: now(), canStart: true, concurrency: { active: 0, limit: 10 }, windows: Object.fromEntries(['minute', 'hour', 'day'].map(k => [k, { limit: 5, used: 0 }])) };
+  let request;
+  const starts = new ExternalLeaseStarts(store, ledger, { create: async job => { request = job; return { sandbox: { id: 'bx_23456789' } }; } }, now);
+  assert.equal(await starts.start('compute', a, 'project-a', 'default', '["repo","label"]', limits, 1800), true);
+  assert.deepEqual(request.network, network);
+  assert.equal(request.noTailnet, true);
+  assert.equal(request.routerSnapshot, undefined);
+});
+
+test('a lease without a client network sends no network field', async () => {
+  const store = new Storage(), now = () => 10_000;
+  await new ExternalLeases(store, now).reserve('compute', a, 1, 5000);
+  const ledger = new AccountLedger(store, { starts: { minute: 1, hour: 1, day: 1 }, externalClients: { compute: { startsPerDay: 1 } } }, now);
+  const limits = { at: now(), canStart: true, concurrency: { active: 0, limit: 10 }, windows: Object.fromEntries(['minute', 'hour', 'day'].map(k => [k, { limit: 5, used: 0 }])) };
+  let request;
+  const starts = new ExternalLeaseStarts(store, ledger, { create: async job => { request = job; return { sandbox: { id: 'bx_23456789' } }; } }, now);
+  assert.equal(await starts.start('compute', a, 'project-a', 'default', '["repo","label"]', limits, 1800), true);
+  assert.equal(Object.hasOwn(request, 'network'), false);
+});

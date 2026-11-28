@@ -1,5 +1,5 @@
 import { safeLogger } from '../redact.mjs';
-import { accounts, projects as projectDefinitions } from '../../config/installation.mjs';
+import { accounts, leaseClients, projects as projectDefinitions } from '../../config/installation.mjs';
 import { createHash } from 'node:crypto';
 import { reuseBootstrap } from '../refresh.mjs';
 import { dockerBootstrap } from '../bootstrap.mjs';
@@ -18,6 +18,7 @@ import { AlertHooks, queueWaitMinutes } from './alert-hooks.mjs';
 import { APIs } from '../apis.mjs';
 import { AccountLedger } from './ledger.mjs';
 import { accountApi, cutoverBudget, externalCutoverLedger, tagCutoverRecords } from './account-cutover.mjs';
+import { POLL_SNAPSHOT_INTERVAL_MS, WEBHOOK_SNAPSHOT_INTERVAL_MS } from './snapshot-freshness.mjs';
 
 export function accountProject(config, account) {
   if (!account.projectAccounts?.includes(config.id)) return config;
@@ -72,8 +73,12 @@ export function installRouter(storage, getEnv, { api, now = Date.now, logger = c
   if (!selected) throw new TypeError('unknown router account');
   const provider = getEnv().BOAT_PROVIDER_WALLET;
   if (typeof provider !== 'string' || !provider.trim() || provider.trim() !== provider || provider === selected.id) throw new TypeError('invalid router provider wallet');
-  let externalClients = {};
-  try { externalClients = JSON.parse(getEnv().EXTERNAL_LEASE_CLIENTS ?? '{}'); } catch {}
+  // The installed file names each client and its policy; the Worker secret adds
+  // or replaces a client, so a deployment can override one without a redeploy.
+  let externalClients = { ...(leaseClients && !Array.isArray(leaseClients) && typeof leaseClients === 'object' ? leaseClients : {}) };
+  let envClients = {};
+  try { envClients = JSON.parse(getEnv().EXTERNAL_LEASE_CLIENTS ?? '{}'); } catch {}
+  if (envClients && !Array.isArray(envClients) && typeof envClients === 'object') externalClients = { ...externalClients, ...envClients };
   if (!externalClients || Array.isArray(externalClients) || typeof externalClients !== 'object') externalClients = {};
   // A client credential rotates through its own secret: EXTERNAL_LEASE_TOKEN_HASHES
   // maps a client name to the SHA-256 hex of its current token and replaces the
@@ -94,6 +99,7 @@ export function installRouter(storage, getEnv, { api, now = Date.now, logger = c
       const overrides = {};
       if (policy.maxActive === null || (Number.isSafeInteger(policy.maxActive) && policy.maxActive > 0)) overrides.maxActive = policy.maxActive;
       if (typeof policy.warmReuse === 'boolean') overrides.warmReuse = policy.warmReuse;
+      if (typeof policy.rollingSnapshot === 'boolean') overrides.rollingSnapshot = policy.rollingSnapshot;
       if (policy.startsPerDay === null) overrides.startsPerDay = null;
       if (policy.concurrencyReserve === 0) overrides.concurrencyReserve = 0;
       externalClients[name] = { ...externalClients[name], ...overrides };
@@ -160,7 +166,7 @@ export function installRouter(storage, getEnv, { api, now = Date.now, logger = c
     account.poolPacing = { ...account.poolPacing, unpaced: pollUnpaced === 'true' };
   }
   const repoWebhook = Boolean(pollRepo && getEnv().GITHUB_WEBHOOK_SECRET);
-  const snapshotInterval = repoWebhook ? 15 * 60_000 : 60_000;
+  const snapshotInterval = repoWebhook ? WEBHOOK_SNAPSHOT_INTERVAL_MS : POLL_SNAPSHOT_INTERVAL_MS;
   const paidCap = getEnv().GITHUB_POLL_PAID_CAP_USD;
   if (paidCap !== undefined) {
     if (!pollRepo || !/^\d+(?:\.\d{1,2})?$/.test(paidCap) || !Number.isFinite(Number(paidCap)) || Number(paidCap) > (account.starts?.paidExtraMaxDollarsPerMonth ?? 0)) throw new TypeError('invalid poll paid extra cap');
@@ -174,7 +180,7 @@ export function installRouter(storage, getEnv, { api, now = Date.now, logger = c
   const dockerProvisionerFingerprint = createHash('sha256').update(dockerBootstrap()).update('\0').update(DOCKER_RESET_PROGRAM_SHA256).update('\0').update(getEnv().TOOLCHAIN_REVISION ?? 'default').digest('hex');
   const projects = getEnv().ROUTER_PROJECTS?.split(',').map(value => value.trim());
   if (projects && (projects.some(value => !value) || new Set(projects).size !== projects.length)) throw new TypeError('invalid router projects');
-  const configurations = projectDefinitions.map(({ config, ...definition }) => ({ ...definition, config: accountProject({ ...config, provisionerFingerprint: config.snapshotBoot === true ? snapshotFingerprint : provisionerFingerprint, dockerProvisionerFingerprint }, account) }))
+  const configurations = projectDefinitions.map(({ config, ...definition }) => ({ ...definition, config: accountProject({ ...config, snapshotIntervalMs: snapshotInterval, provisionerFingerprint: config.snapshotBoot === true ? snapshotFingerprint : provisionerFingerprint, dockerProvisionerFingerprint }, account) }))
     .filter(({ config, optIn }) => config.account === account.id && (!optIn || projects?.includes(config.id)) && (!projects || projects.includes(config.id)))
     .map(definition => {
       if (account.openStartQueue !== true) return definition;
