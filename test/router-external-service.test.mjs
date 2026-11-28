@@ -604,6 +604,26 @@ test('a rolling claim boots the stored peek-ci generation it selected', async ()
   assert.deepEqual(request.routerSnapshot, selection.routerSnapshot);
 });
 
+// A single-account router has no account switch, so the identity check may not
+// depend on one: without this, every snapshot-selected lease stayed reserved
+// until it expired, on every tick, and no box was ever created.
+test('a single-account router verifies a rolling generation without an account switch', async () => {
+  const { storage, projectStorage, service } = setup();
+  await projectStorage.put('pool:mode', 'on');
+  await projectStorage.put('pool:snapshot', { complete: true, at: 10_000, runners: [] });
+  const manifestSha256 = 'd'.repeat(64);
+  const selection = { baseId: manifestSha256, rollingSnapshot: true, account: 'primary', routerSnapshot: { kind: 'peek-ci', name: rollingName(manifestSha256), snapshotId: 'snapshot-id', manifestSha256 } };
+  let asked = null, created = null;
+  service.api.request = async (name, path) => { asked = { name, path }; return { snapshot: { status: 'ready', snapshotId: 'snapshot-id' } }; };
+  service.api.limits = async () => ({ canStart: true, activeSandboxes: 0, maxActiveSandboxes: 10, machineTypes: [{ type: 'default', available: true }], starts: Object.fromEntries(['minute', 'hour', 'day'].map(name => [name, { limit: 10, used: 0 }])) });
+  service.api.create = async job => { created = job; return { sandbox: { id: 'bx_23456789' } }; };
+  assert.equal(await service.claim('compute', id, 'default', 'external-v2', null, false, selection, true), null);
+  const lease = await storage.get(`external-lease:compute:${id}`);
+  assert.equal(lease.state, 'booting');
+  assert.deepEqual(asked, { name: 'boat', path: '/saved-snapshots/' + encodeURIComponent(selection.routerSnapshot.name) });
+  assert.deepEqual(created.routerSnapshot, selection.routerSnapshot);
+});
+
 test('a spend ceiling refusal stays pending with no box and no reserved money', async () => {
   const { storage, projectStorage, service } = setup();
   service.clients.compute.ttlSeconds = 1800; service.clients.compute.machineTtlSeconds = 1800;

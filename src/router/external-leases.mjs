@@ -219,11 +219,15 @@ export class ExternalLeaseStarts {
     // A rolling generation's base identity is its manifest digest, already
     // encoded in the name; the base kinds recompute theirs from the tuple.
     const computed = selected.kind === 'peek-ci' ? { baseId: selected.manifestSha256 } : selected.kind === 'browser-v1' ? await browserBase({ BROWSER_BASE_SNAPSHOT_NAME: selected?.name, BROWSER_BASE_SNAPSHOT_ID: selected?.snapshotId, BROWSER_BASE_TOOLCHAIN_SHA256: selected?.manifestSha256, BROWSER_BASE_FILES_SHA256: selected?.browserManifestSha256, BROWSER_BASE_PROFILE_SHA256: selected?.profileSha256 }) : await leaseBase({ LEASE_BASE_SNAPSHOT_NAME: selected?.name, LEASE_BASE_SNAPSHOT_ID: selected?.snapshotId, LEASE_BASE_MANIFEST_SHA256: selected?.manifestSha256, LEASE_BASE_PROFILE_SHA256: selected?.profileSha256 });
-    if (computed?.baseId !== lease.baseId || typeof this.api.forIdentity !== 'function') return false;
+    if (computed?.baseId !== lease.baseId) return false;
     const expectedId = account === 'secondary' ? this.secondaryBase(lease)?.snapshotId : selected.snapshotId;
     if (!expectedId) return false;
+    // A single-account router has no account switch and reads the primary
+    // account directly; only a secondary snapshot needs the switch.
+    let api = this.api;
+    if (typeof this.api.forIdentity === 'function') api = await this.api.forIdentity({ account });
+    else if (account !== 'primary') return false;
     try {
-      const api = await this.api.forIdentity({ account });
       const found = (await api.request('boat', `/saved-snapshots/${encodeURIComponent(selected.name)}`))?.snapshot;
       return found?.status === 'ready' && found.snapshotId === expectedId;
     } catch { return false; }
