@@ -44,12 +44,12 @@ function seedRolling(fake) {
   return { digest, name };
 }
 
-function activeDevLease(storage, fake, { keyId = 'key-1', key = 'tskey-auth-fake-seeded', deviceId = 'device-1' } = {}) {
+function activeDevLease(storage, fake, { keyId = 'key-1', key = 'tskey-auth-fake-seeded', deviceId = 'device-1', expiresAt = Date.now() + 600_000 } = {}) {
   const hostname = devHostname(ID), machineId = 'bx_23456789';
   fake.tailnet.keys = [{ id: keyId, key, body: {}, path: '' }];
   fake.tailnet.devices = [{ id: deviceId, hostname }];
   return Promise.all([
-    storage.put(`external-lease:peek-dev:${ID}`, { id: ID, client: 'peek-dev', project: 'project-a', state: 'active', machineId, size: 'default', pool: '["a/b","boat-default"]', expiresAt: Date.now() + 600_000, dev: true, tailnet: { hostname }, devKey: { id: keyId, key } }),
+    storage.put(`external-lease:peek-dev:${ID}`, { id: ID, client: 'peek-dev', project: 'project-a', state: 'active', machineId, size: 'default', pool: '["a/b","boat-default"]', expiresAt, dev: true, tailnet: { hostname }, devKey: { id: keyId, key } }),
     storage.put(`project:project-a:box:${machineId}`, { machineId, state: 'leased', leaseId: ID, leaseClient: 'peek-dev', size: 'default', pool: '["a/b","boat-default"]' }),
   ]).then(() => ({ hostname, machineId }));
 }
@@ -117,6 +117,34 @@ test('one open dev lease refuses a second one without minting a key', async () =
   assert.equal(await t.storage.get(`external-lease:peek-dev:${OTHER}`), undefined);
   assert.equal(t.fake.tailnet.tokens, 0);
   assert.equal(t.fake.tailnet.keys.length, 1);
+});
+
+test('two concurrent dev claims admit one lease through the reservation transaction', async () => {
+  const t = await setup();
+  await seedProject(t.storage);
+  const THIRD = '00000000-0000-4000-8000-000000000003';
+  // Both calls read the open dev leases before either commits a reservation, so
+  // the transaction itself, not that read, is what admits only one.
+  const claims = await Promise.all([ID, OTHER].map(id => t.fleet.external.claim('peek-dev', id, 'default', null, null, false, null, false, true)));
+  assert.deepEqual(claims, [null, null]);
+  const open = [...(await t.storage.list({ prefix: 'external-lease:peek-dev:' })).values()].filter(lease => lease.state !== 'closed');
+  assert.equal(open.length, 1, 'the reservation transaction admits one dev lease');
+  assert.equal(open[0].dev, true);
+  assert.equal(open[0].tailnet.hostname, devHostname(open[0].id));
+  const loser = [ID, OTHER].find(id => id !== open[0].id);
+  assert.equal(await t.storage.get(`external-lease:peek-dev:${loser}`), undefined, 'the losing claim leaves no lease behind');
+
+  // The cap the dev claim carries into the transaction is the dev limit itself.
+  const limit = t.fleet.external.devLimit(t.fleet.external.config('peek-dev'));
+  assert.equal(limit, 1);
+  assert.equal(await t.fleet.external.leases.reserve('peek-dev', THIRD, limit, 60_000), null, 'the transaction refuses the second dev lease');
+
+  const winner = open[0];
+  await t.fleet.external.admitStart({ at: winner.createdAt, rank: `external:peek-dev:${winner.id}`, lease: winner });
+  assert.equal((await t.storage.get(`external-lease:peek-dev:${winner.id}`)).state, 'booting');
+  assert.equal(t.fake.tailnet.keys.length, 1, 'one dev box mints one key');
+  assert.equal(boatCreates(t.fake).length, 1);
+  assert.equal([...(await t.storage.list({ prefix: 'external-lease:peek-dev:' })).values()].filter(lease => lease.state !== 'closed').length, 1);
 });
 
 test('a dev claim mints one key into the create environment and never answers or scripts it', async () => {
@@ -251,6 +279,33 @@ test('a failed cleanup stays durable, logs, and a fresh router finishes it after
   assert.equal(await t.storage.get(`dev-cleanup:peek-dev:${ID}`), undefined);
   const lease = await t.storage.get(`external-lease:peek-dev:${ID}`);
   assert.equal(lease.tailnetCleaned, true);
+});
+
+test('the sweep after a restart ends an expired dev lease and its tailnet identity', async () => {
+  const t = await setup();
+  const { machineId } = await activeDevLease(t.storage, t.fake, { expiresAt: Date.now() - 1 });
+  await t.storage.put('project:project-a:pool:migrated', { done: true });
+  const restarted = new Fleet({ storage: t.storage, waitUntil() {} }, t.env, undefined, t.f.fetcher);
+  restarted.external.logger = line => t.f.logs.push(line);
+
+  // The sweep retires the box, then the project's own ticks carry the delete
+  // through and close the lease.
+  await restarted.external.sweep();
+  assert.deepEqual(t.fake.tailnet.deletes, ['device-1']);
+  assert.deepEqual(t.fake.tailnet.revokes, ['key-1']);
+  assert.equal(await t.storage.get(`dev-cleanup:peek-dev:${ID}`), undefined);
+  for (let tick = 0; tick < 3; tick++) await restarted.router.tick();
+
+  assert.deepEqual(t.fake.deletes, [machineId]);
+  assert.deepEqual(t.fake.tailnet.devices, []);
+  assert.equal((await t.storage.get(`project:project-a:box:${machineId}`)).state, 'deleted');
+  const lease = await t.storage.get(`external-lease:peek-dev:${ID}`);
+  assert.equal(lease.state, 'closed');
+  assert.equal(lease.tailnetCleaned, true);
+  assert.equal(lease.devKey.id, 'key-1');
+  assert.equal(lease.devKey.key, undefined);
+  assert.equal(t.fake.tailnet.keys.length, 0);
+  assert.equal(t.f.logs.join('\n').includes('tskey-auth'), false);
 });
 
 test('an ordinary lease never asks for a key and keeps an empty create environment', async () => {

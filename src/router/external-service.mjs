@@ -100,11 +100,16 @@ export class ExternalService {
     if (lease.lastReason && /^[a-z_]+$/.test(lease.lastReason)) return lease.lastReason;
     return /^[a-z_]+$/.test(lease.state ?? '') ? `lease_${lease.state}` : 'lease_pending';
   }
-  // One non-closed dev lease, whatever the ordinary client cap says: install.mjs
-  // nulls maxActive whenever the open start queue owns admission.
+  // install.mjs nulls maxActive whenever the open start queue owns admission, so
+  // the dev cap is its own bound on top of whatever the client allows.
+  devLimit(cfg) {
+    return Number.isSafeInteger(cfg?.devMaxActive) && cfg.devMaxActive >= 1 ? cfg.devMaxActive : 1;
+  }
+  // One non-closed dev lease, whatever the ordinary client cap says. This read
+  // answers the sequential case with a reason; the reservation transaction
+  // admits at most devLimit leases, so two racing claims cannot both pass it.
   async devBlock(client, id) {
-    const cfg = this.config(client);
-    const limit = Number.isSafeInteger(cfg?.devMaxActive) && cfg.devMaxActive >= 1 ? cfg.devMaxActive : 1;
+    const cfg = this.config(client), limit = this.devLimit(cfg);
     const active = (await records(this.storage, 'external-lease:')).filter(item => item.dev === true && item.state !== 'closed' && !(item.client === client && item.id === id) && !(item.state === 'reserved' && !item.machineId && !item.claimKey && item.expiresAt <= this.now()));
     return active.length >= limit ? { reason: 'dev_lease_active', detail: { leaseId: active[0].id, hostname: active[0].tailnet?.hostname ?? null, expiresAt: active[0].expiresAt } } : null;
   }
@@ -129,7 +134,10 @@ export class ExternalService {
     // A rolling generation is a boot disk, not a reuse feature: it needs no warm
     // reuse, so only the base kinds still require the isolated lease mode.
     if (selection && (!prior || ['waiting', 'reserved'].includes(prior.state)) && (!reuseEnabled || isolation !== 'external-v2') && selection.routerSnapshot?.kind !== 'peek-ci') return null;
-    let lease = await this.leases.reserve(client, id, cfg.maxActive, cfg.ttlSeconds * 1000);
+    // The transaction is the only admission point two claims cannot both pass,
+    // so a dev claim carries its own cap into it instead of trusting devBlock.
+    const cap = dev ? Math.min(cfg.maxActive ?? Number.MAX_SAFE_INTEGER, this.devLimit(cfg)) : cfg.maxActive;
+    let lease = await this.leases.reserve(client, id, cap, cfg.ttlSeconds * 1000);
     if (!lease) return null;
     // A retried dev claim keeps the hostname its first claim fixed, so cleanup
     // always matches the device the box actually joined with.
