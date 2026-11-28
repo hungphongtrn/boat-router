@@ -21,5 +21,40 @@
         "files.pythonhosted.org"
       ]
     }
+  },
+  "peek-dev": {
+    "enabled": true,
+    "project": "peek",
+    "maxActive": 1,
+    "ttlSeconds": 1800,
+    "startsPerDay": 60,
+    "rollingSnapshot": true,
+    "warmReuse": false,
+    "tailnet": true,
+    "devMaxActive": 1,
+    "network": {
+      "mode": "allow",
+      "inbound": "boat-only",
+      "allow": [
+        "registry.npmjs.org",
+        "*.npmjs.org",
+        "crates.io",
+        "*.crates.io",
+        "static.rust-lang.org",
+        "*.rust-lang.org",
+        "pypi.org",
+        "files.pythonhosted.org",
+        "pkgs.tailscale.com",
+        "*.tailscale.com",
+        "controlplane.tailscale.com",
+        "*.derp.tailscale.com",
+        "ghcr.io",
+        "*.githubusercontent.com",
+        "*.docker.io",
+        "*.docker.com",
+        "*.cloudflare.docker.com",
+        "*.cloudflarestorage.com"
+      ]
+    }
   }
 }

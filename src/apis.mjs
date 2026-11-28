@@ -12,6 +12,7 @@ import { PROBE, REUSE_PROBE } from './router/jit-liveness.mjs';
 import { setupProviderFields, setupOutputTail, setupCaptureStatus, setupErrorCategory, setupRetryEligible, setupPhase, setupExitCode } from './router/setup-diagnostics.mjs';
 import { latestRollingSnapshot, rollingSnapshotManifest } from './router/rolling-snapshot.mjs';
 import { normalizeNetwork } from './router/lease-network.mjs';
+import { DEV_ENV_KEYS, DEV_KEY_TTL_SECONDS, keyRequestBody, oauthForm, tailnetApiUrl, tailnetName } from './router/tailnet.mjs';
 
 export const providerWallet = env => env.BOAT_PROVIDER_WALLET ?? env.BOAT_WALLET ?? defaultWallet;
 
@@ -22,6 +23,57 @@ export class APIs {
     this.now = now;
     this.tokens = new Map();
     this.credentials = credentials;
+    this.tailnetToken = null;
+  }
+  // Tailscale speaks a different base URL and form encoding from the provider
+  // and GitHub. Error details stay at the HTTP status so a secret in the
+  // response can never reach a log line or a client.
+  async tailnetRequest(path, { method = 'GET', body, form = false, token = null, expectEmpty = false, timeoutMs = 15_000 } = {}) {
+    const base = tailnetApiUrl(this.env);
+    const headers = { 'User-Agent': 'boat-router', ...(token ? { Authorization: `Bearer ${token}` } : {}) };
+    let payload;
+    if (body !== undefined) {
+      if (form) { headers['Content-Type'] = 'application/x-www-form-urlencoded'; payload = body; }
+      else { headers['Content-Type'] = 'application/json'; payload = JSON.stringify(body); }
+    }
+    let response, data;
+    try {
+      response = await this.fetch(base + path, { method, headers, body: payload, signal: AbortSignal.timeout(timeoutMs), redirect: 'manual' });
+      if (response.status === 204 || (response.ok && expectEmpty)) data = {};
+      else data = await response.json();
+    } catch {
+      throw new ApiError('tailscale', response?.status ?? 0, 'transport_or_response');
+    }
+    if (!response.ok) throw new ApiError('tailscale', response.status, response.status === 404 ? 'not_found' : 'tailscale_error');
+    return data;
+  }
+  async tailnetOAuth() {
+    if (this.tailnetToken && this.tailnetToken.expires > this.now() + 60_000) return this.tailnetToken.token;
+    const data = await this.tailnetRequest('/api/v2/oauth/token', { method: 'POST', form: true, body: oauthForm(this.env) });
+    if (typeof data?.access_token !== 'string' || !data.access_token) throw new ApiError('tailscale', 502, 'invalid_oauth_response');
+    const seconds = Number.isFinite(Number(data.expires_in)) && Number(data.expires_in) > 0 ? Number(data.expires_in) : 3600;
+    this.tailnetToken = { token: data.access_token, expires: this.now() + seconds * 1000 };
+    return this.tailnetToken.token;
+  }
+  // One ephemeral, preauthorized, single-use key tagged for the dev fleet.
+  async tailnetKey(leaseId, now = this.now()) {
+    const token = await this.tailnetOAuth();
+    const data = await this.tailnetRequest(`/api/v2/tailnet/${encodeURIComponent(tailnetName(this.env))}/keys`, { method: 'POST', token, body: keyRequestBody(leaseId) });
+    if (typeof data?.id !== 'string' || !data.id || typeof data?.key !== 'string' || !data.key) throw new ApiError('tailscale', 502, 'invalid_key_response');
+    return { id: data.id, key: data.key, expiresAt: now + DEV_KEY_TTL_SECONDS * 1000 };
+  }
+  async tailnetDevices() {
+    const data = await this.tailnetRequest(`/api/v2/tailnet/${encodeURIComponent(tailnetName(this.env))}/devices`, { token: await this.tailnetOAuth() });
+    if (!Array.isArray(data?.devices)) throw new ApiError('tailscale', 502, 'invalid_device_list');
+    return data.devices;
+  }
+  async tailnetDeleteDevice(deviceId) {
+    if (typeof deviceId !== 'string' || !deviceId) throw new TypeError('invalid tailscale device id');
+    return this.tailnetRequest(`/api/v2/device/${encodeURIComponent(deviceId)}`, { method: 'DELETE', token: await this.tailnetOAuth(), expectEmpty: true });
+  }
+  async tailnetRevokeKey(keyId) {
+    if (typeof keyId !== 'string' || !keyId) throw new TypeError('invalid tailscale key id');
+    return this.tailnetRequest(`/api/v2/tailnet/${encodeURIComponent(tailnetName(this.env))}/keys/${encodeURIComponent(keyId)}`, { method: 'DELETE', token: await this.tailnetOAuth(), expectEmpty: true });
   }
   async request(service, path, { method = 'GET', body, headers = {}, token, expectEmpty = false, metadata = false, timeoutMs = 10_000, textResponse = false } = {}) {
     let response;
@@ -119,6 +171,9 @@ export class APIs {
     let body;
     try {
       const snapshot = job.routerSnapshot;
+      // A dev lease is the only create that carries environment values, and
+      // only the two the Tailnet join needs.
+      if (job.devEnv !== undefined && (!job.devEnv || Object.keys(job.devEnv).sort().join(',') !== [...DEV_ENV_KEYS].sort().join(',') || Object.values(job.devEnv).some(value => typeof value !== 'string' || !value))) throw new TypeError('invalid dev environment');
       const lease = snapshot?.kind === 'lease-v1', browser = snapshot?.kind === 'browser-v1', rollingLease = snapshot?.kind === 'peek-ci';
       // A lease client's network policy rides the create body; every other create
       // (CI, refresh, local) keeps the provider default.
@@ -131,7 +186,7 @@ export class APIs {
         (rollingLease && (!rolling || snapshot.profileSha256 != null || snapshot.browserManifestSha256 != null)) ||
         (browser && (!/^[a-f0-9]{64}$/.test(snapshot.browserManifestSha256 ?? '') || !/^[a-f0-9]{64}$/.test(snapshot.profileSha256 ?? '') || job.routerReusable !== true)) || (!lease && !browser && !rollingLease && (snapshot.kind != null || snapshot.profileSha256 != null || snapshot.browserManifestSha256 != null)) || job.routerResetMode === 'docker' || job.routerDockerAccess === true)) throw new TypeError('invalid snapshot');
       body = { type: job.machineSize ?? job.size, ttlSeconds: ttl, noEnv: true, snapshots: false, monitoring: false,
-        failFast: job.failFast !== false, setupScript: snapshot ? snapshotBootstrap(snapshot.manifestSha256, { reusable: job.routerReusable === true, ...(job.noTailnet === true ? { noTailnet: true } : {}), ...(lease || browser ? { leaseProfileSha256: snapshot.profileSha256 } : {}), ...(browser ? { browserManifestSha256: snapshot.browserManifestSha256 } : {}) }) : job.routerResetMode === 'docker' || job.routerDockerAccess === true ? dockerBootstrap() : job.routerReusable ? reuseBootstrap() : bootstrap(), ...(snapshot ? { from: snapshot.name, env: {} } : {}), ...(job.routerCreateName ? { name: job.routerCreateName } : {}), ...(network ? { network } : {}) };
+        failFast: job.failFast !== false, setupScript: snapshot ? snapshotBootstrap(snapshot.manifestSha256, { reusable: job.routerReusable === true, ...(job.noTailnet === true ? { noTailnet: true } : {}), ...(lease || browser ? { leaseProfileSha256: snapshot.profileSha256 } : {}), ...(browser ? { browserManifestSha256: snapshot.browserManifestSha256 } : {}) }) : job.routerResetMode === 'docker' || job.routerDockerAccess === true ? dockerBootstrap() : job.routerReusable ? reuseBootstrap() : bootstrap(), ...(snapshot ? { from: snapshot.name, env: job.devEnv ?? {} } : job.devEnv ? { env: job.devEnv } : {}), ...(job.routerCreateName ? { name: job.routerCreateName } : {}), ...(network ? { network } : {}) };
     } catch { throw new ApiError('boat', 0, 'request_not_sent'); }
     // A create carries the setup script and a snapshot reference and is idempotent by its key, so it
     // gets a longer ceiling than the 10 s read default: a create that outlives 10 s on a loaded box

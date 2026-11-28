@@ -2,6 +2,11 @@ import { transition as applyBoxEvent } from './box-state.mjs';
 import { leaseBase } from './lease-base.mjs';
 import { browserBase } from './browser-base.mjs';
 import { validLeaseSnapshot } from './lease-snapshot.mjs';
+import { devCreateEnv, validDevHostname } from './tailnet.mjs';
+
+// The plaintext key exists only until the box is active: after that the lease
+// keeps the key id for revocation, never the secret.
+const withoutDevKey = lease => lease.devKey?.key ? { devKey: { id: lease.devKey.id, expiresAt: lease.devKey.expiresAt } } : {};
 
 // Durable reservations are retained through cleanup, including uncertain creates.
 export class ExternalLeases {
@@ -61,7 +66,7 @@ export class WarmLeaseFence {
       const box = await tx.get(boxKey), lease = await tx.get(leaseKey);
       if (box?.state !== 'lease-warm' || box.leaseClient !== client || box.leaseIsolation !== lease?.isolation || box.size !== lease?.size || (box.baseId ?? null) !== (lease?.baseId ?? null) || lease?.state !== 'reserved' || lease.isolation !== 'external-v2' || lease.expiresAt <= this.now()) return false;
       await tx.put(boxKey, applyBoxEvent(box, 'lease_activate', { leaseId: id }, this.now()));
-      await tx.put(leaseKey, { ...lease, state: 'active', machineId, reused: true });
+      await tx.put(leaseKey, { ...lease, ...withoutDevKey(lease), state: 'active', machineId, reused: true });
       return true;
     });
   }
@@ -186,7 +191,7 @@ export class WarmLeaseFence {
       if (current?.state !== 'lease-resetting' || item?.state !== 'resetting' || current.leaseId !== id || (item.expiresAt <= this.now() && !item.releaseRequested)) return false;
       const orphan = item.releaseRequested === true && item.isolation === 'external-v2';
       await tx.put(boxKey, applyBoxEvent(current, orphan ? 'lease_park' : 'lease_activate', { runnerId: null, runnerName: null, runnerIdentity: null, processId: null, ...(orphan ? { leaseId: null, leaseIsolation: item.isolation } : {}) }, this.now()));
-      await tx.put(leaseKey, { ...item, state: orphan ? 'closed' : 'active', processId: null });
+      await tx.put(leaseKey, { ...item, ...withoutDevKey(item), state: orphan ? 'closed' : 'active', processId: null });
       return true;
     });
   }
@@ -288,7 +293,7 @@ export class ExternalLeaseStarts {
       if (!lease) return false;
       claim = await this.ledger.claim(lease.claimKey);
     }
-    if ((lease.baseId != null || lease.routerSnapshot != null) && lease.account !== 'primary' && !(lease.account === 'secondary' && this.secondaryBase(lease) && await this.leaseIdentity(lease, 'secondary')) && (!claim || claim.status === 'pending')) return false;
+    if ((lease.baseId != null || lease.routerSnapshot != null) && lease.account != null && lease.account !== 'primary' && !(lease.account === 'secondary' && this.secondaryBase(lease) && await this.leaseIdentity(lease, 'secondary')) && (!claim || claim.status === 'pending')) return false;
     if ((!claim || claim.status === 'pending') && (lease.expiresAt <= this.now() || lease.releaseRequested)) {
       await this.ledger.abandon(project, lease.claimKey);
       await this.storage.put(key, { ...lease, state: 'closed' });
@@ -307,12 +312,13 @@ export class ExternalLeaseStarts {
     if (claim.status === 'pending') {
       if (!await this.ledger.begin(project, lease.claimKey)) return false;
       try {
+        const devEnv = lease.dev === true ? await this.devCreateEnv(lease) : null;
         // A lease box is created for a client: no environment, no tailnet identity
         // on its disk, and only the client's own registry network policy.
         // A lease claim already answers 202 while the box starts, so the create
         // waits for a machine: a fail-fast create answers no_ready_machine
         // whenever none is instantly free, creates nothing, and the lease never boots.
-        const result = await this.api.create({ ...(lease.account ? { account: lease.account } : {}), createKey: lease.createKey, routerCreateName: lease.routerCreateName, machineSize: size, routerReusable: lease.isolation === 'external-v2', noTailnet: true, failFast: false, ...(lease.network ? { network: lease.network } : {}), ...(lease.routerSnapshot ? { routerSnapshot: lease.routerSnapshot } : {}) }, lease.machineTtlSeconds ?? ttlSeconds);
+        const result = await this.api.create({ ...(lease.account ? { account: lease.account } : {}), createKey: lease.createKey, routerCreateName: lease.routerCreateName, machineSize: size, routerReusable: lease.isolation === 'external-v2', noTailnet: true, failFast: false, ...(lease.network ? { network: lease.network } : {}), ...(lease.routerSnapshot ? { routerSnapshot: lease.routerSnapshot } : {}), ...(devEnv ? { devEnv } : {}) }, lease.machineTtlSeconds ?? ttlSeconds);
         sandbox = result?.sandbox;
         if (!/^bx_[23456789abcdefghjkmnpqrstuvwxyz]{8}$/.test(sandbox?.id ?? '')) throw new Error('invalid sandbox');
       } catch (error) {
@@ -355,6 +361,37 @@ export class ExternalLeaseStarts {
     }
     return recorded;
   }
+  // Mint the lease's one key before its first create and reuse it on every
+  // provider retry: a retry never spends a second key.
+  async devCreateEnv(lease) {
+    const hostname = lease.tailnet?.hostname;
+    if (!validDevHostname(hostname)) throw new Error('invalid dev hostname');
+    const key = `external-lease:${lease.client}:${lease.id}`;
+    let devKey = lease.devKey, minted = null;
+    if (!devKey?.key) {
+      if (devKey?.id) throw new Error('dev key unavailable');
+      minted = await this.api.tailnetKey(lease.id);
+      try {
+        devKey = await this.storage.transaction(async tx => {
+          const current = await tx.get(key);
+          if (current?.state !== 'starting' || current.claimKey !== lease.claimKey) return null;
+          if (current.devKey?.key) return current.devKey;
+          const retained = { id: minted.id, key: minted.key, expiresAt: minted.expiresAt };
+          await tx.put(key, { ...current, devKey: retained });
+          return retained;
+        });
+      } catch (error) {
+        // A key the lease did not retain must not outlive this attempt.
+        try { await this.api.tailnetRevokeKey(minted.id); } catch {}
+        throw error;
+      }
+    }
+    if (!devKey?.key) {
+      if (minted) try { await this.api.tailnetRevokeKey(minted.id); } catch {}
+      throw new Error('dev key unavailable');
+    }
+    return devCreateEnv(devKey.key, hostname);
+  }
   async ready(client, id) {
     const key = `external-lease:${client}:${id}`, lease = await this.storage.get(key);
     if (!lease || lease.state !== 'booting') return false;
@@ -386,7 +423,7 @@ export class ExternalLeaseStarts {
       const current = await tx.get(key), boxKey = `project:${lease.project}:box:${lease.machineId}`, box = await tx.get(boxKey);
       if (current?.state !== 'booting' || current.expiresAt <= this.now() || box?.state !== 'lease-booting' || box.leaseId !== id) return false;
       await tx.put(boxKey, applyBoxEvent(box, 'lease_activate', {}, this.now()));
-      await tx.put(key, { ...current, state: 'active' });
+      await tx.put(key, { ...current, ...withoutDevKey(current), state: 'active' });
       return true;
     });
   }
@@ -406,7 +443,7 @@ export class ExternalLeaseStarts {
       if (current?.state !== 'baselining' || item?.state !== 'lease-baselining' || (current.expiresAt <= this.now() && !current.releaseRequested)) return false;
       const orphan = current.releaseRequested === true;
       await tx.put(boxKey, applyBoxEvent(item, orphan ? 'lease_park' : 'lease_activate', { baselineHash: result.baselineHash, processId: null, ...(orphan ? { leaseId: null, leaseIsolation: current.isolation } : {}) }, this.now()));
-      await tx.put(key, { ...current, state: orphan ? 'closed' : 'active', processId: null });
+      await tx.put(key, { ...current, ...withoutDevKey(current), state: orphan ? 'closed' : 'active', processId: null });
       return true;
     });
   }
