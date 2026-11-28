@@ -47,7 +47,13 @@
         "pkgs.tailscale.com",
         "*.tailscale.com",
         "controlplane.tailscale.com",
-        "*.derp.tailscale.com"
+        "*.derp.tailscale.com",
+        "ghcr.io",
+        "*.githubusercontent.com",
+        "*.docker.io",
+        "*.docker.com",
+        "*.cloudflare.docker.com",
+        "*.cloudflarestorage.com"
       ]
     }
   }
