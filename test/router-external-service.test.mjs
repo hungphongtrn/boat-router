@@ -602,6 +602,11 @@ test('a rolling claim boots the stored peek-ci generation it selected', async ()
   assert.deepEqual(lease.routerSnapshot, selection.routerSnapshot);
   assert.equal(lease.state, 'booting');
   assert.deepEqual(request.routerSnapshot, selection.routerSnapshot);
+  // The claim already answers 202 while the box starts, so the create must wait
+  // for a machine rather than fail fast: a fail-fast create answers
+  // no_ready_machine whenever no machine is instantly free, creates nothing,
+  // and the lease never boots.
+  assert.equal(request.failFast, false);
 });
 
 // A single-account router has no account switch, so the identity check may not

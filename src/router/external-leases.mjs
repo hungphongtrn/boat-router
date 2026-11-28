@@ -309,7 +309,10 @@ export class ExternalLeaseStarts {
       try {
         // A lease box is created for a client: no environment, no tailnet identity
         // on its disk, and only the client's own registry network policy.
-        const result = await this.api.create({ ...(lease.account ? { account: lease.account } : {}), createKey: lease.createKey, routerCreateName: lease.routerCreateName, machineSize: size, routerReusable: lease.isolation === 'external-v2', noTailnet: true, ...(lease.network ? { network: lease.network } : {}), ...(lease.routerSnapshot ? { routerSnapshot: lease.routerSnapshot } : {}) }, lease.machineTtlSeconds ?? ttlSeconds);
+        // A lease claim already answers 202 while the box starts, so the create
+        // waits for a machine: a fail-fast create answers no_ready_machine
+        // whenever none is instantly free, creates nothing, and the lease never boots.
+        const result = await this.api.create({ ...(lease.account ? { account: lease.account } : {}), createKey: lease.createKey, routerCreateName: lease.routerCreateName, machineSize: size, routerReusable: lease.isolation === 'external-v2', noTailnet: true, failFast: false, ...(lease.network ? { network: lease.network } : {}), ...(lease.routerSnapshot ? { routerSnapshot: lease.routerSnapshot } : {}) }, lease.machineTtlSeconds ?? ttlSeconds);
         sandbox = result?.sandbox;
         if (!/^bx_[23456789abcdefghjkmnpqrstuvwxyz]{8}$/.test(sandbox?.id ?? '')) throw new Error('invalid sandbox');
       } catch (error) {

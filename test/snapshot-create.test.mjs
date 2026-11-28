@@ -18,6 +18,19 @@ test('a snapshot create keeps the no-environment boundary and uses the saved ide
   assert.doesNotMatch(request.body.setupScript, /apt-get|curl |docker pull/);
 });
 
+// A pool create may fail fast so the pool learns at once that no machine is
+// free; a caller that already waits on an async claim asks the provider to
+// wait for a machine instead, which is the provider's own advice for a queued
+// create.
+test('a create the caller marks as waiting is not fail-fast', async () => {
+  let body;
+  const api = new APIs({}, async (_url, options) => { body = JSON.parse(options.body); return Response.json({}); });
+  await api.create({ ...job, failFast: false }, 3600);
+  assert.equal(body.failFast, false);
+  await api.create(job, 3600);
+  assert.equal(body.failFast, true, 'every other create still fails fast');
+});
+
 test('a plain create keeps the existing bootstrap path', async () => {
   let body;
   const api = new APIs({}, async (_url, options) => { body = JSON.parse(options.body); return Response.json({}); });
