@@ -18,6 +18,7 @@ import { AlertHooks, queueWaitMinutes } from './alert-hooks.mjs';
 import { APIs } from '../apis.mjs';
 import { AccountLedger } from './ledger.mjs';
 import { accountApi, cutoverBudget, externalCutoverLedger, tagCutoverRecords } from './account-cutover.mjs';
+import { POLL_SNAPSHOT_INTERVAL_MS, WEBHOOK_SNAPSHOT_INTERVAL_MS } from './snapshot-freshness.mjs';
 
 export function accountProject(config, account) {
   if (!account.projectAccounts?.includes(config.id)) return config;
@@ -165,7 +166,7 @@ export function installRouter(storage, getEnv, { api, now = Date.now, logger = c
     account.poolPacing = { ...account.poolPacing, unpaced: pollUnpaced === 'true' };
   }
   const repoWebhook = Boolean(pollRepo && getEnv().GITHUB_WEBHOOK_SECRET);
-  const snapshotInterval = repoWebhook ? 15 * 60_000 : 60_000;
+  const snapshotInterval = repoWebhook ? WEBHOOK_SNAPSHOT_INTERVAL_MS : POLL_SNAPSHOT_INTERVAL_MS;
   const paidCap = getEnv().GITHUB_POLL_PAID_CAP_USD;
   if (paidCap !== undefined) {
     if (!pollRepo || !/^\d+(?:\.\d{1,2})?$/.test(paidCap) || !Number.isFinite(Number(paidCap)) || Number(paidCap) > (account.starts?.paidExtraMaxDollarsPerMonth ?? 0)) throw new TypeError('invalid poll paid extra cap');
@@ -179,7 +180,7 @@ export function installRouter(storage, getEnv, { api, now = Date.now, logger = c
   const dockerProvisionerFingerprint = createHash('sha256').update(dockerBootstrap()).update('\0').update(DOCKER_RESET_PROGRAM_SHA256).update('\0').update(getEnv().TOOLCHAIN_REVISION ?? 'default').digest('hex');
   const projects = getEnv().ROUTER_PROJECTS?.split(',').map(value => value.trim());
   if (projects && (projects.some(value => !value) || new Set(projects).size !== projects.length)) throw new TypeError('invalid router projects');
-  const configurations = projectDefinitions.map(({ config, ...definition }) => ({ ...definition, config: accountProject({ ...config, provisionerFingerprint: config.snapshotBoot === true ? snapshotFingerprint : provisionerFingerprint, dockerProvisionerFingerprint }, account) }))
+  const configurations = projectDefinitions.map(({ config, ...definition }) => ({ ...definition, config: accountProject({ ...config, snapshotIntervalMs: snapshotInterval, provisionerFingerprint: config.snapshotBoot === true ? snapshotFingerprint : provisionerFingerprint, dockerProvisionerFingerprint }, account) }))
     .filter(({ config, optIn }) => config.account === account.id && (!optIn || projects?.includes(config.id)) && (!projects || projects.includes(config.id)))
     .map(definition => {
       if (account.openStartQueue !== true) return definition;

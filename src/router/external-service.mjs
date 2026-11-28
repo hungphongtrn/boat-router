@@ -9,6 +9,7 @@ import { breakerForSize } from './verification-breaker.mjs';
 import { validLeaseSize } from './sizes.mjs';
 import { normalizeNetwork } from './lease-network.mjs';
 import { heldUntil, holdActive } from './lease-hold.mjs';
+import { snapshotFresh } from './snapshot-freshness.mjs';
 
 async function records(storage, prefix) {
   const out = []; let startAfter = '';
@@ -48,8 +49,7 @@ export class ExternalService {
       const localOnly = (project.config.externalClaimer ?? project.config.localFirst)?.localOnly ?? [];
       const matchingLabels = project.config.labels.filter(label => { try { return !localOnly.includes(label) && poolSize(project.config, label) === size; } catch { return false; } });
       if (!matchingLabels.length) continue;
-      const snapshot = await project.storage.get('pool:snapshot');
-      if (!snapshot?.complete || !Number.isFinite(snapshot.at) || this.now() - snapshot.at > 90000) return false;
+      if (!snapshotFresh(await project.storage.get('pool:snapshot'), this.now(), project.config)) return false;
       const localPools = new Set(localOnly.map(label => poolKey(project.config.repo, label)));
       const jobs = await records(project.storage, 'gh-job:');
       for (const job of runnableDemand(jobs, project.config.workflowConcurrency, true, { laneCaps: await lanesSwitchOn(project.storage, project.config) })) {
@@ -70,8 +70,7 @@ export class ExternalService {
   async snapshotsReady() {
     for (const project of this.router.projects.values()) {
       if (!project.box || await project.storage.get('pool:mode') !== 'on') continue;
-      const snapshot = await project.storage.get('pool:snapshot');
-      if (!snapshot?.complete || !Number.isFinite(snapshot.at) || this.now() - snapshot.at > 90000 || snapshot.at > this.now()) return false;
+      if (!snapshotFresh(await project.storage.get('pool:snapshot'), this.now(), project.config)) return false;
     }
     return true;
   }
@@ -374,10 +373,10 @@ export class ExternalService {
         const maxJobs = Math.min(this.router.account.reuse?.maxJobs ?? 60, project.config.reuse?.maxJobs ?? 60);
         const maxAge = Math.min(this.router.account.reuse?.maxAgeSeconds ?? 86400, project.config.reuse?.maxAgeSeconds ?? 86400);
         const canTransfer = this.router.account.reuse?.enabled === true && project.config.reuse?.mode === 'on' && project.config.dockerAccess !== true && (box.jobs ?? 0) + 1 < maxJobs && (box.generation ?? 0) < 59 && this.now() - box.createdAt < maxAge * 1000 && await project.storage.get('reuse:override') !== 'off';
-        const demand = box.baseId == null && this.now() < safeUntil && canTransfer && mode === 'on' && snapshot?.complete === true && Number.isFinite(snapshot.at) && this.now() - snapshot.at <= 90000 && jobs.some(job => job.status === 'queued' && !job.missing && job.pool === box.pool);
+        const demand = box.baseId == null && this.now() < safeUntil && canTransfer && mode === 'on' && snapshotFresh(snapshot, this.now(), project.config) && jobs.some(job => job.status === 'queued' && !job.missing && job.pool === box.pool);
         const cap = project.config.caps?.concurrent;
         const full = Number.isSafeInteger(cap) && cap >= 0 && projectBoxes.filter(item => item.state !== 'deleted').length + creates.length >= cap;
-        const fresh = mode === 'on' && snapshot?.complete === true && Number.isFinite(snapshot.at) && this.now() - snapshot.at <= 90000;
+        const fresh = mode === 'on' && snapshotFresh(snapshot, this.now(), project.config);
         const waitingOther = full && fresh && runnableDemand(jobs, project.config.workflowConcurrency, true, { laneCaps: await lanesSwitchOn(project.storage, project.config) }).some(job => job.status === 'queued' && !job.missing && job.pool !== box.pool && !creates.some(item => item.pool === job.pool) && !projectBoxes.some(item => item.pool === job.pool && !['deleted', 'destroying', 'purging', 'busy', 'leased'].includes(item.state)));
         if (demand || waitingOther || this.now() - box.since >= hold * 1000 || this.now() >= leaseSafeUntil) {
           await project.storage.transaction(async tx => {

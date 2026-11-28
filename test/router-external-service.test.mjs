@@ -521,6 +521,72 @@ test('a rolling claim with no ready generation waits and never starts a plain bo
   assert.equal(await service.pendingReason('compute', id, 'default'), 'ci_snapshot_unavailable');
 });
 
+// A complete snapshot is evidence that the scan loop is alive, and the loop
+// rescans every refresh cycle: one minute when the router polls GitHub, fifteen
+// when repository webhooks carry the queue. A fixed 90 s bound refused every
+// lease outside the first 90 s after each webhook-mode scan.
+test('a webhook-mode snapshot is ready for one refresh cycle', async () => {
+  const { storage, projectStorage, service, setTime } = setup();
+  service.router.account.openStartQueue = true;
+  service.router.projects.get('project-a').config.snapshotIntervalMs = 15 * 60_000;
+  await projectStorage.put('pool:mode', 'on');
+  await projectStorage.put('pool:snapshot', { complete: true, at: 10_000, runners: [] });
+  setTime(10_000 + 10 * 60_000);
+  assert.equal(await service.claim('compute', id, 'default'), null);
+  assert.equal((await storage.get(`external-lease:compute:${id}`))?.state, 'reserved');
+  assert.notEqual(await service.pendingReason('compute', id, 'default'), 'ci_snapshot_unavailable');
+});
+
+test('a snapshot older than one webhook refresh cycle and its grace is not ready', async () => {
+  const { storage, projectStorage, service, setTime } = setup();
+  service.router.account.openStartQueue = true;
+  service.router.projects.get('project-a').config.snapshotIntervalMs = 15 * 60_000;
+  await projectStorage.put('pool:mode', 'on');
+  await projectStorage.put('pool:snapshot', { complete: true, at: 10_000, runners: [] });
+  setTime(10_000 + 15 * 60_000 + 30_000 + 1);
+  assert.equal(await service.claim('compute', id, 'default'), null);
+  assert.equal(await storage.get(`external-lease:compute:${id}`), undefined);
+  assert.equal(await service.pendingReason('compute', id, 'default'), 'ci_snapshot_unavailable');
+});
+
+test('a poll-mode project keeps its 90 second snapshot bound', async () => {
+  const reserveAt = async age => {
+    const { storage, projectStorage, service, setTime } = setup();
+    service.router.account.openStartQueue = true;
+    await projectStorage.put('pool:mode', 'on');
+    await projectStorage.put('pool:snapshot', { complete: true, at: 10_000, runners: [] });
+    setTime(10_000 + age);
+    assert.equal(await service.claim('compute', id, 'default'), null);
+    return Boolean(await storage.get(`external-lease:compute:${id}`));
+  };
+  assert.equal(await reserveAt(90_000), true);
+  assert.equal(await reserveAt(90_001), false);
+});
+
+test('a webhook snapshot gates an idle CI pool on its own refresh cycle', async () => {
+  const { projectStorage, service, setTime } = setup();
+  service.router.projects.get('project-a').config.snapshotIntervalMs = 15 * 60_000;
+  await projectStorage.put('pool:mode', 'on');
+  await projectStorage.put('pool:snapshot', { complete: true, at: 10_000, runners: [] });
+  setTime(10_000 + 10 * 60_000);
+  assert.equal(await service.ciIdle('default'), true);
+  setTime(10_000 + 15 * 60_000 + 30_001);
+  assert.equal(await service.ciIdle('default'), false);
+});
+
+test('queued CI reclaims a warm lease box while the webhook snapshot is current', async () => {
+  const { projectStorage, service, setTime } = setup();
+  service.router.projects.get('project-a').config.snapshotIntervalMs = 15 * 60_000;
+  await projectStorage.put('pool:mode', 'on');
+  await projectStorage.put('pool:snapshot', { complete: true, at: 10_000, runners: [] });
+  await projectStorage.put('pool:status:boat-default', { reuseIdleHoldSeconds: 3600 });
+  await projectStorage.put('gh-job:9', { id: 9, status: 'queued', queuedAt: 9_000, pool: '["a/b","boat-default"]' });
+  await projectStorage.put('box:bx_23456789', { machineId: 'bx_23456789', pool: '["a/b","boat-default"]', state: 'lease-warm', size: 'default', leaseClient: 'compute', createdAt: 1, since: 9_000, baselineHash: 'a'.repeat(64), generation: 2, reusable: true });
+  setTime(10_000 + 10 * 60_000);
+  await service.sweep();
+  assert.equal((await projectStorage.get('box:bx_23456789')).state, 'ready');
+});
+
 test('a rolling claim boots the stored peek-ci generation it selected', async () => {
   const { storage, projectStorage, service } = setup();
   await projectStorage.put('pool:mode', 'on');
