@@ -10,10 +10,10 @@ export class SharedBudget {
     const digest = await crypto.subtle.digest('SHA-256', bytes);
     return [...new Uint8Array(digest)].map(byte => byte.toString(16).padStart(2, '0')).join('');
   }
-  async admit(key, limits, { queuedAt = this.now(), jobId, pool = false, label, snapshotRecovery = false, cost } = {}) {
+  async admit(key, limits, { queuedAt = this.now(), jobId, pool = false, label, snapshotRecovery = false, cost, ownLive } = {}) {
     const claim = await this.claimKey(key);
     await this.ledger.enqueue(this.project, claim, queuedAt, jobId, { pool, label, snapshotRecovery });
-    const result = await this.ledger.admit(this.project, claim, snapshotLimits(limits, this.now()), { pool, cost });
+    const result = await this.ledger.admit(this.project, claim, snapshotLimits(limits, this.now()), { pool, cost, ownLive });
     if (result.recovered && result.status !== 'pending') return { ok: false, reason: 'reconciliation_required', nextAt: this.now() + 5000 };
     return result.ok ? { ok: true, claim } : { ...result, nextAt: this.now() + 5000 };
   }

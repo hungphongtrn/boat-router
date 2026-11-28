@@ -216,9 +216,17 @@ export function reservationExpired(box, now) {
   return Number.isFinite(box?.dispatchAt) && now >= box.dispatchAt + RESERVATION_MS;
 }
 
-// A JIT pool unit for the concurrency cap: every recorded box except deleted ones and lease boxes.
+// A recorded box that holds this project's total concurrency slot: every box except deleted ones
+// and adopted orphans. An orphan belongs to another API key (the provider refuses this router's
+// delete with 403 api_key_action_forbidden), so it never held one of this project's slots.
+export function holdsCapSlot(box) {
+  return box.state !== 'deleted' && box.orphan !== true;
+}
+
+// A JIT pool unit for lane usage: a box that holds a cap slot and is not a lease box. Lease boxes
+// share the record key space with the pool but are not pool units.
 export function countsTowardCap(box) {
-  return box.state !== 'deleted' && !LEASE_STATES.includes(box.state);
+  return holdsCapSlot(box) && !LEASE_STATES.includes(box.state);
 }
 
 // Supply windows: a box is supply for the planner only in these states and for these times.

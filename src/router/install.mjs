@@ -9,6 +9,7 @@ import { Router } from './core.mjs';
 import { SharedBudget } from './shared-budget.mjs';
 import { PoolFleet } from './pool-fleet.mjs';
 import { BoxFleet, placementEvidence } from './box-fleet.mjs';
+import { holdsCapSlot } from './box-state.mjs';
 import { migrateProject } from './pool-migrate.mjs';
 import { observe, reconcile, snapshotResumeAt } from './pool-observations.mjs';
 import { records } from './pool-records.mjs';
@@ -272,7 +273,15 @@ export function installRouter(storage, getEnv, { api, now = Date.now, logger = c
         const budget = cutover ? cutoverBudget(scoped, secondaryLedger, ledger, config.id, now, poolOptions) : new SharedBudget(ledger, config.id, now);
         const poolApi = cutover ? accountApi(scoped, secondaryApi, scopedApi) : scopedApi;
         poolController = new PoolFleet(scoped, env, poolApi, now, logger, { sharedBudget: budget, project: config });
-        poolController.boxFleet = new BoxFleet(scoped, poolApi, now, { budget, project: config, projectCount: configurations.length, countLeaseStarts: async () => (await records(storage, 'external-lease:')).filter(lease => lease.project === config.id && lease.state === 'starting').length, ...(cutover ? { createAccount: 'primary' } : {}), getEnv, getLocalCapacity: () => router?.localCapacity, emit: poolController.emit.bind(poolController), logger, alert: (event, data) => schedule(alerts.observe(event, { project: config.id, ...data }).catch(() => {})) });
+        poolController.boxFleet = new BoxFleet(scoped, poolApi, now, { budget, project: config, projectCount: configurations.length, countLeaseStarts: async () => (await records(storage, 'external-lease:')).filter(lease => lease.project === config.id && lease.state === 'starting').length,
+          // The live budget is account-wide: every project on this router shares the ledger, so the
+          // count spans them. Boxes on the secondary account spend that account's own budget.
+          countOwnLive: async observedAt => {
+            let live = 0;
+            for (const peer of router?.projects?.values() ?? []) live += (await records(peer.storage, 'box:')).filter(box => holdsCapSlot(box) && box.account !== 'secondary' && !(Number.isFinite(box.createdAt) && box.createdAt >= observedAt)).length;
+            return live;
+          },
+          ...(cutover ? { createAccount: 'primary' } : {}), getEnv, getLocalCapacity: () => router?.localCapacity, emit: poolController.emit.bind(poolController), logger, alert: (event, data) => schedule(alerts.observe(event, { project: config.id, ...data }).catch(() => {})) });
       }
       poolController.env = env;
       return poolController;

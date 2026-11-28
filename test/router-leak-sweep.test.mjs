@@ -44,24 +44,23 @@ test('unknown router boxes that hold every slot are retired through the router d
   assert.deepEqual(events.filter(event => event.event === 'orphan_sweep').map(event => event.decision), ['retire', 'retire', 'retire']);
 });
 
-test('an unknown box that holds the last slot keeps a create refused until the sweep retires it', async () => {
+test('an unknown box never holds the live budget and the sweep still retires it', async () => {
   const storage = new Storage(), accountStorage = new Storage();
   accountStorage.put('account:ledger', { claims: {}, waiting: [] });
   const ledger = new AccountLedger(accountStorage, { requireConcurrency: true, liveSandboxCap: 3, starts: { minute: 12, hour: 60, day: 200 }, margin: 0, dayReserve: 0 }, () => now);
   const limits = active => ({ canStart: true, activeSandboxes: active, maxActiveSandboxes: 100, starts: { minute: { limit: 12, used: 0 }, hour: { limit: 60, used: 0 }, day: { limit: 200, used: 0 } } });
   await ledger.enqueue('demo', 'first', now);
-  const refused = await ledger.admit('demo', 'first', snapshotLimits(limits(3), now));
-  assert.equal(refused.ok, false);
-  assert.equal(refused.reason, 'concurrency');
+  // Three sandboxes live on the account and this router records none of them,
+  // so the local live budget is untouched and the create goes ahead.
+  const admitted = await ledger.admit('demo', 'first', snapshotLimits(limits(3), now), { ownLive: 0 });
+  assert.equal(admitted.ok, true);
+  await ledger.abandon('demo', 'first');
 
   const sandboxes = ids.map((id, i) => ({ id, name: name(['d', 'e', 'f'][i]) }));
   const api = { listSandboxes: async () => sandboxes, sandbox: async () => ({}), destroy: async () => ({ operation: { id: 'op' } }) };
   const fleet = new BoxFleet(storage, api, () => now, { project, projectCount: 1, budget: { ledger: { storage: accountStorage, key: 'account:ledger' } } });
   await fleet.sweepOrphans({ complete: true, at: now, runners: [], jobs: [] }, project);
-  // The same waiting request is admitted once the leaked boxes no longer hold
-  // the provider's live slots.
-  const admitted = await ledger.admit('demo', 'first', snapshotLimits(limits(0), now));
-  assert.equal(admitted.ok, true);
+  for (const id of ids) assert.equal((await storage.get(`box:${id}`)).orphan, true);
 });
 
 test('an unknown box with a busy runner is adopted and not destroyed', async () => {

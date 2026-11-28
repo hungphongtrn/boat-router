@@ -151,7 +151,7 @@ export class AccountLedger {
     });
   }
   async admit(project, key, snapshot, options) { return this.admitBatch(project, [key], snapshot, options); }
-  async admitBatch(project, keys, snapshot, { pool = false, cost } = {}) {
+  async admitBatch(project, keys, snapshot, { pool = false, cost, ownLive } = {}) {
     if (!Array.isArray(keys) || keys.length < 1 || keys.length > 64 || new Set(keys).size !== keys.length || keys.some(key => typeof key !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(key) || ['__proto__', 'constructor', 'prototype'].includes(key))) throw new TypeError('invalid start batch');
     const now = this.now();
     // A start with a spend policy must price its maximum lifetime before any
@@ -223,7 +223,15 @@ export class AccountLedger {
         const unobserved = claims.filter(c => c.status !== 'created' || (c.settledAt ?? c.at) >= snapshot.at).length;
         const liveCap = this.policy.liveSandboxCap ?? concurrency.limit;
         if (!validCount(liveCap) || liveCap < 1) throw new TypeError('invalid live sandbox budget');
-        if (concurrency.active + unobserved + keys.length > Math.min(concurrency.limit, liveCap)) return { ok: false, reason: 'concurrency' };
+        if (ownLive !== undefined && !validCount(ownLive)) throw new TypeError('invalid own live sandbox count');
+        // The provider limit bounds every sandbox on the account, including the
+        // ones another router created with its own API key.
+        if (concurrency.active + unobserved + keys.length > concurrency.limit) return { ok: false, reason: 'concurrency' };
+        // The live budget bounds only the sandboxes this router owns. A caller
+        // that cannot count its own boxes keeps the provider-wide reading, never
+        // a looser one.
+        const owned = ownLive ?? concurrency.active;
+        if (owned + unobserved + keys.length > liveCap) return { ok: false, reason: 'concurrency' };
       }
       let freeRefusal = null, freeDailyExhausted = false, freeDailyReserved = false, floorRequired = false;
       for (const [name, span] of Object.entries(WINDOWS)) {
